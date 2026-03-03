@@ -12,17 +12,72 @@ menu "ESP32 FDM Bridge Configuration"
         help
             WiFi network password.
 
-    config RFC2217_PORT
-        int "RFC 2217 TCP Port"
-        default 2217
-        range 1 65535
-        help
-            TCP port for the RFC 2217 serial bridge server.
-
     config PRINTER_BAUD_RATE
         int "Default Printer Baud Rate"
         default 115200
         help
             Default baud rate for USB serial connection to the printer.
+
+    menu "Obico Integration"
+
+        config OBICO_ENABLED
+            bool "Enable Obico direct integration"
+            default y
+            help
+                Connect directly to Obico server for AI-based print failure detection.
+                When enabled, RFC 2217 is disabled (mutually exclusive).
+
+        config OBICO_SERVER_URL
+            string "Obico Server URL"
+            default "https://app.obico.io"
+            depends on OBICO_ENABLED
+            help
+                Obico server URL. Change for self-hosted instances.
+
+        config OBICO_SNAP_INTERVAL_PRINTING
+            int "Snapshot interval during printing (seconds)"
+            default 10
+            range 5 300
+            depends on OBICO_ENABLED
+            help
+                How often to upload JPEG snapshots while printing or when AI watching.
+
+        config OBICO_SNAP_INTERVAL_IDLE
+            int "Snapshot interval when idle (seconds)"
+            default 120
+            range 30 600
+            depends on OBICO_ENABLED
+            help
+                How often to upload JPEG snapshots when idle.
+
+        config OBICO_STATUS_INTERVAL
+            int "WebSocket status interval (seconds)"
+            default 30
+            range 10 120
+            depends on OBICO_ENABLED
+            help
+                How often to send printer status over WebSocket.
+
+    endmenu
+
+    menu "RFC 2217 (Legacy)"
+
+        config RFC2217_ENABLED
+            bool "Enable RFC 2217 serial bridge"
+            default n
+            depends on !OBICO_ENABLED
+            help
+                Enable the RFC 2217 Telnet COM-PORT-OPTION server for OctoPrint.
+                Mutually exclusive with Obico integration.
+
+        config RFC2217_PORT
+            int "RFC 2217 TCP Port"
+            default 2217
+            range 1 65535
+            depends on RFC2217_ENABLED
+            help
+                TCP port for the RFC 2217 serial bridge server.
+
+    endmenu
 
 endmenu

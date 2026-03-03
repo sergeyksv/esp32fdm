@@ -8,6 +8,10 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 
+#if CONFIG_OBICO_ENABLED
+#include "obico_client.h"
+#endif
+
 static const char *TAG = "httpd";
 
 #define STREAM_TARGET_FPS 10
@@ -155,12 +159,12 @@ static void stream_server_task(void *arg)
 
 esp_err_t httpd_start_server(void)
 {
-    /* HTTP server on port 80 (Core 0) — /capture only */
+    /* HTTP server on port 80 (Core 0) */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.core_id = 0;
-    config.stack_size = 4096;
-    config.max_uri_handlers = 4;
+    config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
+    config.max_uri_handlers = 8;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -177,7 +181,11 @@ esp_err_t httpd_start_server(void)
     };
     httpd_register_uri_handler(server, &capture_uri);
 
-    ESP_LOGI(TAG, "HTTP server started on port 80 (capture)");
+#if CONFIG_OBICO_ENABLED
+    obico_register_httpd(server);
+#endif
+
+    ESP_LOGI(TAG, "HTTP server started on port 80");
 
     /* MJPEG stream task on Core 1 — raw socket, port 81 */
     xTaskCreatePinnedToCore(stream_server_task, "mjpeg_stream", 8192,

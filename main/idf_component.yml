@@ -11,3 +11,5 @@ dependencies:
     version: "^2.2.0"
   espressif/usb_host_ftdi_vcp:
     version: "^2.1.0"
+  espressif/esp_websocket_client:
+    version: "^1.2.0"
