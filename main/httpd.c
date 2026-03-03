@@ -1,6 +1,7 @@
 #include "httpd.h"
 
 #include "camera.h"
+#include "wifi.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -156,6 +157,46 @@ static void stream_server_task(void *arg)
     }
 }
 
+/* ---- / root handler ---- */
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    const char *ip = wifi_get_ip_str();
+    char buf[1024];
+
+    int len = snprintf(buf, sizeof(buf),
+        "<!DOCTYPE html><html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>ESP32 FDM Bridge</title>"
+        "<style>"
+        "body{font-family:sans-serif;max-width:600px;margin:2em auto;padding:0 1em}"
+        "a{display:block;margin:.5em 0}"
+        "code{background:#eee;padding:2px 6px;border-radius:3px}"
+        "</style></head><body>"
+        "<h1>ESP32 FDM Bridge</h1>"
+        "<h2>Camera</h2>"
+        "<a href=\"http://%s:81/\">MJPEG Stream</a>"
+        "<a href=\"/capture\">Snapshot</a>"
+#if CONFIG_OBICO_ENABLED
+        "<h2>Obico</h2>"
+        "<a href=\"/obico/link\">Link to Obico</a>"
+        "<a href=\"/obico/status\">Obico Status</a>"
+        "<a href=\"/printer/config\">Printer Config</a>"
+#elif CONFIG_RFC2217_ENABLED
+        "<h2>Serial</h2>"
+        "<p>RFC 2217 port: <code>rfc2217://%s:%d</code></p>"
+#endif
+        "</body></html>",
+        ip
+#if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
+        , ip, CONFIG_RFC2217_PORT
+#endif
+    );
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, buf, len);
+}
+
 /* ---- Public API ---- */
 
 esp_err_t httpd_start_server(void)
@@ -174,6 +215,13 @@ esp_err_t httpd_start_server(void)
         ESP_LOGE(TAG, "Failed to start HTTP server: 0x%x", err);
         return err;
     }
+
+    httpd_uri_t root_uri = {
+        .uri      = "/",
+        .method   = HTTP_GET,
+        .handler  = root_handler,
+    };
+    httpd_register_uri_handler(server, &root_uri);
 
     httpd_uri_t capture_uri = {
         .uri      = "/capture",

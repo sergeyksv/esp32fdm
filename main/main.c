@@ -49,16 +49,12 @@ void app_main(void)
     printer_backend_t backend = printer_comm_get_backend();
     ESP_LOGI(TAG, "========================================");
     if (backend == PRINTER_BACKEND_KLIPPER) {
-        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico mode - Klipper → %s:%u)",
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico - Klipper → %s:%u)",
                  printer_comm_get_mr_host(), printer_comm_get_mr_port());
     } else {
-        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico mode - Marlin)");
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico - Marlin)");
     }
-    ESP_LOGI(TAG, "  Webcam stream: http://%s:81/", ip);
-    ESP_LOGI(TAG, "  Snapshot:      http://%s/capture", ip);
-    ESP_LOGI(TAG, "  Obico link:    http://%s/obico/link", ip);
-    ESP_LOGI(TAG, "  Obico status:  http://%s/obico/status", ip);
-    ESP_LOGI(TAG, "  Printer config:http://%s/printer/config", ip);
+    ESP_LOGI(TAG, "  http://%s/", ip);
     ESP_LOGI(TAG, "========================================");
 
 #elif CONFIG_RFC2217_ENABLED
@@ -69,9 +65,7 @@ void app_main(void)
     const char *ip = wifi_get_ip_str();
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (RFC2217 mode)");
-    ESP_LOGI(TAG, "  Webcam stream: http://%s:81/", ip);
-    ESP_LOGI(TAG, "  Snapshot:      http://%s/capture", ip);
-    ESP_LOGI(TAG, "  Serial port:   rfc2217://%s:%d", ip, CONFIG_RFC2217_PORT);
+    ESP_LOGI(TAG, "  http://%s/", ip);
     ESP_LOGI(TAG, "========================================");
 
 #else
@@ -81,8 +75,7 @@ void app_main(void)
     const char *ip = wifi_get_ip_str();
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (camera only)");
-    ESP_LOGI(TAG, "  Webcam stream: http://%s:81/", ip);
-    ESP_LOGI(TAG, "  Snapshot:      http://%s/capture", ip);
+    ESP_LOGI(TAG, "  http://%s/", ip);
     ESP_LOGI(TAG, "========================================");
 #endif
 }
