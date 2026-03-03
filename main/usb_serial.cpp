@@ -25,6 +25,9 @@ static cdc_acm_dev_hdl_t s_cdc_dev = nullptr;
 static std::unique_ptr<CdcAcmDevice> s_vcp_dev;
 static volatile bool s_device_connected = false;
 
+/* Semaphore given when USB Host lib detects a new device */
+static SemaphoreHandle_t s_new_device_sem = nullptr;
+
 /* ---- RX callback from CDC-ACM driver ---- */
 
 static bool handle_rx(const uint8_t *data, size_t data_len, void *arg)
@@ -121,12 +124,30 @@ static void usb_host_lib_task(void *arg)
     }
 }
 
-/* ---- Device poll task — tries to open printer USB device ---- */
+/* ---- CDC-ACM new device callback — wakes up the poll task ---- */
+
+static void new_device_cb(usb_device_handle_t usb_dev)
+{
+    ESP_LOGI(TAG, "New USB device detected");
+    xSemaphoreGive(s_new_device_sem);
+}
+
+/* ---- Device poll task — sleeps until a device is plugged in ---- */
 
 static void usb_device_poll_task(void *arg)
 {
+    ESP_LOGI(TAG, "Waiting for USB device...");
+
     while (true) {
-        if (!s_device_connected) {
+        if (s_device_connected) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Block until new_device_cb fires (no CPU usage while waiting) */
+        if (xSemaphoreTake(s_new_device_sem, portMAX_DELAY) == pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(500));  /* Let enumeration complete */
+
             xSemaphoreTake(s_device_mutex, portMAX_DELAY);
             bool opened = try_open_device();
             xSemaphoreGive(s_device_mutex);
@@ -134,10 +155,8 @@ static void usb_device_poll_task(void *arg)
             if (opened) {
                 ESP_LOGI(TAG, "Printer USB serial ready");
             } else {
-                vTaskDelay(pdMS_TO_TICKS(2000));
+                ESP_LOGW(TAG, "USB device detected but could not open");
             }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 }
@@ -149,6 +168,7 @@ extern "C" esp_err_t usb_serial_init(usb_serial_rx_cb_t rx_cb, void *rx_cb_ctx)
     s_rx_cb = rx_cb;
     s_rx_cb_ctx = rx_cb_ctx;
     s_device_mutex = xSemaphoreCreateMutex();
+    s_new_device_sem = xSemaphoreCreateBinary();
 
     /* Install USB Host library */
     const usb_host_config_t host_config = {
@@ -157,11 +177,12 @@ extern "C" esp_err_t usb_serial_init(usb_serial_rx_cb_t rx_cb, void *rx_cb_ctx)
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
-    /* Install CDC-ACM driver */
+    /* Install CDC-ACM driver with new-device notification */
     const cdc_acm_host_driver_config_t acm_config = {
         .driver_task_stack_size = 4096,
         .driver_task_priority = 20,
         .xCoreID = 1,
+        .new_dev_cb = new_device_cb,
     };
     ESP_ERROR_CHECK(cdc_acm_host_install(&acm_config));
 

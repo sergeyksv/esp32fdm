@@ -47,14 +47,14 @@ esp_err_t camera_init(void)
         .pin_href     = CAM_PIN_HREF,
         .pin_pclk     = CAM_PIN_PCLK,
 
-        .xclk_freq_hz = 20000000,  /* 20 MHz — avoids PSRAM bus contention */
+        .xclk_freq_hz = 10000000,  /* 10 MHz — less PSRAM bus contention */
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size   = FRAMESIZE_VGA,  /* 640x480 */
-        .jpeg_quality = 30,             /* 1-63, lower = better quality */
-        .fb_count     = 2,
+        .jpeg_quality = 40,             /* 1-63, lower = better quality */
+        .fb_count     = 3,              /* 3 for GRAB_LATEST: DMA + ready + consumer */
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
     };

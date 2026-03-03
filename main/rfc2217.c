@@ -284,9 +284,13 @@ static void rfc2217_tx_drain_task(void *arg)
     uint8_t out[512];  /* Worst case: every byte is 0xFF → doubled */
 
     while (true) {
+        /* Block until data arrives — no CPU usage while idle */
         size_t n = xStreamBufferReceive(s_serial_rx_buf, buf, sizeof(buf),
-                                         pdMS_TO_TICKS(100));
-        if (n == 0 || s_client_sock < 0) continue;
+                                         portMAX_DELAY);
+        if (n == 0 || s_client_sock < 0) {
+            /* No client — discard data so buffer doesn't fill up */
+            continue;
+        }
 
         /* IAC-escape any 0xFF bytes */
         size_t out_len = 0;

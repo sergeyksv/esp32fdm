@@ -41,7 +41,7 @@ void app_main(void)
     const char *ip = wifi_get_ip_str();
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32 FDM Bridge READY");
-    ESP_LOGI(TAG, "  Webcam stream: http://%s/stream", ip);
+    ESP_LOGI(TAG, "  Webcam stream: http://%s:81/", ip);
     ESP_LOGI(TAG, "  Snapshot:      http://%s/capture", ip);
     ESP_LOGI(TAG, "  Serial port:   rfc2217://%s:%d", ip, CONFIG_RFC2217_PORT);
     ESP_LOGI(TAG, "========================================");
