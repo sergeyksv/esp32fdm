@@ -1,0 +1,28 @@
+menu "ESP32 FDM Bridge Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            WiFi network name to connect to.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi network password.
+
+    config RFC2217_PORT
+        int "RFC 2217 TCP Port"
+        default 2217
+        range 1 65535
+        help
+            TCP port for the RFC 2217 serial bridge server.
+
+    config PRINTER_BAUD_RATE
+        int "Default Printer Baud Rate"
+        default 115200
+        help
+            Default baud rate for USB serial connection to the printer.
+
+endmenu
