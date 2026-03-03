@@ -18,6 +18,8 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
+#include "lwip/sockets.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -40,6 +42,24 @@ static bool s_should_watch = false;  /* Obico AI wants to watch */
 static TaskHandle_t s_ws_task_handle = NULL;
 static TaskHandle_t s_snap_task_handle = NULL;
 static esp_websocket_client_handle_t s_ws_client = NULL;
+
+/* ---- Janus proxy state ---- */
+
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+static int s_janus_sock = -1;
+static TaskHandle_t s_janus_rx_task_handle = NULL;
+static SemaphoreHandle_t s_janus_sock_mutex = NULL;
+
+static void janus_proxy_task(void *arg);
+static void janus_send_to_sidecar(const char *json_str, int len);
+static void janus_connect(void);
+static void janus_disconnect(void);
+
+static bool janus_proxy_configured(void)
+{
+    return strlen(CONFIG_OBICO_JANUS_PROXY_HOST) > 0;
+}
+#endif
 
 /* ---- Forward declarations ---- */
 
@@ -220,6 +240,13 @@ esp_err_t obico_link_with_code(const char *code)
                 xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
                                         NULL, 4, &s_snap_task_handle, 0);
             }
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+            if (!s_janus_rx_task_handle && janus_proxy_configured()) {
+                s_janus_sock_mutex = xSemaphoreCreateMutex();
+                xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+                                        NULL, 5, &s_janus_rx_task_handle, 0);
+            }
+#endif
             return ESP_OK;
         }
     }
@@ -242,6 +269,13 @@ esp_err_t obico_link_with_code(const char *code)
             xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
                                     NULL, 4, &s_snap_task_handle, 0);
         }
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+        if (!s_janus_rx_task_handle && janus_proxy_configured()) {
+            s_janus_sock_mutex = xSemaphoreCreateMutex();
+            xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+                                    NULL, 5, &s_janus_rx_task_handle, 0);
+        }
+#endif
         return ESP_OK;
     }
 
@@ -435,6 +469,17 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
                         ESP_LOGI(TAG, "should_watch=%d", s_should_watch);
                     }
                 }
+
+                /* Handle Janus signaling relay */
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+                const cJSON *janus_msg = cJSON_GetObjectItem(root, "janus");
+                if (janus_msg && cJSON_IsString(janus_msg) && janus_proxy_configured()) {
+                    const char *janus_str = janus_msg->valuestring;
+                    int janus_len = strlen(janus_str);
+                    ESP_LOGI(TAG, "WS->sidecar janus msg (%d bytes)", janus_len);
+                    janus_send_to_sidecar(janus_str, janus_len);
+                }
+#endif
 
                 /* Handle commands: [{"cmd": "pause", "args": {...}, "initiator": "api"}] */
                 const cJSON *cmds = cJSON_GetObjectItem(root, "commands");
@@ -858,6 +903,173 @@ esp_err_t obico_register_httpd(void *server_handle)
     return ESP_OK;
 }
 
+/* ---- Janus proxy relay ---- */
+
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+
+static void janus_connect(void)
+{
+    if (s_janus_sock >= 0) return;
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(CONFIG_OBICO_JANUS_PROXY_PORT),
+    };
+    inet_pton(AF_INET, CONFIG_OBICO_JANUS_PROXY_HOST, &dest.sin_addr);
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Janus proxy socket create failed");
+        return;
+    }
+
+    /* 5s connect timeout */
+    struct timeval tv = { .tv_sec = 5 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
+        ESP_LOGW(TAG, "Janus proxy connect to %s:%d failed",
+                 CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+        close(sock);
+        return;
+    }
+
+    xSemaphoreTake(s_janus_sock_mutex, portMAX_DELAY);
+    s_janus_sock = sock;
+    xSemaphoreGive(s_janus_sock_mutex);
+
+    ESP_LOGI(TAG, "Connected to Janus proxy at %s:%d",
+             CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+}
+
+static void janus_disconnect(void)
+{
+    xSemaphoreTake(s_janus_sock_mutex, portMAX_DELAY);
+    if (s_janus_sock >= 0) {
+        close(s_janus_sock);
+        s_janus_sock = -1;
+    }
+    xSemaphoreGive(s_janus_sock_mutex);
+}
+
+/**
+ * Send a length-prefixed message to the sidecar.
+ * Wire format: 4-byte big-endian length + JSON payload.
+ */
+static void janus_send_to_sidecar(const char *json_str, int len)
+{
+    xSemaphoreTake(s_janus_sock_mutex, portMAX_DELAY);
+    if (s_janus_sock < 0) {
+        xSemaphoreGive(s_janus_sock_mutex);
+        return;
+    }
+
+    uint8_t hdr[4];
+    hdr[0] = (len >> 24) & 0xFF;
+    hdr[1] = (len >> 16) & 0xFF;
+    hdr[2] = (len >>  8) & 0xFF;
+    hdr[3] = (len >>  0) & 0xFF;
+
+    int sent = send(s_janus_sock, hdr, 4, 0);
+    if (sent == 4) {
+        sent = send(s_janus_sock, json_str, len, 0);
+    }
+    if (sent < 0) {
+        ESP_LOGW(TAG, "Janus proxy send failed, disconnecting");
+        close(s_janus_sock);
+        s_janus_sock = -1;
+    }
+    xSemaphoreGive(s_janus_sock_mutex);
+}
+
+/**
+ * Read a length-prefixed message from the sidecar.
+ * Returns malloc'd buffer (caller frees) or NULL on error.
+ */
+static char *janus_recv_from_sidecar(int *out_len)
+{
+    int sock = s_janus_sock;
+    if (sock < 0) return NULL;
+
+    uint8_t hdr[4];
+    int r = recv(sock, hdr, 4, MSG_WAITALL);
+    if (r != 4) return NULL;
+
+    int msg_len = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+    if (msg_len <= 0 || msg_len > 8192) {
+        ESP_LOGW(TAG, "Janus proxy bad msg len: %d", msg_len);
+        return NULL;
+    }
+
+    char *buf = malloc(msg_len + 1);
+    if (!buf) return NULL;
+
+    r = recv(sock, buf, msg_len, MSG_WAITALL);
+    if (r != msg_len) {
+        free(buf);
+        return NULL;
+    }
+    buf[msg_len] = '\0';
+    *out_len = msg_len;
+    return buf;
+}
+
+/**
+ * Task: reads from sidecar TCP, wraps as {"janus":"..."} and sends to Obico WS.
+ */
+static void janus_proxy_task(void *arg)
+{
+    ESP_LOGI(TAG, "Janus proxy relay task started");
+
+    while (true) {
+        if (!s_linked) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        /* (Re)connect to sidecar */
+        if (s_janus_sock < 0) {
+            janus_connect();
+            if (s_janus_sock < 0) {
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                continue;
+            }
+        }
+
+        /* Read a message from sidecar */
+        int msg_len = 0;
+        char *msg = janus_recv_from_sidecar(&msg_len);
+        if (!msg) {
+            /* Connection lost or timeout */
+            ESP_LOGW(TAG, "Janus proxy recv failed, reconnecting...");
+            janus_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Sidecar→WS janus msg (%d bytes)", msg_len);
+
+        /* Wrap as {"janus":"<escaped_json>"} and send to Obico WS */
+        if (s_ws_client && esp_websocket_client_is_connected(s_ws_client)) {
+            cJSON *wrapper = cJSON_CreateObject();
+            cJSON_AddStringToObject(wrapper, "janus", msg);
+            char *json_out = cJSON_PrintUnformatted(wrapper);
+            cJSON_Delete(wrapper);
+
+            if (json_out) {
+                esp_websocket_client_send_text(s_ws_client, json_out,
+                                               strlen(json_out), pdMS_TO_TICKS(5000));
+                free(json_out);
+            }
+        }
+
+        free(msg);
+    }
+}
+
+#endif /* CONFIG_OBICO_JANUS_PROXY_HOST */
+
 /* ---- Public init ---- */
 
 esp_err_t obico_client_init(void)
@@ -875,6 +1087,15 @@ esp_err_t obico_client_init(void)
                                 NULL, 5, &s_ws_task_handle, 0);
         xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
                                 NULL, 4, &s_snap_task_handle, 0);
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+        if (janus_proxy_configured()) {
+            s_janus_sock_mutex = xSemaphoreCreateMutex();
+            xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+                                    NULL, 5, &s_janus_rx_task_handle, 0);
+            ESP_LOGI(TAG, "Janus proxy relay enabled -> %s:%d",
+                     CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+        }
+#endif
     } else {
         ESP_LOGI(TAG, "Device not linked — visit /obico/link to connect");
     }

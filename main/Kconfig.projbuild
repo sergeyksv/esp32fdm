@@ -58,6 +58,22 @@ menu "ESP32 FDM Bridge Configuration"
             help
                 How often to send printer status over WebSocket.
 
+        config OBICO_JANUS_PROXY_HOST
+            string "Janus proxy sidecar IP (empty = disabled)"
+            default ""
+            depends on OBICO_ENABLED
+            help
+                IP address of the Linux sidecar running janus_proxy.
+                Leave empty to disable WebRTC streaming relay.
+
+        config OBICO_JANUS_PROXY_PORT
+            int "Janus proxy sidecar port"
+            default 17800
+            range 1024 65535
+            depends on OBICO_ENABLED
+            help
+                TCP port for the Janus signaling relay connection to sidecar.
+
     endmenu
 
     menu "RFC 2217 (Legacy)"
