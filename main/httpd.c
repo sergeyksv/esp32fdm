@@ -10,6 +10,7 @@
 
 #if CONFIG_OBICO_ENABLED
 #include "obico_client.h"
+#include "printer_comm.h"
 #endif
 
 static const char *TAG = "httpd";
@@ -164,7 +165,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -183,6 +184,7 @@ esp_err_t httpd_start_server(void)
 
 #if CONFIG_OBICO_ENABLED
     obico_register_httpd(server);
+    printer_config_register_httpd(server);
 #endif
 
     ESP_LOGI(TAG, "HTTP server started on port 80");

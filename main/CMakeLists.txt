@@ -7,7 +7,7 @@ set(SRCS
 )
 
 if(CONFIG_OBICO_ENABLED)
-    list(APPEND SRCS "printer_comm.c" "obico_client.c")
+    list(APPEND SRCS "printer_comm.c" "printer_comm_klipper.c" "obico_client.c")
 endif()
 
 if(CONFIG_RFC2217_ENABLED)

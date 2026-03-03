@@ -9,6 +9,11 @@ extern "C" {
 #endif
 
 typedef enum {
+    PRINTER_BACKEND_MARLIN  = 0,
+    PRINTER_BACKEND_KLIPPER = 1,
+} printer_backend_t;
+
+typedef enum {
     PRINTER_DISCONNECTED,
     PRINTER_OPERATIONAL,
     PRINTER_PRINTING,
@@ -74,6 +79,34 @@ void printer_comm_set_simulate(bool enable);
  * Returns true if simulation mode is active.
  */
 bool printer_comm_is_simulating(void);
+
+/**
+ * Get the currently active printer backend.
+ */
+printer_backend_t printer_comm_get_backend(void);
+
+/**
+ * Get the configured Moonraker host (empty string if not set).
+ */
+const char *printer_comm_get_mr_host(void);
+
+/**
+ * Get the configured Moonraker port.
+ */
+uint16_t printer_comm_get_mr_port(void);
+
+/**
+ * Save printer backend configuration to NVS.
+ * Takes effect after reboot.
+ */
+esp_err_t printer_comm_save_config(printer_backend_t backend,
+                                   const char *mr_host, uint16_t mr_port);
+
+/**
+ * Register printer config HTTP endpoints on the given server.
+ * Called from httpd.c during server setup.
+ */
+esp_err_t printer_config_register_httpd(void *server_handle);
 
 #ifdef __cplusplus
 }

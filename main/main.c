@@ -46,12 +46,19 @@ void app_main(void)
     ESP_ERROR_CHECK(obico_client_init());
 
     const char *ip = wifi_get_ip_str();
+    printer_backend_t backend = printer_comm_get_backend();
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico mode)");
+    if (backend == PRINTER_BACKEND_KLIPPER) {
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico mode - Klipper → %s:%u)",
+                 printer_comm_get_mr_host(), printer_comm_get_mr_port());
+    } else {
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico mode - Marlin)");
+    }
     ESP_LOGI(TAG, "  Webcam stream: http://%s:81/", ip);
     ESP_LOGI(TAG, "  Snapshot:      http://%s/capture", ip);
     ESP_LOGI(TAG, "  Obico link:    http://%s/obico/link", ip);
     ESP_LOGI(TAG, "  Obico status:  http://%s/obico/status", ip);
+    ESP_LOGI(TAG, "  Printer config:http://%s/printer/config", ip);
     ESP_LOGI(TAG, "========================================");
 
 #elif CONFIG_RFC2217_ENABLED

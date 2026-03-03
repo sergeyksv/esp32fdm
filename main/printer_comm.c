@@ -1,7 +1,10 @@
 #include "printer_comm.h"
+#include "printer_comm_klipper.h"
 
 #include "usb_serial.h"
 
+#include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -9,6 +12,8 @@
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -26,7 +31,18 @@ static const char *TAG = "printer_comm";
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
-/* ---- State ---- */
+#define NVS_NAMESPACE           "pcomm"
+#define NVS_KEY_BACKEND         "backend"
+#define NVS_KEY_MR_HOST         "mr_host"
+#define NVS_KEY_MR_PORT         "mr_port"
+
+/* ---- Backend config ---- */
+
+static printer_backend_t s_backend = PRINTER_BACKEND_MARLIN;
+static char s_mr_host[64] = "";
+static uint16_t s_mr_port = 7125;
+
+/* ---- State (Marlin backend) ---- */
 
 static printer_state_t s_state;
 static SemaphoreHandle_t s_state_mutex;
@@ -317,10 +333,45 @@ static void printer_comm_task(void *arg)
     }
 }
 
+/* ---- NVS config ---- */
+
+static void load_config_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(TAG, "No pcomm NVS namespace, using defaults (Marlin)");
+        return;
+    }
+
+    uint8_t backend_val = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_BACKEND, &backend_val) == ESP_OK) {
+        s_backend = (backend_val == 1) ? PRINTER_BACKEND_KLIPPER : PRINTER_BACKEND_MARLIN;
+    }
+
+    size_t len = sizeof(s_mr_host);
+    nvs_get_str(nvs, NVS_KEY_MR_HOST, s_mr_host, &len);
+
+    nvs_get_u16(nvs, NVS_KEY_MR_PORT, &s_mr_port);
+    if (s_mr_port == 0) s_mr_port = 7125;
+
+    nvs_close(nvs);
+
+    /* Fall back to Marlin if Klipper selected but no host configured */
+    if (s_backend == PRINTER_BACKEND_KLIPPER && s_mr_host[0] == '\0') {
+        ESP_LOGW(TAG, "Klipper selected but no Moonraker host — falling back to Marlin");
+        s_backend = PRINTER_BACKEND_MARLIN;
+    }
+
+    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u",
+             s_backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
+             s_mr_host, s_mr_port);
+}
+
 /* ---- Public API ---- */
 
 void printer_comm_rx_cb(const uint8_t *data, size_t len, void *user_ctx)
 {
+    if (s_backend != PRINTER_BACKEND_MARLIN) return;
     if (s_rx_stream && len > 0) {
         xStreamBufferSend(s_rx_stream, data, len, 0);
     }
@@ -360,6 +411,11 @@ void printer_comm_get_state(printer_state_t *out)
             out->print_time_s = -1;
             out->print_time_left_s = -1;
         }
+        return;
+    }
+
+    if (s_backend == PRINTER_BACKEND_KLIPPER) {
+        klipper_backend_get_state(out);
         return;
     }
 
@@ -419,6 +475,10 @@ esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
         }
         return ESP_OK;
     }
+    if (s_backend == PRINTER_BACKEND_KLIPPER) {
+        return klipper_backend_send_cmd(cmd);
+    }
+
     if (xQueueSend(s_cmd_queue, cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Command queue full");
         return ESP_ERR_TIMEOUT;
@@ -428,6 +488,14 @@ esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
 
 esp_err_t printer_comm_init(void)
 {
+    load_config_from_nvs();
+
+    if (s_backend == PRINTER_BACKEND_KLIPPER) {
+        ESP_LOGI(TAG, "Starting Klipper/Moonraker backend → %s:%u", s_mr_host, s_mr_port);
+        return klipper_backend_start(s_mr_host, s_mr_port);
+    }
+
+    /* Marlin backend */
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
 
@@ -447,6 +515,209 @@ esp_err_t printer_comm_init(void)
     xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 4096,
                             NULL, 8, NULL, 0);
 
-    ESP_LOGI(TAG, "Printer comm initialized");
+    ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
+    return ESP_OK;
+}
+
+/* ---- Backend getters ---- */
+
+printer_backend_t printer_comm_get_backend(void)
+{
+    return s_backend;
+}
+
+const char *printer_comm_get_mr_host(void)
+{
+    return s_mr_host;
+}
+
+uint16_t printer_comm_get_mr_port(void)
+{
+    return s_mr_port;
+}
+
+/* ---- NVS save ---- */
+
+esp_err_t printer_comm_save_config(printer_backend_t backend,
+                                   const char *mr_host, uint16_t mr_port)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    nvs_set_u8(nvs, NVS_KEY_BACKEND, (uint8_t)backend);
+    nvs_set_str(nvs, NVS_KEY_MR_HOST, mr_host ? mr_host : "");
+    nvs_set_u16(nvs, NVS_KEY_MR_PORT, mr_port);
+
+    err = nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "Config saved: backend=%s, moonraker=%s:%u",
+             backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
+             mr_host ? mr_host : "", mr_port);
+    return err;
+}
+
+/* ---- Web UI HTTP handlers ---- */
+
+static esp_err_t printer_config_get_handler(httpd_req_t *req)
+{
+    const char *checked_marlin  = (s_backend == PRINTER_BACKEND_MARLIN)  ? "checked" : "";
+    const char *checked_klipper = (s_backend == PRINTER_BACKEND_KLIPPER) ? "checked" : "";
+
+    char html[1536];
+    snprintf(html, sizeof(html),
+        "<!DOCTYPE html><html><head><title>Printer Config</title>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:sans-serif;max-width:480px;margin:20px auto;padding:0 10px}"
+        "label{display:block;margin:8px 0 4px}input[type=text],input[type=number]{width:100%%;box-sizing:border-box;padding:6px}"
+        ".radio-group{margin:10px 0}button{margin-top:16px;padding:10px 24px;font-size:16px}"
+        ".klipper-fields{margin-left:20px}"
+        "</style></head><body>"
+        "<h2>Printer Backend</h2>"
+        "<form method='POST' action='/printer/config'>"
+        "<div class='radio-group'>"
+        "<label><input type='radio' name='backend' value='marlin' %s> Marlin (USB serial)</label>"
+        "<label><input type='radio' name='backend' value='klipper' %s> Klipper (Moonraker HTTP)</label>"
+        "</div>"
+        "<div class='klipper-fields'>"
+        "<label>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63'></label>"
+        "<label>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535'></label>"
+        "</div>"
+        "<button type='submit'>Save &amp; Reboot</button>"
+        "</form>"
+        "<p><a href='/printer/config/test'>Test Moonraker connection</a></p>"
+        "</body></html>",
+        checked_marlin, checked_klipper, s_mr_host, s_mr_port);
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, strlen(html));
+}
+
+static esp_err_t printer_config_post_handler(httpd_req_t *req)
+{
+    char body[256];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    /* Parse form fields */
+    printer_backend_t backend = PRINTER_BACKEND_MARLIN;
+    char mr_host[64] = "";
+    uint16_t mr_port = 7125;
+
+    if (strstr(body, "backend=klipper")) {
+        backend = PRINTER_BACKEND_KLIPPER;
+    }
+
+    /* Extract mr_host */
+    char *hp = strstr(body, "mr_host=");
+    if (hp) {
+        hp += 8;
+        char *end = strchr(hp, '&');
+        size_t hlen = end ? (size_t)(end - hp) : strlen(hp);
+        if (hlen >= sizeof(mr_host)) hlen = sizeof(mr_host) - 1;
+        memcpy(mr_host, hp, hlen);
+        mr_host[hlen] = '\0';
+    }
+
+    /* Extract mr_port */
+    char *pp = strstr(body, "mr_port=");
+    if (pp) {
+        mr_port = (uint16_t)atoi(pp + 8);
+        if (mr_port == 0) mr_port = 7125;
+    }
+
+    esp_err_t err = printer_comm_save_config(backend, mr_host, mr_port);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+        return ESP_FAIL;
+    }
+
+    const char *resp =
+        "<!DOCTYPE html><html><head><title>Saved</title>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "</head><body>"
+        "<h2>Configuration saved!</h2>"
+        "<p>Rebooting in 3 seconds...</p>"
+        "<script>setTimeout(function(){location.href='/printer/config'},5000)</script>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    /* Reboot after a short delay so the response can be sent */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
+
+    return ESP_OK;
+}
+
+static esp_err_t printer_config_test_handler(httpd_req_t *req)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%u/printer/info", s_mr_host, s_mr_port);
+
+    /* Quick connectivity test */
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        httpd_resp_set_type(req, "application/json");
+        const char *fail = "{\"ok\":false,\"error\":\"client init failed\"}";
+        return httpd_resp_send(req, fail, strlen(fail));
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    char resp[128];
+    if (err == ESP_OK && status == 200) {
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\":true,\"host\":\"%s\",\"port\":%u}", s_mr_host, s_mr_port);
+    } else {
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\":false,\"error\":\"HTTP %d, err=%s\"}",
+                 status, esp_err_to_name(err));
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, strlen(resp));
+}
+
+esp_err_t printer_config_register_httpd(void *server_handle)
+{
+    httpd_handle_t server = (httpd_handle_t)server_handle;
+
+    httpd_uri_t get_cfg = {
+        .uri     = "/printer/config",
+        .method  = HTTP_GET,
+        .handler = printer_config_get_handler,
+    };
+    httpd_register_uri_handler(server, &get_cfg);
+
+    httpd_uri_t post_cfg = {
+        .uri     = "/printer/config",
+        .method  = HTTP_POST,
+        .handler = printer_config_post_handler,
+    };
+    httpd_register_uri_handler(server, &post_cfg);
+
+    httpd_uri_t test_cfg = {
+        .uri     = "/printer/config/test",
+        .method  = HTTP_GET,
+        .handler = printer_config_test_handler,
+    };
+    httpd_register_uri_handler(server, &test_cfg);
+
     return ESP_OK;
 }
