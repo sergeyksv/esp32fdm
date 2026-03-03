@@ -39,6 +39,7 @@ static bool s_linked = false;
 /* ---- Obico state ---- */
 
 static bool s_should_watch = false;  /* Obico AI wants to watch */
+static bool s_viewing = false;       /* User viewing webcam in Obico UI */
 static TaskHandle_t s_ws_task_handle = NULL;
 static TaskHandle_t s_snap_task_handle = NULL;
 static esp_websocket_client_handle_t s_ws_client = NULL;
@@ -468,6 +469,11 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
                         s_should_watch = cJSON_IsTrue(watch);
                         ESP_LOGI(TAG, "should_watch=%d", s_should_watch);
                     }
+                    const cJSON *viewing = cJSON_GetObjectItem(remote, "viewing");
+                    if (viewing && cJSON_IsBool(viewing)) {
+                        s_viewing = cJSON_IsTrue(viewing);
+                        ESP_LOGI(TAG, "viewing=%d", s_viewing);
+                    }
                 }
 
                 /* Handle Janus signaling relay */
@@ -730,6 +736,21 @@ static void obico_snap_task(void *arg)
             continue;
         }
 
+        printer_state_t ps;
+        printer_comm_get_state(&ps);
+        bool printing = (ps.opstate == PRINTER_PRINTING || ps.opstate == PRINTER_PAUSED);
+
+        /*
+         * Match official Obico agent behavior:
+         * - Not printing AND nobody viewing → skip upload entirely
+         * - Printing or viewing, with should_watch or viewing → fast (10s)
+         * - Printing, but no should_watch and no viewing → slow (120s)
+         */
+        if (!printing && !s_viewing) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
         /* Capture and upload */
         camera_fb_t *fb = camera_capture_frame();
         if (fb) {
@@ -739,11 +760,8 @@ static void obico_snap_task(void *arg)
             ESP_LOGW(TAG, "Snapshot capture failed");
         }
 
-        /* Adaptive interval: shorter when printing or AI watching */
-        printer_state_t ps;
-        printer_comm_get_state(&ps);
         int interval_s;
-        if (ps.opstate == PRINTER_PRINTING || s_should_watch) {
+        if (s_viewing || s_should_watch) {
             interval_s = CONFIG_OBICO_SNAP_INTERVAL_PRINTING;
         } else {
             interval_s = CONFIG_OBICO_SNAP_INTERVAL_IDLE;
