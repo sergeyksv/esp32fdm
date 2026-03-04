@@ -30,6 +30,10 @@ typedef struct {
     int32_t print_time_left_s;   /* estimated remaining, or -1 */
     float x, y, z;
     char filename[64];
+    float layer_height;          /* from slicer metadata, 0 if unknown */
+    float first_layer_height;    /* from slicer metadata, 0 if unknown */
+    float object_height;         /* max Z from slicer metadata, 0 if unknown */
+    int32_t total_layers;        /* computed from metadata, -1 if unknown */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
 } printer_state_t;
 

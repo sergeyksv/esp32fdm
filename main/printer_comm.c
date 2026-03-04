@@ -87,6 +87,7 @@ static int64_t s_last_m114_us;
 /* Print start time tracking */
 static int64_t s_print_start_us;
 static bool s_need_filename;
+static bool s_have_m73;        /* true once we've seen M73 — prefer slicer progress over M27 bytes */
 
 /* Cooldown after pause/resume/cancel — let firmware settle */
 static int64_t s_cmd_cooldown_until_us;
@@ -150,23 +151,38 @@ static void parse_m27(const char *line)
     if (sd) {
         long pos = 0, total = 0;
         if (sscanf(sd, "SD printing byte %ld/%ld", &pos, &total) == 2 && total > 0) {
-            s_state.progress_pct = (float)pos / (float)total * 100.0f;
 
             if (s_state.opstate != PRINTER_PAUSED) {
                 if (s_state.opstate != PRINTER_PRINTING) {
                     s_print_start_us = esp_timer_get_time();
                     s_need_filename = true;
+                    s_have_m73 = false;
                 }
                 s_state.opstate = PRINTER_PRINTING;
             }
 
-            /* Estimate times */
-            int64_t elapsed_us = esp_timer_get_time() - s_print_start_us;
-            s_state.print_time_s = (int32_t)(elapsed_us / 1000000);
-            if (s_state.progress_pct > 0.1f) {
-                float total_est = (float)s_state.print_time_s / (s_state.progress_pct / 100.0f);
-                s_state.print_time_left_s = (int32_t)(total_est - s_state.print_time_s);
-                if (s_state.print_time_left_s < 0) s_state.print_time_left_s = 0;
+            /* M27 byte-position progress — use as fallback if slicer doesn't embed M73 */
+            if (!s_have_m73) {
+                s_state.progress_pct = (float)pos / (float)total * 100.0f;
+
+                int64_t elapsed_us = esp_timer_get_time() - s_print_start_us;
+                s_state.print_time_s = (int32_t)(elapsed_us / 1000000);
+                if (s_state.progress_pct > 0.1f) {
+                    float total_est = (float)s_state.print_time_s / (s_state.progress_pct / 100.0f);
+                    s_state.print_time_left_s = (int32_t)(total_est - s_state.print_time_s);
+                    if (s_state.print_time_left_s < 0) s_state.print_time_left_s = 0;
+                }
+            } else {
+                /* Still track elapsed time from wall clock */
+                int64_t elapsed_us = esp_timer_get_time() - s_print_start_us;
+                s_state.print_time_s = (int32_t)(elapsed_us / 1000000);
+            }
+
+            /* Estimate object height and layers from Z + progress */
+            if (s_state.z > 0.1f && s_state.progress_pct > 1.0f) {
+                s_state.object_height = s_state.z / (s_state.progress_pct / 100.0f);
+                float lh = s_state.layer_height > 0 ? s_state.layer_height : 0.2f;
+                s_state.total_layers = (int32_t)(s_state.object_height / lh + 0.5f);
             }
         }
     } else if (strstr(line, "Not SD printing")) {
@@ -176,6 +192,8 @@ static void parse_m27(const char *line)
             s_state.print_time_s = -1;
             s_state.print_time_left_s = -1;
             s_state.filename[0] = '\0';
+            s_state.object_height = 0;
+            s_state.total_layers = -1;
         }
     }
 
@@ -231,6 +249,27 @@ static void process_line(const char *line)
         parse_m27c(line);
     } else if (strstr(line, "X:") && strstr(line, "Y:") && strstr(line, "Z:")) {
         parse_m114(line);
+    }
+
+    /* M73 from slicer — Marlin echoes "echo:Unknown command: "M73 P15 R21"" */
+    const char *m73 = strstr(line, "M73");
+    if (m73) {
+        int pct = -1;
+        int mins = -1;
+        const char *pp = strstr(m73, "P");
+        if (pp) pct = atoi(pp + 1);
+        const char *rp = strstr(m73, "R");
+        if (rp) mins = atoi(rp + 1);
+        if (pct >= 0 && pct <= 100) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_have_m73 = true;
+            s_state.progress_pct = (float)pct;
+            if (mins >= 0) {
+                s_state.print_time_left_s = mins * 60;
+            }
+            xSemaphoreGive(s_state_mutex);
+            ESP_LOGI(TAG, "M73: progress=%d%% remaining=%dmin", pct, mins);
+        }
     }
 
     /* Marlin says "busy: processing" when it can't accept commands yet */
@@ -605,6 +644,7 @@ esp_err_t printer_comm_init(void)
     s_state.progress_pct = -1;
     s_state.print_time_s = -1;
     s_state.print_time_left_s = -1;
+    s_state.total_layers = -1;
 
     xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 4096,
                             NULL, 8, NULL, 0);

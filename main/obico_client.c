@@ -382,11 +382,34 @@ static char *build_status_json(const printer_state_t *ps)
     cJSON_AddNumberToObject(bed, "actual", ps->bed_actual);
     cJSON_AddNumberToObject(bed, "target", ps->bed_target);
 
-    /* Current Z height and approximate layer number */
+    /* Current Z height and layer number */
     cJSON_AddNumberToObject(status, "currentZ", ps->z);
     if (printing || paused) {
-        cJSON_AddNumberToObject(status, "currentLayerHeight",
-                                (int)(ps->z / 0.2f));
+        float lh = ps->layer_height > 0 ? ps->layer_height : 0.2f;
+        float flh = ps->first_layer_height > 0 ? ps->first_layer_height : lh;
+        int cur_layer = 0;
+        if (ps->z > 0) {
+            if (ps->z <= flh) {
+                cur_layer = 1;
+            } else {
+                cur_layer = 1 + (int)((ps->z - flh) / lh + 0.5f);
+            }
+        }
+        cJSON_AddNumberToObject(status, "currentLayerHeight", cur_layer);
+    }
+
+    /* File metadata — needed by Obico UI for Z/layer totals */
+    if (ps->object_height > 0 || ps->total_layers > 0) {
+        cJSON *fmeta = cJSON_AddObjectToObject(status, "file_metadata");
+        if (ps->object_height > 0) {
+            cJSON *analysis = cJSON_AddObjectToObject(fmeta, "analysis");
+            cJSON *pa = cJSON_AddObjectToObject(analysis, "printingArea");
+            cJSON_AddNumberToObject(pa, "maxZ", ps->object_height);
+        }
+        if (ps->total_layers > 0) {
+            cJSON *obico_meta = cJSON_AddObjectToObject(fmeta, "obico");
+            cJSON_AddNumberToObject(obico_meta, "totalLayerCount", ps->total_layers);
+        }
     }
 
     /* Progress */
