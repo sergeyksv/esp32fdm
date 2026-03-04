@@ -52,8 +52,8 @@ esp_err_t camera_init(void)
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_VGA,  /* 640x480 */
-        .jpeg_quality = 30,             /* 1-63, lower = better quality */
+        .frame_size   = FRAMESIZE_SVGA, /* 800x600 */
+        .jpeg_quality = 20,             /* 1-63, lower = better quality */
         .fb_count     = 3,              /* 3 for GRAB_LATEST: DMA + ready + consumer */
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
@@ -65,7 +65,7 @@ esp_err_t camera_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "Camera initialized (VGA JPEG, 2 buffers in PSRAM)");
+    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 3 buffers in PSRAM)");
     return ESP_OK;
 }
 

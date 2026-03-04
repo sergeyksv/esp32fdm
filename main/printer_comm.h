@@ -100,7 +100,8 @@ uint16_t printer_comm_get_mr_port(void);
  * Takes effect after reboot.
  */
 esp_err_t printer_comm_save_config(printer_backend_t backend,
-                                   const char *mr_host, uint16_t mr_port);
+                                   const char *mr_host, uint16_t mr_port,
+                                   bool pause_abort);
 
 /**
  * Register printer config HTTP endpoints on the given server.

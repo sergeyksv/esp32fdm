@@ -16,7 +16,7 @@
 
 static const char *TAG = "httpd";
 
-#define STREAM_TARGET_FPS 10
+#define STREAM_TARGET_FPS 5
 #define STREAM_FRAME_INTERVAL_US (1000000 / STREAM_TARGET_FPS)
 #define STREAM_PORT 81
 
@@ -25,7 +25,7 @@ static const char *STREAM_RESP_HEADER =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace;boundary=esp32fdm_frame\r\n"
     "Access-Control-Allow-Origin: *\r\n"
-    "X-Framerate: 10\r\n"
+    "X-Framerate: 5\r\n"
     "\r\n";
 
 /* ---- /capture handler (stays on httpd, Core 0) ---- */

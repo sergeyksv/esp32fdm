@@ -382,6 +382,13 @@ static char *build_status_json(const printer_state_t *ps)
     cJSON_AddNumberToObject(bed, "actual", ps->bed_actual);
     cJSON_AddNumberToObject(bed, "target", ps->bed_target);
 
+    /* Current Z height and approximate layer number */
+    cJSON_AddNumberToObject(status, "currentZ", ps->z);
+    if (printing || paused) {
+        cJSON_AddNumberToObject(status, "currentLayerHeight",
+                                (int)(ps->z / 0.2f));
+    }
+
     /* Progress */
     cJSON *progress = cJSON_AddObjectToObject(status, "progress");
     if (ps->progress_pct >= 0) {

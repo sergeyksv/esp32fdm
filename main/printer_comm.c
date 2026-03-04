@@ -27,7 +27,7 @@ static const char *TAG = "printer_comm";
 #define POLL_M105_INTERVAL_MS   4000
 #define POLL_M27_INTERVAL_MS    10000
 #define POLL_M114_INTERVAL_MS   30000
-#define CMD_RESPONSE_TIMEOUT_MS 500
+#define CMD_RESPONSE_TIMEOUT_MS 6000
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
@@ -35,12 +35,19 @@ static const char *TAG = "printer_comm";
 #define NVS_KEY_BACKEND         "backend"
 #define NVS_KEY_MR_HOST         "mr_host"
 #define NVS_KEY_MR_PORT         "mr_port"
+#define NVS_KEY_PAUSE_CMD       "pause_cmd"
 
 /* ---- Backend config ---- */
+
+typedef enum {
+    PAUSE_CMD_M25  = 0,  /* Pause SD print (can resume) */
+    PAUSE_CMD_M524 = 1,  /* Abort SD print (workaround for buggy firmware) */
+} pause_cmd_t;
 
 static printer_backend_t s_backend = PRINTER_BACKEND_MARLIN;
 static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
+static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
 
 /* ---- State (Marlin backend) ---- */
 
@@ -65,6 +72,7 @@ typedef enum {
     QUERY_NONE,
     QUERY_M105,
     QUERY_M27,
+    QUERY_M27C,
     QUERY_M114,
     QUERY_CMD,
 } query_type_t;
@@ -78,6 +86,10 @@ static int64_t s_last_m114_us;
 
 /* Print start time tracking */
 static int64_t s_print_start_us;
+static bool s_need_filename;
+
+/* Cooldown after pause/resume/cancel — let firmware settle */
+static int64_t s_cmd_cooldown_until_us;
 
 /* ---- Helpers ---- */
 
@@ -143,6 +155,7 @@ static void parse_m27(const char *line)
             if (s_state.opstate != PRINTER_PAUSED) {
                 if (s_state.opstate != PRINTER_PRINTING) {
                     s_print_start_us = esp_timer_get_time();
+                    s_need_filename = true;
                 }
                 s_state.opstate = PRINTER_PRINTING;
             }
@@ -169,6 +182,22 @@ static void parse_m27(const char *line)
     xSemaphoreGive(s_state_mutex);
 }
 
+/** Parse M27 C response: "Current file: filename.gcode" */
+static void parse_m27c(const char *line)
+{
+    const char *prefix = "Current file: ";
+    const char *p = strstr(line, prefix);
+    if (!p) return;
+
+    p += strlen(prefix);
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    strncpy(s_state.filename, p, sizeof(s_state.filename) - 1);
+    s_state.filename[sizeof(s_state.filename) - 1] = '\0';
+    xSemaphoreGive(s_state_mutex);
+
+    ESP_LOGI(TAG, "Current file: %s", s_state.filename);
+}
+
 /** Parse M114 response: "X:100.00 Y:50.00 Z:0.30 E:123.45" */
 static void parse_m114(const char *line)
 {
@@ -191,31 +220,50 @@ static void process_line(const char *line)
     /* Skip empty lines */
     if (line[0] == '\0') return;
 
-    ESP_LOGD(TAG, "RX: %s", line);
+    ESP_LOGI(TAG, "RX: %s", line);
 
-    switch (s_pending_query) {
-    case QUERY_M105:
+    /* Content-based matching — handles unsolicited auto-reports too */
+    if (strstr(line, "T:")) {
+        parse_m105(line);
+    } else if (strstr(line, "SD printing") || strstr(line, "Not SD")) {
+        parse_m27(line);
+    } else if (strstr(line, "Current file:")) {
+        parse_m27c(line);
+    } else if (strstr(line, "X:") && strstr(line, "Y:") && strstr(line, "Z:")) {
+        parse_m114(line);
+    }
+
+    /* Marlin says "busy: processing" when it can't accept commands yet */
+    if (strstr(line, "busy:")) {
+        s_cmd_cooldown_until_us = esp_timer_get_time() + 4000000LL; /* back off 4s */
+        s_pending_query = QUERY_NONE;
+        return;
+    }
+
+    /* "ok" signals end of response for current query.
+     * Marlin often sends "ok T:205.3 /210.0 B:60.1 /60.0" — temp data on the ok line. */
+    if (strncmp(line, "ok", 2) == 0) {
         if (strstr(line, "T:")) {
             parse_m105(line);
         }
-        break;
-    case QUERY_M27:
-        if (strstr(line, "SD printing") || strstr(line, "Not SD")) {
-            parse_m27(line);
-        }
-        break;
-    case QUERY_M114:
-        if (strstr(line, "X:") && strstr(line, "Y:")) {
-            parse_m114(line);
-        }
-        break;
-    default:
-        break;
-    }
-
-    /* "ok" signals end of response for current query */
-    if (strncmp(line, "ok", 2) == 0) {
         s_pending_query = QUERY_NONE;
+    }
+}
+
+/** Drain buffered RX data, processing any complete lines (e.g. auto-reports) */
+static void drain_rx(void)
+{
+    uint8_t rx_byte;
+    while (xStreamBufferReceive(s_rx_stream, &rx_byte, 1, 0) > 0) {
+        if (rx_byte == '\n' || rx_byte == '\r') {
+            if (s_line_len > 0) {
+                s_line_buf[s_line_len] = '\0';
+                process_line(s_line_buf);
+                s_line_len = 0;
+            }
+        } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
+            s_line_buf[s_line_len++] = (char)rx_byte;
+        }
     }
 }
 
@@ -224,12 +272,20 @@ static bool send_query(const char *gcode, query_type_t qtype)
 {
     if (!usb_serial_is_connected()) return false;
 
+    /* Process any buffered unsolicited data before sending */
+    s_pending_query = QUERY_NONE;
+    drain_rx();
+
+    /* Abort if drain_rx saw busy: and set cooldown */
+    if (esp_timer_get_time() < s_cmd_cooldown_until_us) return false;
+
     s_pending_query = qtype;
     s_line_len = 0;
 
     /* Send command with newline */
     char buf[100];
     int len = snprintf(buf, sizeof(buf), "%s\n", gcode);
+    ESP_LOGI(TAG, "TX: %s", gcode);
     esp_err_t err = usb_serial_send((const uint8_t *)buf, len);
     if (err != ESP_OK) {
         s_pending_query = QUERY_NONE;
@@ -243,7 +299,7 @@ static bool send_query(const char *gcode, query_type_t qtype)
     while (s_pending_query != QUERY_NONE) {
         int64_t remaining_us = deadline - esp_timer_get_time();
         if (remaining_us <= 0) {
-            ESP_LOGD(TAG, "Timeout waiting for response to %s", gcode);
+            ESP_LOGW(TAG, "Timeout waiting for response to %s", gcode);
             s_pending_query = QUERY_NONE;
             return false;
         }
@@ -296,7 +352,11 @@ static void printer_comm_task(void *arg)
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             const char *gcode = NULL;
             switch (cmd.type) {
-            case PCMD_PAUSE:  gcode = "M25"; break;
+            case PCMD_PAUSE:
+                ESP_LOGI(TAG, "Draining planner (M400) before pause...");
+                send_query("M400", QUERY_CMD);
+                gcode = (s_pause_cmd == PAUSE_CMD_M524) ? "M524" : "M25";
+                break;
             case PCMD_RESUME: gcode = "M24"; break;
             case PCMD_CANCEL: gcode = "M524"; break;
             case PCMD_RAW:    gcode = cmd.gcode; break;
@@ -304,14 +364,31 @@ static void printer_comm_task(void *arg)
             if (gcode) {
                 ESP_LOGI(TAG, "Sending command: %s", gcode);
                 send_query(gcode, QUERY_CMD);
+
+                /* Before pause, drain planner buffer first */
+                if (cmd.type == PCMD_PAUSE) {
+                    s_cmd_cooldown_until_us = esp_timer_get_time() + 5000000LL; /* 5s */
+                }
             }
         }
+
+        /* Skip polling during cooldown */
+#define CHECK_COOLDOWN() \
+        do { now = esp_timer_get_time(); \
+             if (now < s_cmd_cooldown_until_us) goto poll_done; } while(0)
+
+        /* Macro: skip remaining polls if cooldown active (set by busy: handler) */
+#define CHECK_COOLDOWN() \
+        do { if (esp_timer_get_time() < s_cmd_cooldown_until_us) goto poll_done; } while(0)
+
+        CHECK_COOLDOWN();
 
         /* Poll M105 (temperatures) every 4s */
         now = esp_timer_get_time();
         if (now - s_last_m105_us >= POLL_M105_INTERVAL_MS * 1000LL) {
             send_query("M105", QUERY_M105);
             s_last_m105_us = esp_timer_get_time();
+            CHECK_COOLDOWN();
         }
 
         /* Poll M27 (SD progress) every 10s */
@@ -319,6 +396,14 @@ static void printer_comm_task(void *arg)
         if (now - s_last_m27_us >= POLL_M27_INTERVAL_MS * 1000LL) {
             send_query("M27", QUERY_M27);
             s_last_m27_us = esp_timer_get_time();
+            CHECK_COOLDOWN();
+        }
+
+        /* Fetch filename once when printing starts */
+        if (s_need_filename) {
+            s_need_filename = false;
+            send_query("M27 C", QUERY_M27C);
+            CHECK_COOLDOWN();
         }
 
         /* Poll M114 (position) every 30s */
@@ -327,6 +412,9 @@ static void printer_comm_task(void *arg)
             send_query("M114", QUERY_M114);
             s_last_m114_us = esp_timer_get_time();
         }
+
+poll_done:
+#undef CHECK_COOLDOWN
 
         /* Small delay to avoid busy-looping between polls */
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -354,6 +442,11 @@ static void load_config_from_nvs(void)
     nvs_get_u16(nvs, NVS_KEY_MR_PORT, &s_mr_port);
     if (s_mr_port == 0) s_mr_port = 7125;
 
+    uint8_t pause_val = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_PAUSE_CMD, &pause_val) == ESP_OK) {
+        s_pause_cmd = (pause_val == 1) ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
+    }
+
     nvs_close(nvs);
 
     /* Fall back to Marlin if Klipper selected but no host configured */
@@ -362,9 +455,10 @@ static void load_config_from_nvs(void)
         s_backend = PRINTER_BACKEND_MARLIN;
     }
 
-    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u",
+    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u, pause=%s",
              s_backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
-             s_mr_host, s_mr_port);
+             s_mr_host, s_mr_port,
+             s_pause_cmd == PAUSE_CMD_M524 ? "M524 (abort)" : "M25 (pause)");
 }
 
 /* ---- Public API ---- */
@@ -539,7 +633,8 @@ uint16_t printer_comm_get_mr_port(void)
 /* ---- NVS save ---- */
 
 esp_err_t printer_comm_save_config(printer_backend_t backend,
-                                   const char *mr_host, uint16_t mr_port)
+                                   const char *mr_host, uint16_t mr_port,
+                                   bool pause_abort)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
@@ -548,13 +643,15 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
     nvs_set_u8(nvs, NVS_KEY_BACKEND, (uint8_t)backend);
     nvs_set_str(nvs, NVS_KEY_MR_HOST, mr_host ? mr_host : "");
     nvs_set_u16(nvs, NVS_KEY_MR_PORT, mr_port);
+    nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, pause_abort ? 1 : 0);
 
     err = nvs_commit(nvs);
     nvs_close(nvs);
 
-    ESP_LOGI(TAG, "Config saved: backend=%s, moonraker=%s:%u",
+    ESP_LOGI(TAG, "Config saved: backend=%s, moonraker=%s:%u, pause=%s",
              backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
-             mr_host ? mr_host : "", mr_port);
+             mr_host ? mr_host : "", mr_port,
+             pause_abort ? "M524 (abort)" : "M25 (pause)");
     return err;
 }
 
@@ -564,8 +661,10 @@ static esp_err_t printer_config_get_handler(httpd_req_t *req)
 {
     const char *checked_marlin  = (s_backend == PRINTER_BACKEND_MARLIN)  ? "checked" : "";
     const char *checked_klipper = (s_backend == PRINTER_BACKEND_KLIPPER) ? "checked" : "";
+    const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
+    const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
 
-    char html[1536];
+    char html[2048];
     snprintf(html, sizeof(html),
         "<!DOCTYPE html><html><head><title>Printer Config</title>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -585,11 +684,17 @@ static esp_err_t printer_config_get_handler(httpd_req_t *req)
         "<label>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63'></label>"
         "<label>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535'></label>"
         "</div>"
+        "<h2>Pause Command</h2>"
+        "<div class='radio-group'>"
+        "<label><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
+        "<label><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
+        "</div>"
         "<button type='submit'>Save &amp; Reboot</button>"
         "</form>"
         "<p><a href='/printer/config/test'>Test Moonraker connection</a></p>"
         "</body></html>",
-        checked_marlin, checked_klipper, s_mr_host, s_mr_port);
+        checked_marlin, checked_klipper, s_mr_host, s_mr_port,
+        checked_m25, checked_m524);
 
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, strlen(html));
@@ -632,7 +737,9 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
         if (mr_port == 0) mr_port = 7125;
     }
 
-    esp_err_t err = printer_comm_save_config(backend, mr_host, mr_port);
+    bool pause_abort = (strstr(body, "pause_cmd=m524") != NULL);
+
+    esp_err_t err = printer_comm_save_config(backend, mr_host, mr_port, pause_abort);
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
         return ESP_FAIL;

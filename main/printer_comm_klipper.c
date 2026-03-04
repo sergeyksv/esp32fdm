@@ -51,7 +51,7 @@ static int http_get(const char *path)
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "GET %s open failed: %s", path, esp_err_to_name(err));
+        ESP_LOGW(TAG, "GET %s open failed: %s", path, esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return -1;
     }
@@ -93,7 +93,7 @@ static int http_post(const char *path)
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "POST %s open failed: %s", path, esp_err_to_name(err));
+        ESP_LOGW(TAG, "POST %s open failed: %s", path, esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return -1;
     }
@@ -296,6 +296,11 @@ esp_err_t klipper_backend_send_cmd(const printer_cmd_t *cmd)
 {
     int status;
 
+    static const char *cmd_names[] = { "pause", "resume", "cancel", "raw" };
+    ESP_LOGI(TAG, "CMD: %s%s%s", cmd_names[cmd->type],
+             cmd->type == PCMD_RAW ? " → " : "",
+             cmd->type == PCMD_RAW ? cmd->gcode : "");
+
     switch (cmd->type) {
     case PCMD_PAUSE:
         status = http_post("/printer/print/pause");
@@ -342,5 +347,6 @@ esp_err_t klipper_backend_send_cmd(const printer_cmd_t *cmd)
         return ESP_FAIL;
     }
 
+    ESP_LOGI(TAG, "Command OK (HTTP 200)");
     return ESP_OK;
 }
