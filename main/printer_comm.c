@@ -470,10 +470,19 @@ static bool send_query_numbered(const char *gcode)
 
     /* Handle resend requests */
     while (s_host_resend_line >= 0) {
+        if (s_host_resend_line == s_host_marlin_line + 1) {
+            /* Printer already executed our line and wants the next one.
+             * This means our command succeeded — just advance the counter. */
+            ESP_LOGW(TAG, "Printer already has N%ld, wants N%ld — command accepted",
+                     (long)s_host_marlin_line, (long)s_host_resend_line);
+            s_host_resend_line = -1;
+            s_host_marlin_line++;
+            return true;
+        }
         if (s_host_resend_line != s_host_marlin_line) {
             ESP_LOGE(TAG, "Resend line mismatch: expected N%ld, got N%ld — resync",
                      (long)s_host_marlin_line, (long)s_host_resend_line);
-            /* Resync Marlin's line counter */
+            /* Resync Marlin's line counter to our current line */
             char sync[40];
             format_numbered_line(sync, sizeof(sync), s_host_marlin_line, "M110");
             send_query(sync, QUERY_CMD);

@@ -212,13 +212,12 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     int cpu0_pct = 0, cpu1_pct = 0;
     if (s_stats_initialized && total_runtime > s_prev_total) {
         uint32_t dt = total_runtime - s_prev_total;
-        /* dt is total across both cores, so per-core share is dt/2 */
-        uint32_t per_core = dt / 2;
-        if (per_core > 0) {
+        /* total_runtime is wall-clock timer ticks (same for both cores) */
+        if (dt > 0) {
             uint32_t idle0_delta = idle_now[0] - s_prev_idle[0];
             uint32_t idle1_delta = idle_now[1] - s_prev_idle[1];
-            cpu0_pct = 100 - (int)(idle0_delta * 100 / per_core);
-            cpu1_pct = 100 - (int)(idle1_delta * 100 / per_core);
+            cpu0_pct = 100 - (int)(idle0_delta * 100 / dt);
+            cpu1_pct = 100 - (int)(idle1_delta * 100 / dt);
             if (cpu0_pct < 0) cpu0_pct = 0;
             if (cpu1_pct < 0) cpu1_pct = 0;
             if (cpu0_pct > 100) cpu0_pct = 100;
