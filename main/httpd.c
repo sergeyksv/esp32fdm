@@ -8,6 +8,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -176,6 +177,76 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json, strlen(json));
+}
+
+/* ---- GET /api/stats — per-core CPU usage ---- */
+
+/* Accumulated idle ticks from previous call, per core */
+static uint32_t s_prev_idle[2];
+static uint32_t s_prev_total;
+static bool     s_stats_initialized;
+
+static esp_err_t api_stats_handler(httpd_req_t *req)
+{
+#if defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
+    UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
+    TaskStatus_t *task_array = malloc(num_tasks * sizeof(TaskStatus_t));
+    if (!task_array) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    uint32_t total_runtime;
+    UBaseType_t count = uxTaskGetSystemState(task_array, num_tasks, &total_runtime);
+
+    /* Sum idle task runtime per core (IDLE0, IDLE1) */
+    uint32_t idle_now[2] = {0, 0};
+    for (UBaseType_t i = 0; i < count; i++) {
+        const char *name = task_array[i].pcTaskName;
+        if (strcmp(name, "IDLE0") == 0 || strcmp(name, "IDLE") == 0)
+            idle_now[0] = task_array[i].ulRunTimeCounter;
+        else if (strcmp(name, "IDLE1") == 0)
+            idle_now[1] = task_array[i].ulRunTimeCounter;
+    }
+
+    int cpu0_pct = 0, cpu1_pct = 0;
+    if (s_stats_initialized && total_runtime > s_prev_total) {
+        uint32_t dt = total_runtime - s_prev_total;
+        /* dt is total across both cores, so per-core share is dt/2 */
+        uint32_t per_core = dt / 2;
+        if (per_core > 0) {
+            uint32_t idle0_delta = idle_now[0] - s_prev_idle[0];
+            uint32_t idle1_delta = idle_now[1] - s_prev_idle[1];
+            cpu0_pct = 100 - (int)(idle0_delta * 100 / per_core);
+            cpu1_pct = 100 - (int)(idle1_delta * 100 / per_core);
+            if (cpu0_pct < 0) cpu0_pct = 0;
+            if (cpu1_pct < 0) cpu1_pct = 0;
+            if (cpu0_pct > 100) cpu0_pct = 100;
+            if (cpu1_pct > 100) cpu1_pct = 100;
+        }
+    }
+    s_prev_idle[0] = idle_now[0];
+    s_prev_idle[1] = idle_now[1];
+    s_prev_total = total_runtime;
+    s_stats_initialized = true;
+
+    free(task_array);
+
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t min_heap = esp_get_minimum_free_heap_size();
+
+    char json[128];
+    snprintf(json, sizeof(json),
+        "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu}",
+        cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json, strlen(json));
+#else
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"error\":\"stats not enabled\"}", HTTPD_RESP_USE_STRLEN);
+#endif
 }
 
 /* ---- / root handler — dashboard ---- */
@@ -529,6 +600,13 @@ esp_err_t httpd_start_server(void)
         .handler  = api_status_handler,
     };
     httpd_register_uri_handler(server, &api_status);
+
+    httpd_uri_t api_stats = {
+        .uri      = "/api/stats",
+        .method   = HTTP_GET,
+        .handler  = api_stats_handler,
+    };
+    httpd_register_uri_handler(server, &api_stats);
 
     httpd_uri_t camera_page = {
         .uri      = "/camera",
