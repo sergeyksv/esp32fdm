@@ -1,8 +1,14 @@
 #include "camera.h"
 
 #include "esp_log.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "camera";
+
+#define NVS_NS_CAMERA  "camera"
+#define NVS_KEY_ROT180 "rotate180"
+
+static bool s_rotate180 = false;
 
 /*
  * Freenove ESP32-S3-WROOM pin mapping for OV2640 (DVP parallel interface).
@@ -65,7 +71,24 @@ esp_err_t camera_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 3 buffers in PSRAM)");
+    /* Load rotation setting from NVS and apply */
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS_CAMERA, NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t val = 0;
+        if (nvs_get_u8(nvs, NVS_KEY_ROT180, &val) == ESP_OK) {
+            s_rotate180 = (val != 0);
+        }
+        nvs_close(nvs);
+    }
+    if (s_rotate180) {
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) {
+            s->set_hmirror(s, 1);
+            s->set_vflip(s, 1);
+        }
+    }
+
+    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 3 buffers, rotate180=%d)", s_rotate180);
     return ESP_OK;
 }
 
@@ -76,4 +99,29 @@ camera_fb_t *camera_capture_frame(void)
         ESP_LOGW(TAG, "Frame capture failed");
     }
     return fb;
+}
+
+void camera_set_rotate180(bool enable)
+{
+    s_rotate180 = enable;
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_hmirror(s, enable ? 1 : 0);
+        s->set_vflip(s, enable ? 1 : 0);
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS_CAMERA, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_ROT180, enable ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    ESP_LOGI(TAG, "Rotate 180°: %s", enable ? "ON" : "OFF");
+}
+
+bool camera_get_rotate180(void)
+{
+    return s_rotate180;
 }

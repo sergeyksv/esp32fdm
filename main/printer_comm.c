@@ -94,6 +94,12 @@ static bool s_have_m73;        /* true once we've seen M73 — prefer slicer pro
 /* Cooldown after pause/resume/cancel — let firmware settle */
 static int64_t s_cmd_cooldown_until_us;
 
+/* Unsupported command tracking — commands that Marlin reports as unknown.
+ * Store just the numeric code (e.g. 73 for M73, 900 for M900). */
+#define UNSUPPORTED_CMD_MAX 16
+static uint16_t s_unsupported_cmds[UNSUPPORTED_CMD_MAX];
+static int s_unsupported_count;
+
 /* ---- Host print state ---- */
 static FILE *s_host_file;
 static bool s_host_printing, s_host_paused;
@@ -102,6 +108,13 @@ static int64_t s_host_start_us, s_host_pause_elapsed_us;
 static char s_host_filename[64];
 static char s_host_pending_line[128]; /* line read but not yet sent */
 static bool s_host_has_pending;
+static float s_park_x, s_park_y, s_park_z; /* saved position before park */
+
+/* Park position and retract settings */
+#define PARK_X       0.0f
+#define PARK_Y       0.0f
+#define PARK_Z_LIFT  5.0f    /* mm to lift Z on pause */
+#define PARK_RETRACT 2.0f    /* mm filament retract on pause */
 
 /* Internal command types for host print (sent via s_cmd_queue) */
 #define PCMD_HOST_START  100
@@ -268,6 +281,26 @@ static void process_line(const char *line)
         parse_m114(line);
     }
 
+    /* Detect unsupported commands: echo:Unknown command: "M73 P15 R21" */
+    const char *unk = strstr(line, "Unknown command:");
+    if (unk) {
+        /* Find the M/G code in the quoted string */
+        const char *q = strchr(unk, '"');
+        if (q && (q[1] == 'M' || q[1] == 'G')) {
+            uint16_t code = (uint16_t)atoi(q + 2);
+            /* Add to unsupported list if not already there */
+            bool found = false;
+            for (int i = 0; i < s_unsupported_count; i++) {
+                if (s_unsupported_cmds[i] == code) { found = true; break; }
+            }
+            if (!found && s_unsupported_count < UNSUPPORTED_CMD_MAX) {
+                s_unsupported_cmds[s_unsupported_count++] = code;
+                ESP_LOGW(TAG, "Marking %c%u as unsupported",
+                         q[1], code);
+            }
+        }
+    }
+
     /* M73 from slicer — Marlin echoes "echo:Unknown command: "M73 P15 R21"" */
     const char *m73 = strstr(line, "M73");
     if (m73) {
@@ -382,15 +415,145 @@ static bool send_query(const char *gcode, query_type_t qtype)
 
 /* ---- Host print helpers ---- */
 
-/** Count total lines in file (for progress), then rewind */
-static int32_t count_lines(FILE *f)
+/** Scan GCode file: count lines, find max Z, layer count, layer heights */
+typedef struct {
+    int32_t total_lines;
+    float max_z;              /* highest Z from G0/G1 moves */
+    float layer_height;       /* from slicer comment or computed */
+    float first_layer_height; /* from slicer comment or first Z */
+    int32_t total_layers;     /* from ;LAYER: comments */
+} gcode_scan_t;
+
+static void scan_gcode_file(FILE *f, gcode_scan_t *out)
 {
-    int32_t count = 0;
+    memset(out, 0, sizeof(*out));
+    out->total_layers = -1;
+
     char buf[128];
+    int32_t max_layer = -1;
+    float first_z = 0, prev_z = 0;
+    bool seen_z = false;
+
     rewind(f);
-    while (fgets(buf, sizeof(buf), f)) count++;
+    while (fgets(buf, sizeof(buf), f)) {
+        out->total_lines++;
+
+        /* Slicer metadata comments */
+        if (buf[0] == ';') {
+            /* PrusaSlicer/SuperSlicer/OrcaSlicer: ; layer_height = 0.2 */
+            const char *lh = strstr(buf, "layer_height");
+            if (lh) {
+                const char *eq = strchr(lh, '=');
+                if (eq) {
+                    float v = strtof(eq + 1, NULL);
+                    if (v > 0.01f && v < 1.0f) {
+                        /* "first_layer_height" vs "layer_height" */
+                        if (strstr(buf, "first_layer_height"))
+                            out->first_layer_height = v;
+                        else
+                            out->layer_height = v;
+                    }
+                }
+            }
+            /* ;LAYER:N — track highest layer number */
+            if (strncmp(buf, ";LAYER:", 7) == 0) {
+                int32_t n = atoi(buf + 7);
+                if (n > max_layer) max_layer = n;
+            }
+            /* Cura: ;Layer height: 0.2 */
+            const char *clh = strstr(buf, ";Layer height:");
+            if (clh) {
+                float v = strtof(clh + 14, NULL);
+                if (v > 0.01f && v < 1.0f) out->layer_height = v;
+            }
+            continue;
+        }
+
+        /* Track Z from G0/G1 moves */
+        if (buf[0] == 'G' && (buf[1] == '0' || buf[1] == '1') && buf[2] == ' ') {
+            const char *zp = strstr(buf, "Z");
+            if (zp && (zp == buf + 3 || *(zp - 1) == ' ')) {
+                float z = strtof(zp + 1, NULL);
+                if (z > 0.01f) {
+                    if (!seen_z) {
+                        first_z = z;
+                        seen_z = true;
+                    }
+                    if (z > out->max_z) out->max_z = z;
+                    prev_z = z;
+                }
+            }
+        }
+    }
     rewind(f);
-    return count;
+
+    /* Derive values if not found in comments */
+    if (max_layer >= 0)
+        out->total_layers = max_layer + 1;  /* ;LAYER: is 0-based */
+
+    if (out->first_layer_height == 0 && first_z > 0)
+        out->first_layer_height = first_z;
+
+    if (out->layer_height == 0 && out->total_layers > 1 && out->max_z > 0) {
+        /* Estimate: (maxZ - first_layer) / (layers - 1) */
+        float flh = out->first_layer_height > 0 ? out->first_layer_height : first_z;
+        out->layer_height = (out->max_z - flh) / (float)(out->total_layers - 1);
+    }
+
+    /* If still no total_layers, estimate from Z and layer height */
+    if (out->total_layers <= 0 && out->max_z > 0 && out->layer_height > 0) {
+        float flh = out->first_layer_height > 0 ? out->first_layer_height : out->layer_height;
+        out->total_layers = 1 + (int32_t)((out->max_z - flh) / out->layer_height + 0.5f);
+    }
+
+    (void)prev_z;
+    ESP_LOGI(TAG, "GCode scan: %ld lines, maxZ=%.2f, layers=%ld, lh=%.2f, flh=%.2f",
+             (long)out->total_lines, out->max_z, (long)out->total_layers,
+             out->layer_height, out->first_layer_height);
+}
+
+/** Query current position and save it, then park the head */
+static void host_print_park(void)
+{
+    /* Get fresh position */
+    send_query("M114", QUERY_M114);
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_park_x = s_state.x;
+    s_park_y = s_state.y;
+    s_park_z = s_state.z;
+    xSemaphoreGive(s_state_mutex);
+
+    ESP_LOGI(TAG, "Parking head from (%.1f, %.1f, %.1f)", s_park_x, s_park_y, s_park_z);
+
+    char buf[64];
+    send_query("M400", QUERY_CMD);           /* Wait for moves to finish */
+    send_query("G91", QUERY_CMD);            /* Relative positioning */
+    snprintf(buf, sizeof(buf), "G1 E-%.1f F2400", PARK_RETRACT);
+    send_query(buf, QUERY_CMD);              /* Retract filament */
+    snprintf(buf, sizeof(buf), "G1 Z%.1f F600", PARK_Z_LIFT);
+    send_query(buf, QUERY_CMD);              /* Lift Z */
+    send_query("G90", QUERY_CMD);            /* Absolute positioning */
+    snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
+    send_query(buf, QUERY_CMD);              /* Park at corner */
+}
+
+/** Restore head position after park */
+static void host_print_unpark(void)
+{
+    ESP_LOGI(TAG, "Unparking head to (%.1f, %.1f, %.1f)", s_park_x, s_park_y, s_park_z);
+
+    char buf[64];
+    send_query("G90", QUERY_CMD);            /* Absolute positioning */
+    snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", s_park_x, s_park_y);
+    send_query(buf, QUERY_CMD);              /* Move to saved XY */
+    snprintf(buf, sizeof(buf), "G1 Z%.1f F600", s_park_z);
+    send_query(buf, QUERY_CMD);              /* Lower Z back */
+    send_query("G91", QUERY_CMD);            /* Relative positioning */
+    snprintf(buf, sizeof(buf), "G1 E%.1f F2400", PARK_RETRACT);
+    send_query(buf, QUERY_CMD);              /* Prime filament */
+    send_query("G90", QUERY_CMD);            /* Absolute positioning */
+    send_query("M83", QUERY_CMD);            /* Extruder relative (most slicers use this) */
 }
 
 /** Start host print from within the task context */
@@ -410,14 +573,16 @@ static void host_print_start_internal(const char *filename)
         return;
     }
 
-    int32_t total = count_lines(f);
-    ESP_LOGI(TAG, "Host print starting: %s (%ld lines)", filename, (long)total);
+    gcode_scan_t scan;
+    scan_gcode_file(f, &scan);
+
+    ESP_LOGI(TAG, "Host print starting: %s (%ld lines)", filename, (long)scan.total_lines);
 
     s_host_file = f;
     s_host_printing = true;
     s_host_paused = false;
     s_host_lines_sent = 0;
-    s_host_total_lines = total;
+    s_host_total_lines = scan.total_lines;
     s_host_layer = 0;
     s_host_start_us = esp_timer_get_time();
     s_host_pause_elapsed_us = 0;
@@ -440,6 +605,10 @@ static void host_print_start_internal(const char *filename)
     s_state.print_time_left_s = -1;
     s_state.host_printing = true;
     s_state.current_layer = 0;
+    s_state.object_height = scan.max_z;
+    s_state.total_layers = scan.total_layers;
+    s_state.layer_height = scan.layer_height;
+    s_state.first_layer_height = scan.first_layer_height;
     strncpy(s_state.filename, filename, sizeof(s_state.filename) - 1);
     s_state.filename[sizeof(s_state.filename) - 1] = '\0';
     xSemaphoreGive(s_state_mutex);
@@ -518,62 +687,46 @@ static void printer_comm_task(void *arg)
                 host_print_start_internal(cmd.gcode);
                 continue;
             } else if (cmd.type == PCMD_HOST_PAUSE) {
-                if (s_host_printing && !s_host_paused) {
-                    s_host_paused = true;
-                    s_host_pause_elapsed_us += esp_timer_get_time() - s_host_start_us;
-                    send_query("M76", QUERY_CMD);  /* Pause Marlin print timer */
-                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-                    s_state.opstate = PRINTER_PAUSED;
-                    xSemaphoreGive(s_state_mutex);
-                    ESP_LOGI(TAG, "Host print paused");
-                }
-                continue;
+                goto do_host_pause;
             } else if (cmd.type == PCMD_HOST_RESUME) {
-                if (s_host_printing && s_host_paused) {
-                    s_host_paused = false;
-                    s_host_start_us = esp_timer_get_time();
-                    send_query("M75", QUERY_CMD);  /* Resume Marlin print timer */
-                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-                    s_state.opstate = PRINTER_PRINTING;
-                    xSemaphoreGive(s_state_mutex);
-                    ESP_LOGI(TAG, "Host print resumed");
-                }
-                continue;
+                goto do_host_resume;
             } else if (cmd.type == PCMD_HOST_CANCEL) {
-                if (s_host_printing) {
-                    host_print_finish(true);
-                }
+                if (s_host_printing) host_print_finish(true);
                 continue;
             }
 
             /* Route pause/resume/cancel to host print if active */
             if (s_host_printing) {
-                if (cmd.type == PCMD_PAUSE) {
-                    if (!s_host_paused) {
-                        s_host_paused = true;
-                        s_host_pause_elapsed_us += esp_timer_get_time() - s_host_start_us;
-                        send_query("M76", QUERY_CMD);
-                        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-                        s_state.opstate = PRINTER_PAUSED;
-                        xSemaphoreGive(s_state_mutex);
-                        ESP_LOGI(TAG, "Host print paused");
-                    }
-                    continue;
-                } else if (cmd.type == PCMD_RESUME) {
-                    if (s_host_paused) {
-                        s_host_paused = false;
-                        s_host_start_us = esp_timer_get_time();
-                        send_query("M75", QUERY_CMD);
-                        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-                        s_state.opstate = PRINTER_PRINTING;
-                        xSemaphoreGive(s_state_mutex);
-                        ESP_LOGI(TAG, "Host print resumed");
-                    }
-                    continue;
-                } else if (cmd.type == PCMD_CANCEL) {
-                    host_print_finish(true);
-                    continue;
+                if (cmd.type == PCMD_PAUSE) goto do_host_pause;
+                if (cmd.type == PCMD_RESUME) goto do_host_resume;
+                if (cmd.type == PCMD_CANCEL) { host_print_finish(true); continue; }
+            }
+
+            if (false) {
+            do_host_pause:
+                if (s_host_printing && !s_host_paused) {
+                    s_host_paused = true;
+                    s_host_pause_elapsed_us += esp_timer_get_time() - s_host_start_us;
+                    host_print_park();
+                    send_query("M76", QUERY_CMD);  /* Pause Marlin print timer */
+                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                    s_state.opstate = PRINTER_PAUSED;
+                    xSemaphoreGive(s_state_mutex);
+                    ESP_LOGI(TAG, "Host print paused (head parked)");
                 }
+                continue;
+            do_host_resume:
+                if (s_host_printing && s_host_paused) {
+                    send_query("M75", QUERY_CMD);  /* Resume Marlin print timer */
+                    host_print_unpark();
+                    s_host_paused = false;
+                    s_host_start_us = esp_timer_get_time();
+                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                    s_state.opstate = PRINTER_PRINTING;
+                    xSemaphoreGive(s_state_mutex);
+                    ESP_LOGI(TAG, "Host print resumed (head restored)");
+                }
+                continue;
             }
 
             switch (cmd.type) {
@@ -643,6 +796,46 @@ static void printer_comm_task(void *arg)
                     if (ln == 0) {
                         s_host_lines_sent++;
                         continue;
+                    }
+                }
+
+                /* Check if this command was previously reported as unsupported */
+                if ((line[0] == 'M' || line[0] == 'G') && s_unsupported_count > 0) {
+                    uint16_t code = (uint16_t)atoi(line + 1);
+                    bool skip = false;
+                    for (int i = 0; i < s_unsupported_count; i++) {
+                        if (s_unsupported_cmds[i] == code) { skip = true; break; }
+                    }
+                    if (skip) {
+                        /* Still parse M73 locally for our own progress tracking */
+                        if (line[0] == 'M' && code == 73) {
+                            const char *pp = strstr(line, "P");
+                            const char *rp = strstr(line, "R");
+                            int pct = pp ? atoi(pp + 1) : -1;
+                            int mins = rp ? atoi(rp + 1) : -1;
+                            if (pct >= 0 && pct <= 100) {
+                                xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                                s_state.progress_pct = (float)pct;
+                                if (mins >= 0)
+                                    s_state.print_time_left_s = mins * 60;
+                                xSemaphoreGive(s_state_mutex);
+                            }
+                        }
+                        s_host_lines_sent++;
+                        continue;
+                    }
+                }
+
+                /* Track Z from G0/G1 moves for real-time position */
+                if ((line[0] == 'G') && (line[1] == '0' || line[1] == '1') && line[2] == ' ') {
+                    const char *zp = strstr(line, "Z");
+                    if (zp && (zp == line + 3 || *(zp - 1) == ' ')) {
+                        float z = strtof(zp + 1, NULL);
+                        if (z > 0.01f) {
+                            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                            s_state.z = z;
+                            xSemaphoreGive(s_state_mutex);
+                        }
                     }
                 }
 
@@ -911,7 +1104,7 @@ esp_err_t printer_comm_init(void)
     s_state.total_layers = -1;
 
     xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 6144,
-                            NULL, 8, NULL, 0);
+                            NULL, 8, NULL, 1);  /* Core 1: with USB host, isolated from WiFi/HTTP */
 
     ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
     return ESP_OK;

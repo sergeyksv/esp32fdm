@@ -21,17 +21,10 @@ static const char *TAG = "httpd";
 
 #define STREAM_TARGET_FPS 5
 #define STREAM_FRAME_INTERVAL_US (1000000 / STREAM_TARGET_FPS)
-#define STREAM_PORT 81
 
 static const char *STREAM_BOUNDARY = "esp32fdm_frame";
-static const char *STREAM_RESP_HEADER =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: multipart/x-mixed-replace;boundary=esp32fdm_frame\r\n"
-    "Access-Control-Allow-Origin: *\r\n"
-    "X-Framerate: 5\r\n"
-    "\r\n";
 
-/* ---- /capture handler (stays on httpd, Core 0) ---- */
+/* ---- /capture handler ---- */
 
 static esp_err_t capture_handler(httpd_req_t *req)
 {
@@ -51,15 +44,31 @@ static esp_err_t capture_handler(httpd_req_t *req)
     return res;
 }
 
-/* ---- MJPEG stream task (raw socket, Core 1) ---- */
+/* ---- /stream handler (MJPEG multipart) ---- */
 
-static void stream_client_handler(int client_sock)
+static esp_err_t stream_handler(httpd_req_t *req)
 {
+    int fd = httpd_req_to_sockfd(req);
+
+    /* TCP_NODELAY for low-latency frame delivery */
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    /* Send HTTP response header directly (not chunked) */
+    const char *resp_hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace;boundary=esp32fdm_frame\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "X-Framerate: 5\r\n"
+        "\r\n";
+    if (httpd_send(req, resp_hdr, strlen(resp_hdr)) <= 0) {
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Stream client connected");
+
     char part_header[128];
     int64_t last_frame_time = 0;
-
-    /* Send HTTP response header */
-    send(client_sock, STREAM_RESP_HEADER, strlen(STREAM_RESP_HEADER), 0);
 
     while (true) {
         /* Frame rate limiter */
@@ -84,88 +93,28 @@ static void stream_client_handler(int client_sock)
                                "\r\n",
                                STREAM_BOUNDARY, (unsigned)fb->len);
 
-        /* Send part header */
-        if (send(client_sock, part_header, hdr_len, 0) <= 0) {
-            esp_camera_fb_return(fb);
-            break;
-        }
-
-        /* Send JPEG data */
-        if (send(client_sock, (const char *)fb->buf, fb->len, 0) <= 0) {
+        /* Send part header + JPEG + trailing CRLF via raw socket */
+        if (send(fd, part_header, hdr_len, 0) <= 0 ||
+            send(fd, (const char *)fb->buf, fb->len, 0) <= 0 ||
+            send(fd, "\r\n", 2, 0) <= 0) {
             esp_camera_fb_return(fb);
             break;
         }
         esp_camera_fb_return(fb);
-
-        /* Send trailing CRLF */
-        if (send(client_sock, "\r\n", 2, 0) <= 0) {
-            break;
-        }
     }
 
     ESP_LOGI(TAG, "Stream client disconnected");
-}
-
-static void stream_server_task(void *arg)
-{
-    int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "Stream: failed to create socket");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(STREAM_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-
-    if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGE(TAG, "Stream: bind failed");
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (listen(listen_sock, 1) != 0) {
-        ESP_LOGE(TAG, "Stream: listen failed");
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "MJPEG stream server listening on port %d", STREAM_PORT);
-
-    while (true) {
-        struct sockaddr_in client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-        int client = accept(listen_sock, (struct sockaddr *)&client_addr,
-                            &addr_len);
-        if (client < 0) {
-            ESP_LOGW(TAG, "Stream: accept failed");
-            continue;
-        }
-
-        /* TCP_NODELAY for low-latency frame delivery */
-        int nodelay = 1;
-        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-        ESP_LOGI(TAG, "Stream client connected");
-        stream_client_handler(client);
-        close(client);
-    }
+    return ESP_OK;
 }
 
 /* ---- / root handler ---- */
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    const char *ip = wifi_get_ip_str();
     char buf[1200];
+#if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
+    const char *ip = wifi_get_ip_str();
+#endif
 
     int len = snprintf(buf, sizeof(buf),
         "<!DOCTYPE html><html><head>"
@@ -178,7 +127,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "</style></head><body>"
         "<h1>ESP32 FDM Bridge</h1>"
         "<h2>Camera</h2>"
-        "<a href=\"http://%s:81/\">MJPEG Stream</a>"
+        "<a href=\"/stream\">MJPEG Stream</a>"
         "<a href=\"/capture\">Snapshot</a>"
         "<a href=\"/camera/config\">Camera Config</a>"
         "%s"
@@ -192,7 +141,6 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<p>RFC 2217 port: <code>rfc2217://%s:%d</code></p>"
 #endif
         "</body></html>",
-        ip,
         sdcard_is_mounted() ? "<h2>SD Card</h2><a href=\"/sd\">File Manager</a>" : ""
 #if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
         , ip, CONFIG_RFC2217_PORT
@@ -274,6 +222,13 @@ esp_err_t httpd_start_server(void)
     };
     httpd_register_uri_handler(server, &capture_uri);
 
+    httpd_uri_t stream_uri = {
+        .uri      = "/stream",
+        .method   = HTTP_GET,
+        .handler  = stream_handler,
+    };
+    httpd_register_uri_handler(server, &stream_uri);
+
     httpd_uri_t cam_cfg_get = {
         .uri      = "/camera/config",
         .method   = HTTP_GET,
@@ -295,11 +250,7 @@ esp_err_t httpd_start_server(void)
     printer_config_register_httpd(server);
 #endif
 
-    ESP_LOGI(TAG, "HTTP server started on port 80");
-
-    /* MJPEG stream task on Core 1 — raw socket, port 81 */
-    xTaskCreatePinnedToCore(stream_server_task, "mjpeg_stream", 8192,
-                            NULL, 5, NULL, 1);
+    ESP_LOGI(TAG, "HTTP server started on port 80 (stream at /stream)");
 
     return ESP_OK;
 }
