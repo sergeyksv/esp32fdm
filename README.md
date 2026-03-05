@@ -1,16 +1,16 @@
 # ESP32 FDM Bridge
 
-A WiFi-to-printer bridge firmware for the **Freenove ESP32-S3-WROOM** board, turning a ~$15 microcontroller into a full-featured wireless print server with camera monitoring and cloud AI failure detection — at a fraction of the cost of a Raspberry Pi setup.
+A WiFi-to-printer bridge firmware for the **Freenove ESP32-S3-WROOM** board, turning a ~$7 microcontroller into a full-featured wireless print server with camera monitoring and cloud AI failure detection — at a fraction of the cost of a Raspberry Pi setup.
 
 ## Why This Exists
 
 Traditional wireless 3D printing setups require a single-board computer (Raspberry Pi ~$50-75), a USB webcam (~$20-30), an SD card, a power supply, and software installation (OctoPrint, Klipper, etc.). Total cost: **$80-120+**, plus ongoing maintenance of a full Linux system.
 
-This project replaces all of that with a **single $10-15 ESP32-S3 board** that has everything built in:
+This project replaces all of that with a **single ~$7 ESP32-S3 board** that has everything built in:
 
 | | Raspberry Pi Setup | ESP32 FDM Bridge |
 |---|---|---|
-| **Cost** | $80-120+ | $10-15 |
+| **Cost** | $80-120+ | ~$7 |
 | **Hardware** | SBC + camera + PSU + case | Single board |
 | **Setup** | OS install, SSH, packages | Flash and go |
 | **Boot time** | 30-60 seconds | ~3 seconds |
@@ -72,6 +72,7 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 
 ### Web Dashboard
 - Real-time temperature display (hotend + bed, actual/target)
+- **Temperature history graph** — 1 hour of data, auto-refreshing canvas chart
 - Print progress bar with layer count, elapsed time, and ETA
 - Live camera snapshot (auto-refreshing)
 - Responsive nav: Home, Camera, SD Card, Terminal, Settings
@@ -183,6 +184,7 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/sd/resume` | POST | Resume print |
 | `/sd/cancel` | POST | Cancel print |
 | `/api/status` | GET | JSON printer status |
+| `/api/temp_history` | GET | Temperature history (1h, 4s intervals) |
 | `/settings` | GET | Settings page |
 | `/printer/config` | GET/POST | Printer backend config |
 | `/obico/link` | GET/POST | Obico device linking |
