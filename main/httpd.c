@@ -248,6 +248,45 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
 #endif
 }
 
+/* ---- GET /api/temp_history — temperature history for chart ---- */
+
+static esp_err_t api_temp_history_handler(httpd_req_t *req)
+{
+    /* Allocate on heap — samples are 24 bytes each, 900 * 24 = ~21KB */
+    temp_sample_t *samples = malloc(TEMP_HISTORY_MAX * sizeof(temp_sample_t));
+    if (!samples) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int count = printer_comm_get_temp_history(samples, TEMP_HISTORY_MAX);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    /* Use chunked response to avoid a huge JSON buffer */
+    char chunk[128];
+    httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+
+    for (int i = 0; i < count; i++) {
+        temp_sample_t *s = &samples[i];
+        int64_t ts_sec = s->timestamp_us / 1000000;
+        int len = snprintf(chunk, sizeof(chunk),
+            "%s[%lld,%.1f,%.0f,%.1f,%.0f]",
+            i > 0 ? "," : "",
+            (long long)ts_sec,
+            s->hotend_actual, s->hotend_target,
+            s->bed_actual, s->bed_target);
+        httpd_resp_send_chunk(req, chunk, len);
+    }
+
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_send_chunk(req, NULL, 0);  /* finish chunked response */
+
+    free(samples);
+    return ESP_OK;
+}
+
 /* ---- / root handler — dashboard ---- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -262,6 +301,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<div style='text-align:center;margin:12px 0'>"
         "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
         "</div>"
+        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>"
         "<div id='dash'>"
         "<table>"
         "<tr><td>Hotend</td><td id='he'>--</td></tr>"
@@ -296,6 +336,57 @@ static esp_err_t root_handler(httpd_req_t *req)
         "document.getElementById('tm').textContent=e+r;}"
         "}).catch(function(){})}"
         "u();setInterval(u,2000);"
+        "</script>"
+        "<script>"
+        "var cv=document.getElementById('tc'),cx=cv.getContext('2d');"
+        "function drawChart(d){"
+        "var W=cv.width,H=cv.height,pad=40,r=pad,b=H-25,t=10,w=W-pad-r;"
+        "if(!d.length)return;"
+        "cx.clearRect(0,0,W,H);"
+        /* compute time range and temp range */
+        "var t0=d[0][0],t1=d[d.length-1][0];"
+        "if(t1<=t0)t1=t0+1;"
+        "var mn=999,mx=0;"
+        "for(var i=0;i<d.length;i++){for(var j=1;j<5;j++){if(d[i][j]>0){if(d[i][j]<mn)mn=d[i][j];if(d[i][j]>mx)mx=d[i][j]}}}"
+        "if(mn>=mx){mn=0;mx=100;}"
+        "mn=Math.floor(mn/10)*10;mx=Math.ceil(mx/10)*10;"
+        "if(mx-mn<20)mx=mn+20;"
+        /* grid lines */
+        "cx.strokeStyle='#333';cx.lineWidth=0.5;cx.font='10px sans-serif';cx.fillStyle='#888';"
+        "var steps=5;for(var i=0;i<=steps;i++){"
+        "var y=b-(b-t)*i/steps,v=mn+(mx-mn)*i/steps;"
+        "cx.beginPath();cx.moveTo(r,y);cx.lineTo(r+w,y);cx.stroke();"
+        "cx.fillText(v.toFixed(0),2,y+3);}"
+        /* x-axis: minutes ago */
+        "cx.fillStyle='#888';"
+        "var dur=t1-t0;var xsteps=Math.min(6,Math.floor(dur/60));"
+        "if(xsteps<1)xsteps=1;"
+        "for(var i=0;i<=xsteps;i++){"
+        "var x=r+w*i/xsteps,sec=dur*i/xsteps;"
+        "cx.fillText('-'+(dur-sec>=60?Math.round((dur-sec)/60)+'m':Math.round(dur-sec)+'s'),x-8,H-4);}"
+        /* draw lines: [he_act=red, he_tgt=red dash, bed_act=blue, bed_tgt=blue dash] */
+        "var colors=['#ff4444','#ff4444','#4488ff','#4488ff'];"
+        "var dashes=[[],[5,4],[],[5,4]];"
+        "for(var li=0;li<4;li++){"
+        "cx.strokeStyle=colors[li];cx.lineWidth=li%%2?1:1.5;cx.setLineDash(dashes[li]);"
+        "cx.beginPath();"
+        "for(var i=0;i<d.length;i++){"
+        "var x=r+((d[i][0]-t0)/(t1-t0))*w;"
+        "var y=b-((d[i][li+1]-mn)/(mx-mn))*(b-t);"
+        "if(i==0)cx.moveTo(x,y);else cx.lineTo(x,y);}"
+        "cx.stroke();cx.setLineDash([]);}"
+        /* legend */
+        "var lx=r+6,ly=t+10;"
+        "var lbl=['HE','HE tgt','Bed','Bed tgt'];"
+        "for(var i=0;i<4;i++){"
+        "cx.strokeStyle=colors[i];cx.lineWidth=i%%2?1:1.5;cx.setLineDash(dashes[i]);"
+        "cx.beginPath();cx.moveTo(lx,ly);cx.lineTo(lx+16,ly);cx.stroke();cx.setLineDash([]);"
+        "cx.fillStyle=colors[i];cx.fillText(lbl[i],lx+19,ly+3);lx+=60;}"
+        "}"
+        "function fetchTemp(){"
+        "fetch('/api/temp_history').then(function(r){return r.json()}).then(function(j){"
+        "drawChart(j.samples)}).catch(function(){})}"
+        "fetchTemp();setInterval(fetchTemp,15000);"
         "</script>");
 
     layout_html_end(&p);
@@ -606,6 +697,13 @@ esp_err_t httpd_start_server(void)
         .handler  = api_stats_handler,
     };
     httpd_register_uri_handler(server, &api_stats);
+
+    httpd_uri_t api_temp_history = {
+        .uri      = "/api/temp_history",
+        .method   = HTTP_GET,
+        .handler  = api_temp_history_handler,
+    };
+    httpd_register_uri_handler(server, &api_temp_history);
 
     httpd_uri_t camera_page = {
         .uri      = "/camera",

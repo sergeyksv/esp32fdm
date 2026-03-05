@@ -53,6 +53,12 @@ static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
 static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
 
+/* ---- Temperature history circular buffer ---- */
+
+static temp_sample_t s_temp_history[TEMP_HISTORY_MAX];
+static int s_temp_head;   /* next write index */
+static int s_temp_count;  /* number of valid samples */
+
 /* ---- State (Marlin backend) ---- */
 
 static printer_state_t s_state;
@@ -190,6 +196,16 @@ static void parse_m105(const char *line)
     }
 
     s_state.last_update_us = esp_timer_get_time();
+
+    /* Record temperature history sample */
+    temp_sample_t *sample = &s_temp_history[s_temp_head];
+    sample->timestamp_us = s_state.last_update_us;
+    sample->hotend_actual = s_state.hotend_actual;
+    sample->hotend_target = s_state.hotend_target;
+    sample->bed_actual = s_state.bed_actual;
+    sample->bed_target = s_state.bed_target;
+    s_temp_head = (s_temp_head + 1) % TEMP_HISTORY_MAX;
+    if (s_temp_count < TEMP_HISTORY_MAX) s_temp_count++;
 
     /* Update opstate from temps if not already printing */
     if (s_state.opstate == PRINTER_DISCONNECTED) {
@@ -1157,6 +1173,21 @@ void printer_comm_get_state(printer_state_t *out)
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     memcpy(out, &s_state, sizeof(printer_state_t));
     xSemaphoreGive(s_state_mutex);
+}
+
+int printer_comm_get_temp_history(temp_sample_t *buf, int max_count)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    int count = s_temp_count < max_count ? s_temp_count : max_count;
+    /* Copy oldest-first: start from (head - count) wrapped */
+    int start = (s_temp_head - s_temp_count + TEMP_HISTORY_MAX) % TEMP_HISTORY_MAX;
+    /* Skip oldest samples if count < s_temp_count */
+    start = (start + (s_temp_count - count)) % TEMP_HISTORY_MAX;
+    for (int i = 0; i < count; i++) {
+        buf[i] = s_temp_history[(start + i) % TEMP_HISTORY_MAX];
+    }
+    xSemaphoreGive(s_state_mutex);
+    return count;
 }
 
 void printer_comm_set_simulate(bool enable)

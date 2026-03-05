@@ -52,6 +52,21 @@ typedef struct {
     char gcode[96];  /* only used for PCMD_RAW */
 } printer_cmd_t;
 
+/* Temperature history sample */
+typedef struct {
+    int64_t timestamp_us;       /* esp_timer_get_time() when recorded */
+    float hotend_actual, hotend_target;
+    float bed_actual, bed_target;
+} temp_sample_t;
+
+#define TEMP_HISTORY_MAX 900    /* 1 hour at 4s intervals */
+
+/**
+ * Copy temperature history samples oldest-first into buf.
+ * Returns actual number of samples copied (up to TEMP_HISTORY_MAX).
+ */
+int printer_comm_get_temp_history(temp_sample_t *buf, int max_count);
+
 /**
  * Initialize the printer communication module.
  * Starts a polling task that queries the printer over USB serial.
