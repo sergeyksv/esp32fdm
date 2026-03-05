@@ -962,6 +962,12 @@ static void printer_comm_task(void *arg)
                  * If timeout, poke with M105 to flush stuck USB CDC
                  * on printer side, then retry once */
                 if (!send_query_numbered(line)) {
+                    if (esp_timer_get_time() < s_cmd_cooldown_until_us) {
+                        /* Printer said "busy: processing" — don't poke, just defer */
+                        strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
+                        s_host_has_pending = true;
+                        break;
+                    }
                     /* Poke: M105 generates USB activity that can unstick
                      * STM32 CDC TX (same effect as touching LCD encoder) */
                     ESP_LOGW(TAG, "Poking printer with M105 after timeout");
