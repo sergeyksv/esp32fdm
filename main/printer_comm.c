@@ -26,10 +26,11 @@ static const char *TAG = "printer_comm";
 
 /* ---- Configuration ---- */
 
-#define POLL_M105_INTERVAL_MS   4000
-#define POLL_M27_INTERVAL_MS    10000
-#define POLL_M114_INTERVAL_MS   30000
-#define CMD_RESPONSE_TIMEOUT_MS 6000
+#define POLL_M105_INTERVAL_MS           4000
+#define POLL_M105_HOSTPRINT_INTERVAL_MS 30000   /* Reduced frequency during host print */
+#define POLL_M27_INTERVAL_MS            10000
+#define POLL_M114_INTERVAL_MS           30000
+#define CMD_RESPONSE_TIMEOUT_MS         6000
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
@@ -797,6 +798,22 @@ static void printer_comm_task(void *arg)
                         s_host_lines_sent++;
                         continue;
                     }
+
+                    /* Skip lines that aren't valid GCode commands.
+                     * Valid GCode starts with G, M, T, N, O, or F.
+                     * Slicer annotations like "27 @ 4.6mm" would otherwise
+                     * be sent raw, causing response desync. */
+                    char first = line[0];
+                    if (first != 'G' && first != 'g' &&
+                        first != 'M' && first != 'm' &&
+                        first != 'T' && first != 't' &&
+                        first != 'N' && first != 'n' &&
+                        first != 'O' && first != 'o' &&
+                        first != 'F' && first != 'f') {
+                        ESP_LOGW(TAG, "Skipping non-GCode line: %s", line);
+                        s_host_lines_sent++;
+                        continue;
+                    }
                 }
 
                 /* Check if this command was previously reported as unsupported */
@@ -870,6 +887,18 @@ static void printer_comm_task(void *arg)
         do { if (esp_timer_get_time() < s_cmd_cooldown_until_us) goto poll_done; } while(0)
 
         CHECK_COOLDOWN();
+
+        /* During active host printing, only poll M105 at reduced frequency
+         * (for Obico temp display). Skip M27/M114 entirely — position is
+         * tracked from the GCode stream. */
+        if (s_host_printing && !s_host_paused) {
+            now = esp_timer_get_time();
+            if (now - s_last_m105_us >= POLL_M105_HOSTPRINT_INTERVAL_MS * 1000LL) {
+                send_query("M105", QUERY_M105);
+                s_last_m105_us = esp_timer_get_time();
+            }
+            goto poll_done;
+        }
 
         /* Poll M105 (temperatures) every 4s */
         now = esp_timer_get_time();

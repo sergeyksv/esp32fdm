@@ -17,6 +17,25 @@ static const char *TAG = "sdcard_httpd";
 #define MOUNT_POINT "/sdcard"
 #define UPLOAD_BUF_SIZE 4096
 
+/* URL-decode a string in-place (handles %XX and '+' → space) */
+static void url_decode_inplace(char *s)
+{
+    char *dst = s;
+    while (*s) {
+        if (*s == '+') {
+            *dst++ = ' ';
+            s++;
+        } else if (*s == '%' && s[1] && s[2]) {
+            char hex[3] = { s[1], s[2], '\0' };
+            *dst++ = (char)strtol(hex, NULL, 16);
+            s += 3;
+        } else {
+            *dst++ = *s++;
+        }
+    }
+    *dst = '\0';
+}
+
 /* ---- GET /sd — HTML file manager ---- */
 
 static esp_err_t sd_page_handler(httpd_req_t *req)
@@ -218,6 +237,7 @@ static esp_err_t sd_delete_handler(httpd_req_t *req)
     fn += 9;
     char *amp = strchr(fn, '&');
     if (amp) *amp = '\0';
+    url_decode_inplace(fn);
 
     char path[300];
     snprintf(path, sizeof(path), MOUNT_POINT "/%s", fn);
@@ -255,6 +275,7 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     fn += 9;
     char *amp = strchr(fn, '&');
     if (amp) *amp = '\0';
+    url_decode_inplace(fn);
 
     esp_err_t err = printer_comm_host_print_start(fn);
     if (err != ESP_OK) {
