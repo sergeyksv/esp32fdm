@@ -19,6 +19,12 @@ void terminal_init(void);
 void terminal_feed_rx(const uint8_t *data, size_t len);
 
 /**
+ * Feed a TX command string into the terminal ring buffer.
+ * Displayed with "> " prefix so user can see what was sent.
+ */
+void terminal_feed_tx(const char *cmd);
+
+/**
  * Register terminal HTTP endpoints on the given server.
  */
 esp_err_t terminal_register_httpd(httpd_handle_t server);

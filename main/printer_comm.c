@@ -429,6 +429,7 @@ static bool send_query(const char *gcode, query_type_t qtype)
     char buf[100];
     int len = snprintf(buf, sizeof(buf), "%s\n", gcode);
     ESP_LOGI(TAG, "TX: %s", gcode);
+    terminal_feed_tx(gcode);
     esp_err_t err = usb_serial_send((const uint8_t *)buf, len);
     if (err != ESP_OK) {
         s_pending_query = QUERY_NONE;

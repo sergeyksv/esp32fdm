@@ -42,6 +42,14 @@ void terminal_feed_rx(const uint8_t *data, size_t len)
     ring_write((const char *)data, len);
 }
 
+void terminal_feed_tx(const char *cmd)
+{
+    if (!cmd || !s_mutex) return;
+    ring_write("> ", 2);
+    ring_write(cmd, strlen(cmd));
+    ring_write("\n", 1);
+}
+
 /* ---- Send command ---- */
 
 static esp_err_t terminal_send_cmd(const char *cmd)
