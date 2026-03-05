@@ -2,14 +2,23 @@
 
 #include "esp_err.h"
 
+typedef enum {
+    WIFI_RESULT_STA_CONNECTED,
+    WIFI_RESULT_AP_MODE,
+} wifi_result_t;
+
 /**
- * Initialize WiFi in STA mode and block until connected.
- * Returns ESP_OK on success, or an error if connection failed after retries.
+ * Initialize WiFi: try STA with NVS/Kconfig creds, fall back to AP mode.
  */
-esp_err_t wifi_init_sta(void);
+wifi_result_t wifi_init(void);
 
 /**
  * Get the current IP address as a string.
  * Returns pointer to a static buffer — valid until next call.
  */
 const char *wifi_get_ip_str(void);
+
+/**
+ * Erase stored WiFi credentials from NVS and reboot.
+ */
+void wifi_reset_credentials(void);

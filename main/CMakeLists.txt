@@ -7,6 +7,7 @@ set(SRCS
     "sdcard.c"
     "sdcard_httpd.c"
     "printer_comm.c"
+    "dns_server.c"
 )
 
 if(CONFIG_OBICO_ENABLED)

@@ -1,6 +1,7 @@
 #include "wifi.h"
 #include "camera.h"
 #include "httpd.h"
+#include "dns_server.h"
 #include "usb_serial.h"
 #include "sdcard.h"
 #include "printer_comm.h"
@@ -31,8 +32,18 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* WiFi — blocks until connected */
-    ESP_ERROR_CHECK(wifi_init_sta());
+    /* WiFi — try STA, fall back to AP */
+    wifi_result_t wifi_result = wifi_init();
+
+    if (wifi_result == WIFI_RESULT_AP_MODE) {
+        dns_server_start();
+        httpd_start_captive_portal();
+        ESP_LOGW(TAG, "========================================");
+        ESP_LOGW(TAG, "  AP MODE — configure WiFi at");
+        ESP_LOGW(TAG, "  http://192.168.4.1/");
+        ESP_LOGW(TAG, "========================================");
+        return;
+    }
 
     /* Camera */
     ESP_ERROR_CHECK(camera_init());
