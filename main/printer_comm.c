@@ -112,6 +112,13 @@ static char s_host_pending_line[128]; /* line read but not yet sent */
 static bool s_host_has_pending;
 static float s_park_x, s_park_y, s_park_z; /* saved position before park */
 
+/* Marlin line numbering & checksum for reliable host print transmission */
+static int32_t s_host_marlin_line;        /* Next Marlin line number to assign */
+static int32_t s_host_resend_line;        /* Line requested by Resend:, or -1 */
+static char    s_host_numbered_line[160]; /* Formatted "Nxxx gcode*cs" for resend */
+static int     s_host_resend_retries;
+#define HOST_RESEND_MAX_RETRIES 5
+
 /* Park position and retract settings */
 #define PARK_X       0.0f
 #define PARK_Y       0.0f
@@ -125,6 +132,24 @@ static float s_park_x, s_park_y, s_park_z; /* saved position before park */
 #define PCMD_HOST_CANCEL 103
 
 /* ---- Helpers ---- */
+
+/** Compute Marlin XOR checksum: XOR all bytes in the string */
+static uint8_t marlin_checksum(const char *line)
+{
+    uint8_t cs = 0;
+    while (*line) cs ^= (uint8_t)*line++;
+    return cs;
+}
+
+/** Format a numbered line: "Nxxx gcode*cs" into dst */
+static int format_numbered_line(char *dst, size_t size, int32_t line_num, const char *gcode)
+{
+    int n = snprintf(dst, size, "N%ld %s", (long)line_num, gcode);
+    if (n < 0 || (size_t)n >= size - 5) return -1; /* no room for *cs */
+    uint8_t cs = marlin_checksum(dst);
+    n += snprintf(dst + n, size - n, "*%u", cs);
+    return n;
+}
 
 /** Find value after a key character, e.g. 'T' in "T:205.3 /210.0" */
 static bool parse_temp_pair(const char *line, char key,
@@ -331,6 +356,17 @@ static void process_line(const char *line)
         return;
     }
 
+    /* Marlin resend request: "Resend: N123" or "rs N123" */
+    if (strncasecmp(line, "resend", 6) == 0 || strncmp(line, "rs ", 3) == 0) {
+        const char *p = line;
+        while (*p && (*p < '0' || *p > '9')) p++; /* skip to first digit */
+        if (*p) {
+            s_host_resend_line = (int32_t)atol(p);
+            ESP_LOGW(TAG, "Resend requested: N%ld", (long)s_host_resend_line);
+        }
+        /* Don't return — Marlin sends "ok" after "Resend:" which clears s_pending_query */
+    }
+
     /* "ok" signals end of response for current query.
      * Marlin often sends "ok T:205.3 /210.0 B:60.1 /60.0" — temp data on the ok line. */
     if (strncmp(line, "ok", 2) == 0) {
@@ -412,6 +448,54 @@ static bool send_query(const char *gcode, query_type_t qtype)
         }
     }
 
+    return true;
+}
+
+/** Send a numbered GCode command with checksum, handle Resend: retries.
+ *  Used only for host print streaming lines. */
+static bool send_query_numbered(const char *gcode)
+{
+    s_host_resend_line = -1;
+    s_host_resend_retries = 0;
+
+    if (format_numbered_line(s_host_numbered_line, sizeof(s_host_numbered_line),
+                             s_host_marlin_line, gcode) < 0) {
+        ESP_LOGE(TAG, "Line too long for numbering: %s", gcode);
+        return send_query(gcode, QUERY_CMD); /* fallback unnumbered */
+    }
+
+    if (!send_query(s_host_numbered_line, QUERY_CMD)) {
+        return false;
+    }
+
+    /* Handle resend requests */
+    while (s_host_resend_line >= 0) {
+        if (s_host_resend_line != s_host_marlin_line) {
+            ESP_LOGE(TAG, "Resend line mismatch: expected N%ld, got N%ld — resync",
+                     (long)s_host_marlin_line, (long)s_host_resend_line);
+            /* Resync Marlin's line counter */
+            char sync[40];
+            format_numbered_line(sync, sizeof(sync), s_host_marlin_line, "M110");
+            send_query(sync, QUERY_CMD);
+            s_host_resend_line = -1;
+            return false;
+        }
+
+        s_host_resend_retries++;
+        if (s_host_resend_retries > HOST_RESEND_MAX_RETRIES) {
+            ESP_LOGE(TAG, "Resend retries exhausted for N%ld", (long)s_host_marlin_line);
+            s_host_resend_line = -1;
+            return false;
+        }
+
+        ESP_LOGW(TAG, "Resending N%ld (attempt %d)", (long)s_host_marlin_line, s_host_resend_retries);
+        s_host_resend_line = -1;
+        if (!send_query(s_host_numbered_line, QUERY_CMD)) {
+            return false;
+        }
+    }
+
+    s_host_marlin_line++;
     return true;
 }
 
@@ -591,6 +675,14 @@ static void host_print_start_internal(const char *filename)
     s_host_has_pending = false;
     strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
     s_host_filename[sizeof(s_host_filename) - 1] = '\0';
+
+    /* Reset Marlin line numbering for reliable transmission */
+    s_host_marlin_line = 0;
+    s_host_resend_line = -1;
+    char sync[40];
+    format_numbered_line(sync, sizeof(sync), 0, "M110 N0");
+    send_query(sync, QUERY_CMD);
+    s_host_marlin_line = 1;
 
     /* Tell Marlin we're printing — starts LCD print timer & enables host mode */
     send_query("M75", QUERY_CMD);
@@ -857,11 +949,22 @@ static void printer_comm_task(void *arg)
                     }
                 }
 
-                /* Send to printer — if it fails (cooldown/timeout), save for retry */
-                if (!send_query(line, QUERY_CMD)) {
-                    strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
-                    s_host_has_pending = true;
-                    break;
+                /* Send to printer with line numbering & checksum.
+                 * If timeout, poke with M105 to flush stuck USB CDC
+                 * on printer side, then retry once */
+                if (!send_query_numbered(line)) {
+                    /* Poke: M105 generates USB activity that can unstick
+                     * STM32 CDC TX (same effect as touching LCD encoder) */
+                    ESP_LOGW(TAG, "Poking printer with M105 after timeout");
+                    send_query("M105", QUERY_M105);
+                    s_last_m105_us = esp_timer_get_time();
+
+                    /* Retry the original command */
+                    if (!send_query_numbered(line)) {
+                        strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
+                        s_host_has_pending = true;
+                        break;
+                    }
                 }
                 s_host_lines_sent++;
                 lines_this_batch++;
