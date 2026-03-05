@@ -20,6 +20,14 @@ This project replaces all of that with a **single $10-15 ESP32-S3 board** that h
 
 The ESP32-S3's dual cores, 8MB PSRAM, and native USB OTG make it powerful enough to handle simultaneous MJPEG streaming, printer communication, and cloud connectivity — all in real time.
 
+## Web Installer
+
+Flash the firmware directly from your browser — no tools or setup required:
+
+**[Open Web Installer](https://sergeyksv.github.io/esp32fdm/)**
+
+Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-C port** (UART).
+
 ## Features
 
 ### Camera & Streaming
