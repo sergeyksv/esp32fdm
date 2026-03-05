@@ -4,10 +4,13 @@ set(SRCS
     "camera.c"
     "httpd.c"
     "usb_serial.cpp"
+    "sdcard.c"
+    "sdcard_httpd.c"
+    "printer_comm.c"
 )
 
 if(CONFIG_OBICO_ENABLED)
-    list(APPEND SRCS "printer_comm.c" "printer_comm_klipper.c" "obico_client.c")
+    list(APPEND SRCS "printer_comm_klipper.c" "obico_client.c")
 endif()
 
 if(CONFIG_RFC2217_ENABLED)

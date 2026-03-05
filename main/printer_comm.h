@@ -34,6 +34,8 @@ typedef struct {
     float first_layer_height;    /* from slicer metadata, 0 if unknown */
     float object_height;         /* max Z from slicer metadata, 0 if unknown */
     int32_t total_layers;        /* computed from metadata, -1 if unknown */
+    bool host_printing;          /* true if ESP32 is streaming GCode from SD */
+    int32_t current_layer;       /* current layer from ;LAYER:N comments */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
 } printer_state_t;
 
@@ -112,6 +114,32 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
  * Called from httpd.c during server setup.
  */
 esp_err_t printer_config_register_httpd(void *server_handle);
+
+/**
+ * Start host-based GCode printing from a file on /sdcard.
+ * The file is streamed line-by-line to the printer via USB serial.
+ */
+esp_err_t printer_comm_host_print_start(const char *filename);
+
+/**
+ * Pause host print (stops sending lines, heaters stay on).
+ */
+esp_err_t printer_comm_host_print_pause(void);
+
+/**
+ * Resume host print after pause.
+ */
+esp_err_t printer_comm_host_print_resume(void);
+
+/**
+ * Cancel host print (closes file, turns off heaters, disables motors).
+ */
+esp_err_t printer_comm_host_print_cancel(void);
+
+/**
+ * Returns true if a host print is currently active (printing or paused).
+ */
+bool printer_comm_is_host_printing(void);
 
 #ifdef __cplusplus
 }

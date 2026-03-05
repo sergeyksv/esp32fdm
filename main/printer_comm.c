@@ -1,5 +1,7 @@
 #include "printer_comm.h"
+#if CONFIG_OBICO_ENABLED
 #include "printer_comm_klipper.h"
+#endif
 
 #include "usb_serial.h"
 
@@ -91,6 +93,21 @@ static bool s_have_m73;        /* true once we've seen M73 — prefer slicer pro
 
 /* Cooldown after pause/resume/cancel — let firmware settle */
 static int64_t s_cmd_cooldown_until_us;
+
+/* ---- Host print state ---- */
+static FILE *s_host_file;
+static bool s_host_printing, s_host_paused;
+static int32_t s_host_lines_sent, s_host_total_lines, s_host_layer;
+static int64_t s_host_start_us, s_host_pause_elapsed_us;
+static char s_host_filename[64];
+static char s_host_pending_line[128]; /* line read but not yet sent */
+static bool s_host_has_pending;
+
+/* Internal command types for host print (sent via s_cmd_queue) */
+#define PCMD_HOST_START  100
+#define PCMD_HOST_PAUSE  101
+#define PCMD_HOST_RESUME 102
+#define PCMD_HOST_CANCEL 103
 
 /* ---- Helpers ---- */
 
@@ -363,6 +380,111 @@ static bool send_query(const char *gcode, query_type_t qtype)
     return true;
 }
 
+/* ---- Host print helpers ---- */
+
+/** Count total lines in file (for progress), then rewind */
+static int32_t count_lines(FILE *f)
+{
+    int32_t count = 0;
+    char buf[128];
+    rewind(f);
+    while (fgets(buf, sizeof(buf), f)) count++;
+    rewind(f);
+    return count;
+}
+
+/** Start host print from within the task context */
+static void host_print_start_internal(const char *filename)
+{
+    if (s_host_printing) {
+        ESP_LOGW(TAG, "Host print already active");
+        return;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), "/sdcard/%s", filename);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open %s", path);
+        return;
+    }
+
+    int32_t total = count_lines(f);
+    ESP_LOGI(TAG, "Host print starting: %s (%ld lines)", filename, (long)total);
+
+    s_host_file = f;
+    s_host_printing = true;
+    s_host_paused = false;
+    s_host_lines_sent = 0;
+    s_host_total_lines = total;
+    s_host_layer = 0;
+    s_host_start_us = esp_timer_get_time();
+    s_host_pause_elapsed_us = 0;
+    s_host_has_pending = false;
+    strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
+    s_host_filename[sizeof(s_host_filename) - 1] = '\0';
+
+    /* Tell Marlin we're printing — starts LCD print timer & enables host mode */
+    send_query("M75", QUERY_CMD);
+
+    /* Show filename on LCD */
+    char lcd_msg[128];
+    snprintf(lcd_msg, sizeof(lcd_msg), "M117 %s", filename);
+    send_query(lcd_msg, QUERY_CMD);
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_state.opstate = PRINTER_PRINTING;
+    s_state.progress_pct = 0;
+    s_state.print_time_s = 0;
+    s_state.print_time_left_s = -1;
+    s_state.host_printing = true;
+    s_state.current_layer = 0;
+    strncpy(s_state.filename, filename, sizeof(s_state.filename) - 1);
+    s_state.filename[sizeof(s_state.filename) - 1] = '\0';
+    xSemaphoreGive(s_state_mutex);
+}
+
+/** Finish host print (complete or cancel) */
+static void host_print_finish(bool cancelled)
+{
+    if (s_host_file) {
+        fclose(s_host_file);
+        s_host_file = NULL;
+    }
+
+    /* Stop Marlin print timer */
+    send_query("M77", QUERY_CMD);
+    send_query("M117", QUERY_CMD);  /* Clear LCD message */
+
+    if (cancelled) {
+        ESP_LOGI(TAG, "Host print cancelled — turning off heaters");
+        send_query("M400", QUERY_CMD);
+        send_query("M104 S0", QUERY_CMD);
+        send_query("M140 S0", QUERY_CMD);
+        send_query("M84", QUERY_CMD);
+    } else {
+        int64_t elapsed_us = s_host_pause_elapsed_us + (esp_timer_get_time() - s_host_start_us);
+        ESP_LOGI(TAG, "Host print complete: %s (%ld lines, %lds)",
+                 s_host_filename, (long)s_host_lines_sent,
+                 (long)(elapsed_us / 1000000));
+        send_query("M117 Print complete", QUERY_CMD);
+    }
+
+    s_host_printing = false;
+    s_host_paused = false;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_state.opstate = PRINTER_OPERATIONAL;
+    s_state.progress_pct = -1;
+    s_state.print_time_s = -1;
+    s_state.print_time_left_s = -1;
+    s_state.host_printing = false;
+    s_state.current_layer = 0;
+    s_state.filename[0] = '\0';
+    xSemaphoreGive(s_state_mutex);
+}
+
 /* ---- Polling task ---- */
 
 static void printer_comm_task(void *arg)
@@ -390,6 +512,70 @@ static void printer_comm_task(void *arg)
         printer_cmd_t cmd;
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             const char *gcode = NULL;
+
+            /* Host print commands */
+            if (cmd.type == PCMD_HOST_START) {
+                host_print_start_internal(cmd.gcode);
+                continue;
+            } else if (cmd.type == PCMD_HOST_PAUSE) {
+                if (s_host_printing && !s_host_paused) {
+                    s_host_paused = true;
+                    s_host_pause_elapsed_us += esp_timer_get_time() - s_host_start_us;
+                    send_query("M76", QUERY_CMD);  /* Pause Marlin print timer */
+                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                    s_state.opstate = PRINTER_PAUSED;
+                    xSemaphoreGive(s_state_mutex);
+                    ESP_LOGI(TAG, "Host print paused");
+                }
+                continue;
+            } else if (cmd.type == PCMD_HOST_RESUME) {
+                if (s_host_printing && s_host_paused) {
+                    s_host_paused = false;
+                    s_host_start_us = esp_timer_get_time();
+                    send_query("M75", QUERY_CMD);  /* Resume Marlin print timer */
+                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                    s_state.opstate = PRINTER_PRINTING;
+                    xSemaphoreGive(s_state_mutex);
+                    ESP_LOGI(TAG, "Host print resumed");
+                }
+                continue;
+            } else if (cmd.type == PCMD_HOST_CANCEL) {
+                if (s_host_printing) {
+                    host_print_finish(true);
+                }
+                continue;
+            }
+
+            /* Route pause/resume/cancel to host print if active */
+            if (s_host_printing) {
+                if (cmd.type == PCMD_PAUSE) {
+                    if (!s_host_paused) {
+                        s_host_paused = true;
+                        s_host_pause_elapsed_us += esp_timer_get_time() - s_host_start_us;
+                        send_query("M76", QUERY_CMD);
+                        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                        s_state.opstate = PRINTER_PAUSED;
+                        xSemaphoreGive(s_state_mutex);
+                        ESP_LOGI(TAG, "Host print paused");
+                    }
+                    continue;
+                } else if (cmd.type == PCMD_RESUME) {
+                    if (s_host_paused) {
+                        s_host_paused = false;
+                        s_host_start_us = esp_timer_get_time();
+                        send_query("M75", QUERY_CMD);
+                        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                        s_state.opstate = PRINTER_PRINTING;
+                        xSemaphoreGive(s_state_mutex);
+                        ESP_LOGI(TAG, "Host print resumed");
+                    }
+                    continue;
+                } else if (cmd.type == PCMD_CANCEL) {
+                    host_print_finish(true);
+                    continue;
+                }
+            }
+
             switch (cmd.type) {
             case PCMD_PAUSE:
                 ESP_LOGI(TAG, "Draining planner (M400) before pause...");
@@ -399,22 +585,92 @@ static void printer_comm_task(void *arg)
             case PCMD_RESUME: gcode = "M24"; break;
             case PCMD_CANCEL: gcode = "M524"; break;
             case PCMD_RAW:    gcode = cmd.gcode; break;
+            default: break;
             }
             if (gcode) {
                 ESP_LOGI(TAG, "Sending command: %s", gcode);
                 send_query(gcode, QUERY_CMD);
 
-                /* Before pause, drain planner buffer first */
                 if (cmd.type == PCMD_PAUSE) {
                     s_cmd_cooldown_until_us = esp_timer_get_time() + 5000000LL; /* 5s */
                 }
             }
         }
 
-        /* Skip polling during cooldown */
-#define CHECK_COOLDOWN() \
-        do { now = esp_timer_get_time(); \
-             if (now < s_cmd_cooldown_until_us) goto poll_done; } while(0)
+        /* ---- Host print: stream GCode lines ---- */
+        if (s_host_printing && !s_host_paused) {
+            int lines_this_batch = 0;
+            char line[128];
+
+            while (lines_this_batch < 4 && s_host_file) {
+                if (esp_timer_get_time() < s_cmd_cooldown_until_us) break;
+
+                /* Use pending line from previous failed send, or read new */
+                if (s_host_has_pending) {
+                    strncpy(line, s_host_pending_line, sizeof(line));
+                    s_host_has_pending = false;
+                } else {
+                    if (!fgets(line, sizeof(line), s_host_file)) {
+                        /* EOF — print complete */
+                        host_print_finish(false);
+                        break;
+                    }
+
+                    /* Strip newline */
+                    size_t ln = strlen(line);
+                    while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'))
+                        line[--ln] = '\0';
+
+                    /* Parse ;LAYER:N comments for layer tracking */
+                    if (strncmp(line, ";LAYER:", 7) == 0) {
+                        s_host_layer = atoi(line + 7);
+                    }
+
+                    /* Skip empty lines and comments */
+                    if (ln == 0 || line[0] == ';') {
+                        s_host_lines_sent++;
+                        continue;
+                    }
+
+                    /* Strip inline comments */
+                    char *comment = strchr(line, ';');
+                    if (comment) {
+                        *comment = '\0';
+                        /* Trim trailing spaces */
+                        ln = strlen(line);
+                        while (ln > 0 && line[ln-1] == ' ') line[--ln] = '\0';
+                    }
+                    if (ln == 0) {
+                        s_host_lines_sent++;
+                        continue;
+                    }
+                }
+
+                /* Send to printer — if it fails (cooldown/timeout), save for retry */
+                if (!send_query(line, QUERY_CMD)) {
+                    strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
+                    s_host_has_pending = true;
+                    break;
+                }
+                s_host_lines_sent++;
+                lines_this_batch++;
+
+                /* Update progress */
+                xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                if (s_host_total_lines > 0) {
+                    s_state.progress_pct = (float)s_host_lines_sent / (float)s_host_total_lines * 100.0f;
+                }
+                int64_t elapsed_us = s_host_pause_elapsed_us + (esp_timer_get_time() - s_host_start_us);
+                s_state.print_time_s = (int32_t)(elapsed_us / 1000000);
+                s_state.current_layer = s_host_layer;
+                if (s_state.progress_pct > 0.1f) {
+                    float total_est = (float)s_state.print_time_s / (s_state.progress_pct / 100.0f);
+                    s_state.print_time_left_s = (int32_t)(total_est - s_state.print_time_s);
+                    if (s_state.print_time_left_s < 0) s_state.print_time_left_s = 0;
+                }
+                xSemaphoreGive(s_state_mutex);
+            }
+        }
 
         /* Macro: skip remaining polls if cooldown active (set by busy: handler) */
 #define CHECK_COOLDOWN() \
@@ -430,19 +686,21 @@ static void printer_comm_task(void *arg)
             CHECK_COOLDOWN();
         }
 
-        /* Poll M27 (SD progress) every 10s */
-        now = esp_timer_get_time();
-        if (now - s_last_m27_us >= POLL_M27_INTERVAL_MS * 1000LL) {
-            send_query("M27", QUERY_M27);
-            s_last_m27_us = esp_timer_get_time();
-            CHECK_COOLDOWN();
-        }
+        /* Poll M27 (SD progress) every 10s — skip during host print */
+        if (!s_host_printing) {
+            now = esp_timer_get_time();
+            if (now - s_last_m27_us >= POLL_M27_INTERVAL_MS * 1000LL) {
+                send_query("M27", QUERY_M27);
+                s_last_m27_us = esp_timer_get_time();
+                CHECK_COOLDOWN();
+            }
 
-        /* Fetch filename once when printing starts */
-        if (s_need_filename) {
-            s_need_filename = false;
-            send_query("M27 C", QUERY_M27C);
-            CHECK_COOLDOWN();
+            /* Fetch filename once when printing starts */
+            if (s_need_filename) {
+                s_need_filename = false;
+                send_query("M27 C", QUERY_M27C);
+                CHECK_COOLDOWN();
+            }
         }
 
         /* Poll M114 (position) every 30s */
@@ -455,8 +713,8 @@ static void printer_comm_task(void *arg)
 poll_done:
 #undef CHECK_COOLDOWN
 
-        /* Small delay to avoid busy-looping between polls */
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Shorter delay during host print for throughput, normal otherwise */
+        vTaskDelay(pdMS_TO_TICKS(s_host_printing && !s_host_paused ? 20 : 100));
     }
 }
 
@@ -547,10 +805,12 @@ void printer_comm_get_state(printer_state_t *out)
         return;
     }
 
+#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         klipper_backend_get_state(out);
         return;
     }
+#endif
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     memcpy(out, &s_state, sizeof(printer_state_t));
@@ -608,9 +868,11 @@ esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
         }
         return ESP_OK;
     }
+#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         return klipper_backend_send_cmd(cmd);
     }
+#endif
 
     if (xQueueSend(s_cmd_queue, cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Command queue full");
@@ -623,10 +885,12 @@ esp_err_t printer_comm_init(void)
 {
     load_config_from_nvs();
 
+#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         ESP_LOGI(TAG, "Starting Klipper/Moonraker backend → %s:%u", s_mr_host, s_mr_port);
         return klipper_backend_start(s_mr_host, s_mr_port);
     }
+#endif
 
     /* Marlin backend */
     s_state_mutex = xSemaphoreCreateMutex();
@@ -646,11 +910,56 @@ esp_err_t printer_comm_init(void)
     s_state.print_time_left_s = -1;
     s_state.total_layers = -1;
 
-    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 4096,
+    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 6144,
                             NULL, 8, NULL, 0);
 
     ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
     return ESP_OK;
+}
+
+/* ---- Host print public API ---- */
+
+esp_err_t printer_comm_host_print_start(const char *filename)
+{
+    printer_cmd_t cmd = { .type = PCMD_HOST_START };
+    strncpy(cmd.gcode, filename, sizeof(cmd.gcode) - 1);
+    cmd.gcode[sizeof(cmd.gcode) - 1] = '\0';
+    if (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t printer_comm_host_print_pause(void)
+{
+    printer_cmd_t cmd = { .type = PCMD_HOST_PAUSE };
+    if (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t printer_comm_host_print_resume(void)
+{
+    printer_cmd_t cmd = { .type = PCMD_HOST_RESUME };
+    if (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t printer_comm_host_print_cancel(void)
+{
+    printer_cmd_t cmd = { .type = PCMD_HOST_CANCEL };
+    if (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+bool printer_comm_is_host_printing(void)
+{
+    return s_host_printing;
 }
 
 /* ---- Backend getters ---- */

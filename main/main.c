@@ -2,9 +2,10 @@
 #include "camera.h"
 #include "httpd.h"
 #include "usb_serial.h"
+#include "sdcard.h"
+#include "printer_comm.h"
 
 #if CONFIG_OBICO_ENABLED
-#include "printer_comm.h"
 #include "obico_client.h"
 #endif
 
@@ -36,7 +37,10 @@ void app_main(void)
     /* Camera */
     ESP_ERROR_CHECK(camera_init());
 
-    /* HTTP server (MJPEG stream + snapshot + Obico endpoints) */
+    /* SD card — optional, non-fatal if no card inserted */
+    sdcard_init();
+
+    /* HTTP server (MJPEG stream + snapshot + SD card + Obico endpoints) */
     ESP_ERROR_CHECK(httpd_start_server());
 
 #if CONFIG_OBICO_ENABLED
@@ -61,6 +65,8 @@ void app_main(void)
     /* Legacy mode: RFC 2217 owns the USB serial RX callback */
     ESP_ERROR_CHECK(usb_serial_init(rfc2217_feed_serial_data, NULL));
     ESP_ERROR_CHECK(rfc2217_start());
+    /* Also init printer_comm for host SD printing */
+    ESP_ERROR_CHECK(printer_comm_init());
 
     const char *ip = wifi_get_ip_str();
     ESP_LOGI(TAG, "========================================");
@@ -69,12 +75,13 @@ void app_main(void)
     ESP_LOGI(TAG, "========================================");
 
 #else
-    /* No serial bridge — camera-only mode */
-    ESP_ERROR_CHECK(usb_serial_init(NULL, NULL));
+    /* Camera + SD print mode */
+    ESP_ERROR_CHECK(usb_serial_init(printer_comm_rx_cb, NULL));
+    ESP_ERROR_CHECK(printer_comm_init());
 
     const char *ip = wifi_get_ip_str();
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (camera only)");
+    ESP_LOGI(TAG, "  ESP32 FDM Bridge READY");
     ESP_LOGI(TAG, "  http://%s/", ip);
     ESP_LOGI(TAG, "========================================");
 #endif

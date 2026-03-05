@@ -9,9 +9,12 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 
+#include "sdcard.h"
+#include "sdcard_httpd.h"
+#include "printer_comm.h"
+
 #if CONFIG_OBICO_ENABLED
 #include "obico_client.h"
-#include "printer_comm.h"
 #endif
 
 static const char *TAG = "httpd";
@@ -162,7 +165,7 @@ static void stream_server_task(void *arg)
 static esp_err_t root_handler(httpd_req_t *req)
 {
     const char *ip = wifi_get_ip_str();
-    char buf[1024];
+    char buf[1200];
 
     int len = snprintf(buf, sizeof(buf),
         "<!DOCTYPE html><html><head>"
@@ -177,6 +180,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<h2>Camera</h2>"
         "<a href=\"http://%s:81/\">MJPEG Stream</a>"
         "<a href=\"/capture\">Snapshot</a>"
+        "<a href=\"/camera/config\">Camera Config</a>"
+        "%s"
 #if CONFIG_OBICO_ENABLED
         "<h2>Obico</h2>"
         "<a href=\"/obico/link\">Link to Obico</a>"
@@ -187,7 +192,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<p>RFC 2217 port: <code>rfc2217://%s:%d</code></p>"
 #endif
         "</body></html>",
-        ip
+        ip,
+        sdcard_is_mounted() ? "<h2>SD Card</h2><a href=\"/sd\">File Manager</a>" : ""
 #if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
         , ip, CONFIG_RFC2217_PORT
 #endif
@@ -195,6 +201,44 @@ static esp_err_t root_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, buf, len);
+}
+
+/* ---- /camera/config handler ---- */
+
+static esp_err_t camera_config_get_handler(httpd_req_t *req)
+{
+    bool rot = camera_get_rotate180();
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf),
+        "<!DOCTYPE html><html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Camera Config</title>"
+        "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
+        "label{font-size:18px}button{font-size:16px;margin-top:12px;padding:8px 24px}</style>"
+        "</head><body><h2>Camera Config</h2>"
+        "<form method=\"POST\" action=\"/camera/config\">"
+        "<label><input type=\"checkbox\" name=\"rotate180\" value=\"1\"%s> Rotate 180&deg;</label><br>"
+        "<button type=\"submit\">Save</button></form></body></html>",
+        rot ? " checked" : "");
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, buf, len);
+}
+
+static esp_err_t camera_config_post_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recv_len < 0) recv_len = 0;
+    buf[recv_len] = '\0';
+
+    bool enable = (strstr(buf, "rotate180=1") != NULL);
+    camera_set_rotate180(enable);
+
+    /* Redirect back to GET to avoid form resubmit */
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/camera/config");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 /* ---- Public API ---- */
@@ -206,7 +250,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 24;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -229,6 +273,22 @@ esp_err_t httpd_start_server(void)
         .handler  = capture_handler,
     };
     httpd_register_uri_handler(server, &capture_uri);
+
+    httpd_uri_t cam_cfg_get = {
+        .uri      = "/camera/config",
+        .method   = HTTP_GET,
+        .handler  = camera_config_get_handler,
+    };
+    httpd_register_uri_handler(server, &cam_cfg_get);
+
+    httpd_uri_t cam_cfg_post = {
+        .uri      = "/camera/config",
+        .method   = HTTP_POST,
+        .handler  = camera_config_post_handler,
+    };
+    httpd_register_uri_handler(server, &cam_cfg_post);
+
+    sdcard_httpd_register(server);
 
 #if CONFIG_OBICO_ENABLED
     obico_register_httpd(server);
