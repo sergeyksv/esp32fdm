@@ -10,11 +10,6 @@ extern "C" {
 #endif
 
 typedef enum {
-    PRINTER_BACKEND_MARLIN  = 0,
-    PRINTER_BACKEND_KLIPPER = 1,
-} printer_backend_t;
-
-typedef enum {
     PRINTER_DISCONNECTED,
     PRINTER_OPERATIONAL,
     PRINTER_PRINTING,
@@ -62,6 +57,12 @@ typedef struct {
 #define TEMP_HISTORY_MAX 900    /* 1 hour at 4s intervals */
 
 /**
+ * Record a temperature history sample from current state.
+ * Must be called with s_state_mutex held (Marlin) or s_state populated (Klipper).
+ */
+void printer_comm_record_temp_sample(void);
+
+/**
  * Copy temperature history samples oldest-first into buf.
  * Returns actual number of samples copied (up to TEMP_HISTORY_MAX).
  */
@@ -101,11 +102,6 @@ void printer_comm_set_simulate(bool enable);
  * Returns true if simulation mode is active.
  */
 bool printer_comm_is_simulating(void);
-
-/**
- * Get the currently active printer backend.
- */
-printer_backend_t printer_comm_get_backend(void);
 
 /**
  * Get a human-readable name for the current backend ("Marlin" or "Klipper").

@@ -1,6 +1,7 @@
 #include "sdcard_httpd.h"
 #include "sdcard.h"
 #include "printer_comm.h"
+#include "printer_comm_klipper.h"
 #include "layout.h"
 
 #include "esp_log.h"
@@ -277,7 +278,12 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     if (amp) *amp = '\0';
     url_decode_inplace(fn);
 
-    esp_err_t err = printer_comm_host_print_start(fn);
+    esp_err_t err;
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        err = klipper_backend_print_file(fn);
+    } else {
+        err = printer_comm_host_print_start(fn);
+    }
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start print");
         return ESP_FAIL;
@@ -293,19 +299,34 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
 
 static esp_err_t sd_pause_handler(httpd_req_t *req)
 {
-    printer_comm_host_print_pause();
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        printer_cmd_t cmd = { .type = PCMD_PAUSE };
+        printer_comm_send_cmd(&cmd);
+    } else {
+        printer_comm_host_print_pause();
+    }
     return httpd_resp_send(req, "OK", 2);
 }
 
 static esp_err_t sd_resume_handler(httpd_req_t *req)
 {
-    printer_comm_host_print_resume();
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        printer_cmd_t cmd = { .type = PCMD_RESUME };
+        printer_comm_send_cmd(&cmd);
+    } else {
+        printer_comm_host_print_resume();
+    }
     return httpd_resp_send(req, "OK", 2);
 }
 
 static esp_err_t sd_cancel_handler(httpd_req_t *req)
 {
-    printer_comm_host_print_cancel();
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        printer_cmd_t cmd = { .type = PCMD_CANCEL };
+        printer_comm_send_cmd(&cmd);
+    } else {
+        printer_comm_host_print_cancel();
+    }
     return httpd_resp_send(req, "OK", 2);
 }
 
@@ -318,11 +339,19 @@ static esp_err_t sd_status_handler(httpd_req_t *req)
     printer_state_t st;
     printer_comm_get_state(&st);
 
-    bool host = printer_comm_is_host_printing();
+    bool is_printing;
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        /* Klipper: print status comes from Moonraker polling */
+        is_printing = (st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED);
+    } else {
+        /* Marlin: check host print state */
+        is_printing = printer_comm_is_host_printing();
+    }
+
     bool paused = (st.opstate == PRINTER_PAUSED);
 
     char json[256];
-    if (host) {
+    if (is_printing) {
         snprintf(json, sizeof(json),
                  "{\"printing\":true,\"paused\":%s,\"filename\":\"%s\","
                  "\"progress\":%.1f,\"layer\":%ld,\"elapsed\":%ld}",

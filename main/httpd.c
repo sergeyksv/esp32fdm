@@ -424,12 +424,14 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     printer_config_render_settings(&p);
     obico_render_settings(&p);
 
-    /* RFC 2217 section */
-    html_buf_printf(&p,
-        "<h2>RFC 2217</h2>"
-        "<p style='font-size:13px;color:#666'>"
-        "Serial bridge: <code>rfc2217://%s:%d</code></p>",
-        ip, CONFIG_RFC2217_PORT);
+    /* RFC 2217 section — only relevant for Marlin (USB serial bridge) */
+    if (printer_comm_get_backend() == PRINTER_BACKEND_MARLIN) {
+        html_buf_printf(&p,
+            "<h2>RFC 2217</h2>"
+            "<p style='font-size:13px;color:#666'>"
+            "Serial bridge: <code>rfc2217://%s:%d</code></p>",
+            ip, CONFIG_RFC2217_PORT);
+    }
 
     /* WiFi section */
     html_buf_printf(&p,

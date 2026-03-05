@@ -179,6 +179,18 @@ static bool parse_temp_pair(const char *line, char key,
     return true;
 }
 
+void printer_comm_record_temp_sample(void)
+{
+    temp_sample_t *sample = &s_temp_history[s_temp_head];
+    sample->timestamp_us = s_state.last_update_us;
+    sample->hotend_actual = s_state.hotend_actual;
+    sample->hotend_target = s_state.hotend_target;
+    sample->bed_actual = s_state.bed_actual;
+    sample->bed_target = s_state.bed_target;
+    s_temp_head = (s_temp_head + 1) % TEMP_HISTORY_MAX;
+    if (s_temp_count < TEMP_HISTORY_MAX) s_temp_count++;
+}
+
 /** Parse M105 response: "ok T:205.3 /210.0 B:60.1 /60.0" */
 static void parse_m105(const char *line)
 {
@@ -197,15 +209,7 @@ static void parse_m105(const char *line)
 
     s_state.last_update_us = esp_timer_get_time();
 
-    /* Record temperature history sample */
-    temp_sample_t *sample = &s_temp_history[s_temp_head];
-    sample->timestamp_us = s_state.last_update_us;
-    sample->hotend_actual = s_state.hotend_actual;
-    sample->hotend_target = s_state.hotend_target;
-    sample->bed_actual = s_state.bed_actual;
-    sample->bed_target = s_state.bed_target;
-    s_temp_head = (s_temp_head + 1) % TEMP_HISTORY_MAX;
-    if (s_temp_count < TEMP_HISTORY_MAX) s_temp_count++;
+    printer_comm_record_temp_sample();
 
     /* Update opstate from temps if not already printing */
     if (s_state.opstate == PRINTER_DISCONNECTED) {
@@ -760,6 +764,13 @@ static void host_print_finish(bool cancelled)
         fclose(s_host_file);
         s_host_file = NULL;
     }
+
+    /* Reset Marlin's line counter so it stops expecting numbered lines.
+     * Must be sent as a numbered command with the expected line number. */
+    char reset[40];
+    format_numbered_line(reset, sizeof(reset), s_host_marlin_line, "M110 N0");
+    send_query(reset, QUERY_CMD);
+    s_host_resend_line = -1;
 
     /* Stop Marlin print timer */
     send_query("M77", QUERY_CMD);
@@ -1417,17 +1428,24 @@ static void render_printer_config_form(html_buf_t *p)
         "<div style='margin-left:20px'>"
         "<label style='display:block;margin:8px 0 4px'>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
         "<label style='display:block;margin:8px 0 4px'>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
-        "</div>"
-        "<h3>Pause Command</h3>"
-        "<div style='margin:10px 0'>"
-        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
-        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
-        "</div>"
+        "</div>",
+        checked_marlin, checked_klipper, s_mr_host, s_mr_port);
+
+    /* Pause command section — Marlin only */
+    if (s_backend == PRINTER_BACKEND_MARLIN) {
+        html_buf_printf(p,
+            "<h3>Pause Command</h3>"
+            "<div style='margin:10px 0'>"
+            "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
+            "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
+            "</div>",
+            checked_m25, checked_m524);
+    }
+
+    html_buf_printf(p,
         "<button type='submit' style='margin-top:8px'>Save &amp; Reboot</button>"
         "</form>"
-        "<p style='font-size:13px'><a href='/printer/config/test'>Test Moonraker connection</a></p>",
-        checked_marlin, checked_klipper, s_mr_host, s_mr_port,
-        checked_m25, checked_m524);
+        "<p style='font-size:13px'><a href='/printer/config/test'>Test Moonraker connection</a></p>");
 }
 
 void printer_config_render_settings(html_buf_t *p)

@@ -30,6 +30,12 @@ void klipper_backend_get_state(printer_state_t *out);
  */
 esp_err_t klipper_backend_send_cmd(const printer_cmd_t *cmd);
 
+/**
+ * Upload a file from local SD card to Moonraker and start printing.
+ * Reads /sdcard/<filename>, uploads via multipart POST, then starts the print.
+ */
+esp_err_t klipper_backend_print_file(const char *filename);
+
 #ifdef __cplusplus
 }
 #endif

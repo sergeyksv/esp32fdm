@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sdcard.h"
+#include "printer_backend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -82,6 +83,14 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
             : " <a href='/sd'>SD Card</a>";
     }
 
+    int is_klipper = (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER);
+    const char *terminal_nav = "";
+    if (!is_klipper) {
+        terminal_nav = strcmp(current_path, "/terminal") == 0
+            ? " <b>Terminal</b>"
+            : " <a href='/terminal'>Terminal</a>";
+    }
+
     html_buf_printf(p,
         "<!DOCTYPE html><html><head>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -107,7 +116,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "</style></head><body>"
         "<nav>"
         "<span class='brand'>ESP32FDM</span>"
-        "%s %s%s %s %s"
+        "%s %s%s%s %s"
         "<span class='cpu-bars'>"
         "C0<span class='cpu-bar'><div id='cb0'></div></span>"
         "C1<span class='cpu-bar'><div id='cb1'></div></span>"
@@ -118,7 +127,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         NAV_LINK("/", "Home"),
         NAV_LINK("/camera", "Camera"),
         sd_nav,
-        NAV_LINK("/terminal", "Terminal"),
+        terminal_nav,
         NAV_LINK("/settings", "Settings"));
 
     #undef NAV_LINK

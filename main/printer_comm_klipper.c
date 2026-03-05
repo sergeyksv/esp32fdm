@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *TAG = "klipper";
 
@@ -21,6 +22,9 @@ static const char *TAG = "klipper";
 /* Moonraker connection info */
 static char s_host[64];
 static uint16_t s_port;
+
+/* Track last file uploaded to Moonraker so we can delete it when uploading a different one */
+static char s_last_uploaded[64];
 
 /* State */
 static printer_state_t s_state;
@@ -324,6 +328,9 @@ static void parse_moonraker_status(const char *json_str)
 
     s_state.last_update_us = esp_timer_get_time();
 
+    /* Record temperature history sample (shared circular buffer in printer_comm.c) */
+    printer_comm_record_temp_sample();
+
     ESP_LOGI(TAG, "=> op=%d temps=%.0f/%.0f bed=%.0f/%.0f prog=%.1f%% file='%s'",
              s_state.opstate,
              s_state.hotend_actual, s_state.hotend_target,
@@ -495,5 +502,243 @@ esp_err_t klipper_backend_send_cmd(const printer_cmd_t *cmd)
     }
 
     ESP_LOGI(TAG, "Command OK (HTTP 200)");
+    return ESP_OK;
+}
+
+/** URL-encode a filename into dst buffer. Returns pointer to dst. */
+static char *url_encode_filename(char *dst, size_t dst_size, const char *filename)
+{
+    const char *src = filename;
+    char *d = dst;
+    char *end = dst + dst_size - 4;
+    while (*src && d < end) {
+        char c = *src++;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            *d++ = c;
+        } else {
+            d += snprintf(d, end - d + 1, "%%%02X", (unsigned char)c);
+        }
+    }
+    *d = '\0';
+    return dst;
+}
+
+/**
+ * Check if Moonraker already has this file with the same size.
+ * Must be called with s_http_mutex held.
+ * Returns true if the file exists and size matches.
+ */
+static bool moonraker_file_matches(const char *filename, long local_size)
+{
+    char encoded[128];
+    url_encode_filename(encoded, sizeof(encoded), filename);
+
+    char path[256];
+    snprintf(path, sizeof(path), "/server/files/metadata?filename=%s", encoded);
+
+    int status = http_get(path);
+    if (status != 200) return false;
+
+    cJSON *root = cJSON_Parse(s_resp_buf);
+    if (!root) return false;
+
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (!result) { cJSON_Delete(root); return false; }
+
+    cJSON *size_item = cJSON_GetObjectItem(result, "size");
+    bool match = false;
+    if (size_item && cJSON_IsNumber(size_item)) {
+        long remote_size = (long)size_item->valuedouble;
+        match = (remote_size == local_size);
+        ESP_LOGI(TAG, "Moonraker file '%s': remote=%ld local=%ld → %s",
+                 filename, remote_size, local_size, match ? "SKIP upload" : "RE-upload");
+    }
+
+    cJSON_Delete(root);
+    return match;
+}
+
+/**
+ * Delete a file from Moonraker's gcodes storage.
+ * Must be called with s_http_mutex held.
+ */
+static void moonraker_delete_file(const char *filename)
+{
+    char encoded[128];
+    url_encode_filename(encoded, sizeof(encoded), filename);
+
+    char url[320];
+    snprintf(url, sizeof(url), "http://%s:%u/server/files/gcodes/%s",
+             s_host, s_port, encoded);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_DELETE,
+        .timeout_ms = HTTP_TIMEOUT_MS,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Delete '%s' from Moonraker → HTTP %d", filename, status);
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
+esp_err_t klipper_backend_print_file(const char *filename)
+{
+    if (!filename || !filename[0]) return ESP_ERR_INVALID_ARG;
+
+    /* Get local file size */
+    char filepath[300];
+    snprintf(filepath, sizeof(filepath), "/sdcard/%s", filename);
+
+    struct stat st;
+    if (stat(filepath, &st) != 0 || st.st_size <= 0) {
+        ESP_LOGE(TAG, "Cannot stat %s", filepath);
+        return ESP_ERR_NOT_FOUND;
+    }
+    long file_size = (long)st.st_size;
+
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+
+    /* Delete previous uploaded file if it's different from what we're about to print */
+    if (s_last_uploaded[0] && strcmp(s_last_uploaded, filename) != 0) {
+        moonraker_delete_file(s_last_uploaded);
+        s_last_uploaded[0] = '\0';
+    }
+
+    /* Check if Moonraker already has this file with the same size */
+    bool already_uploaded = moonraker_file_matches(filename, file_size);
+
+    if (!already_uploaded) {
+        FILE *f = fopen(filepath, "r");
+        if (!f) {
+            ESP_LOGE(TAG, "Cannot open %s", filepath);
+            xSemaphoreGive(s_http_mutex);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        ESP_LOGI(TAG, "Uploading %s (%ld bytes) to Moonraker", filename, file_size);
+
+        /* Build multipart body */
+        static const char *boundary = "----ESP32FDMUpload";
+
+        char part_header[256];
+        int hdr_len = snprintf(part_header, sizeof(part_header),
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "\r\n",
+            boundary, filename);
+
+        char part_footer[64];
+        int ftr_len = snprintf(part_footer, sizeof(part_footer),
+            "\r\n--%s--\r\n", boundary);
+
+        int total_len = hdr_len + (int)file_size + ftr_len;
+
+        char url[256];
+        snprintf(url, sizeof(url), "http://%s:%u/server/files/upload", s_host, s_port);
+
+        char content_type[64];
+        snprintf(content_type, sizeof(content_type),
+            "multipart/form-data; boundary=%s", boundary);
+
+        esp_http_client_config_t config = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+            .timeout_ms = 60000,
+        };
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) {
+            xSemaphoreGive(s_http_mutex);
+            fclose(f);
+            return ESP_FAIL;
+        }
+
+        esp_http_client_set_header(client, "Content-Type", content_type);
+
+        esp_err_t err = esp_http_client_open(client, total_len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Upload open failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            xSemaphoreGive(s_http_mutex);
+            fclose(f);
+            return err;
+        }
+
+        esp_http_client_write(client, part_header, hdr_len);
+
+        char *buf = malloc(4096);
+        if (!buf) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            xSemaphoreGive(s_http_mutex);
+            fclose(f);
+            return ESP_ERR_NO_MEM;
+        }
+
+        size_t total_written = 0;
+        while (total_written < (size_t)file_size) {
+            size_t to_read = 4096;
+            if (to_read > (size_t)file_size - total_written)
+                to_read = (size_t)file_size - total_written;
+            size_t rd = fread(buf, 1, to_read, f);
+            if (rd == 0) break;
+            int wr = esp_http_client_write(client, buf, rd);
+            if (wr < 0) {
+                ESP_LOGE(TAG, "Upload write failed");
+                break;
+            }
+            total_written += rd;
+        }
+        free(buf);
+        fclose(f);
+
+        esp_http_client_write(client, part_footer, ftr_len);
+
+        esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (status != 201 && status != 200) {
+            ESP_LOGE(TAG, "Upload failed: HTTP %d", status);
+            xSemaphoreGive(s_http_mutex);
+            return ESP_FAIL;
+        }
+
+        ESP_LOGI(TAG, "Upload OK (HTTP %d)", status);
+    }
+
+    /* Start print */
+    char encoded[128];
+    url_encode_filename(encoded, sizeof(encoded), filename);
+
+    char path[256];
+    snprintf(path, sizeof(path), "/printer/print/start?filename=%s", encoded);
+    int status = http_post(path, CMD_TIMEOUT_MS);
+
+    xSemaphoreGive(s_http_mutex);
+
+    if (status != 200) {
+        ESP_LOGE(TAG, "Print start failed: HTTP %d", status);
+        return ESP_FAIL;
+    }
+
+    /* Track this as the last uploaded file */
+    strncpy(s_last_uploaded, filename, sizeof(s_last_uploaded) - 1);
+    s_last_uploaded[sizeof(s_last_uploaded) - 1] = '\0';
+
+    ESP_LOGI(TAG, "Print started: %s", filename);
     return ESP_OK;
 }
