@@ -2,6 +2,7 @@
 
 #include "camera.h"
 #include "printer_comm.h"
+#include "layout.h"
 
 #include "cJSON.h"
 #include "esp_camera.h"
@@ -803,26 +804,26 @@ static void obico_snap_task(void *arg)
 
 /* ---- HTTP endpoints for device linking ---- */
 
-static const char LINK_PAGE_HTML[] =
-    "<!DOCTYPE html><html><head><title>Obico Link</title>"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
-    "input,button{font-size:18px;padding:10px;width:100%;box-sizing:border-box;margin:8px 0}"
-    "button{background:#4CAF50;color:white;border:none;cursor:pointer;border-radius:4px}"
-    ".status{margin-top:16px;padding:12px;border-radius:4px}"
-    ".ok{background:#dff0d8;color:#3c763d}.err{background:#f2dede;color:#a94442}"
-    "</style></head><body>"
-    "<h2>Link to Obico</h2>"
-    "<p>Enter the 6-digit code from <a href=\"https://app.obico.io\" target=\"_blank\">Obico</a>:</p>"
-    "<form method=\"POST\" action=\"/obico/link\">"
-    "<input type=\"text\" name=\"code\" placeholder=\"123456\" maxlength=\"6\" pattern=\"[0-9]{6}\" required>"
-    "<button type=\"submit\">Link</button>"
-    "</form></body></html>";
+void obico_render_settings(html_buf_t *p)
+{
+    html_buf_printf(p,
+        "<h2>Obico</h2>"
+        "<p>Enter the 6-digit code from <a href='https://app.obico.io' target='_blank'>Obico</a>:</p>"
+        "<form method='POST' action='/obico/link'>"
+        "<input type='text' name='code' placeholder='123456' maxlength='6' pattern='[0-9]{6}' required "
+        "style='font-size:18px;padding:10px;width:100%%;box-sizing:border-box;margin:8px 0'>"
+        "<button type='submit' style='background:#4CAF50;color:white;border:none;width:100%%;padding:10px;font-size:18px;margin:8px 0'>Link</button>"
+        "</form>"
+        "<p style='font-size:13px'><a href='/obico/status'>Obico Status</a> | "
+        "<a href='/obico/simulate'>Simulate</a></p>");
+}
 
 static esp_err_t obico_link_get_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, LINK_PAGE_HTML, sizeof(LINK_PAGE_HTML) - 1);
+    /* Redirect to unified settings page */
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t obico_link_post_handler(httpd_req_t *req)
@@ -855,20 +856,24 @@ static esp_err_t obico_link_post_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Linking with code: %s", code);
     esp_err_t err = obico_link_with_code(code);
 
-    httpd_resp_set_type(req, "text/html");
+    html_buf_t hb;
+    html_buf_init(&hb);
+    layout_html_begin(&hb, err == ESP_OK ? "Linked" : "Link Failed", "/settings");
     if (err == ESP_OK) {
-        const char *ok_html =
-            "<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;margin-top:80px\">"
-            "<h2 style=\"color:#3c763d\">Linked successfully!</h2>"
-            "<p>This printer is now connected to Obico.</p></body></html>";
-        return httpd_resp_send(req, ok_html, HTTPD_RESP_USE_STRLEN);
+        html_buf_printf(&hb,
+            "<h2 style='color:#3c763d'>Linked successfully!</h2>"
+            "<p>This printer is now connected to Obico.</p>");
     } else {
-        const char *err_html =
-            "<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;margin-top:80px\">"
-            "<h2 style=\"color:#a94442\">Linking failed</h2>"
-            "<p>Check the code and try again. <a href=\"/obico/link\">Back</a></p></body></html>";
-        return httpd_resp_send(req, err_html, HTTPD_RESP_USE_STRLEN);
+        html_buf_printf(&hb,
+            "<h2 style='color:#a94442'>Linking failed</h2>"
+            "<p>Check the code and try again. <a href='/settings'>Back</a></p>");
     }
+    layout_html_end(&hb);
+
+    httpd_resp_set_type(req, "text/html");
+    esp_err_t ret = httpd_resp_send(req, hb.data, hb.len);
+    html_buf_free(&hb);
+    return ret;
 }
 
 static esp_err_t obico_status_handler(httpd_req_t *req)
@@ -901,18 +906,22 @@ static esp_err_t obico_simulate_handler(httpd_req_t *req)
     bool currently_on = printer_comm_is_simulating();
     printer_comm_set_simulate(!currently_on);
 
-    const char *state_str = !currently_on ? "ON — printing with fake data"
-                                          : "OFF — real printer state";
-    char resp[512];
-    snprintf(resp, sizeof(resp),
-        "<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;margin-top:80px\">"
+    const char *state_str = !currently_on ? "ON &mdash; printing with fake data"
+                                          : "OFF &mdash; real printer state";
+    html_buf_t p;
+    html_buf_init(&p);
+    layout_html_begin(&p, "Simulate", "/settings");
+    html_buf_printf(&p,
         "<h2>Simulation: %s</h2>"
-        "<p><a href=\"/obico/simulate\">Toggle</a> | "
-        "<a href=\"/obico/status\">Status</a></p></body></html>",
+        "<p><a href='/obico/simulate'>Toggle</a> | "
+        "<a href='/obico/status'>Status</a></p>",
         state_str);
+    layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
+    html_buf_free(&p);
+    return ret;
 }
 
 esp_err_t obico_register_httpd(void *server_handle)

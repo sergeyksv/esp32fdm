@@ -16,10 +16,10 @@
 #include "sdcard.h"
 #include "sdcard_httpd.h"
 #include "printer_comm.h"
+#include "usb_serial.h"
+#include "layout.h"
 
-#if CONFIG_OBICO_ENABLED
 #include "obico_client.h"
-#endif
 
 static const char *TAG = "httpd";
 
@@ -50,24 +50,11 @@ static esp_err_t capture_handler(httpd_req_t *req)
 
 /* ---- /stream handler (MJPEG multipart) ---- */
 
-static esp_err_t stream_handler(httpd_req_t *req)
+/* Stream task runs in background, freeing the httpd thread */
+static void stream_task(void *arg)
 {
+    httpd_req_t *req = (httpd_req_t *)arg;
     int fd = httpd_req_to_sockfd(req);
-
-    /* TCP_NODELAY for low-latency frame delivery */
-    int nodelay = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-    /* Send HTTP response header directly (not chunked) */
-    const char *resp_hdr =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace;boundary=esp32fdm_frame\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "X-Framerate: 5\r\n"
-        "\r\n";
-    if (httpd_send(req, resp_hdr, strlen(resp_hdr)) <= 0) {
-        return ESP_FAIL;
-    }
 
     ESP_LOGI(TAG, "Stream client connected");
 
@@ -108,77 +95,214 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     ESP_LOGI(TAG, "Stream client disconnected");
+    httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+
+    /* TCP_NODELAY for low-latency frame delivery */
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    /* Send HTTP response header before handing off to background task */
+    const char *resp_hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace;boundary=esp32fdm_frame\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "X-Framerate: 5\r\n"
+        "\r\n";
+    if (httpd_send(req, resp_hdr, strlen(resp_hdr)) <= 0) {
+        return ESP_FAIL;
+    }
+
+    /* Clone the request for async use and spawn a background task */
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start async stream handler");
+        return ESP_FAIL;
+    }
+
+    if (xTaskCreatePinnedToCore(stream_task, "stream", 4096, async_req,
+                                 5, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create stream task");
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
+
     return ESP_OK;
 }
 
-/* ---- / root handler ---- */
+/* ---- GET /api/status — JSON for status bar + dashboard ---- */
+
+static esp_err_t api_status_handler(httpd_req_t *req)
+{
+    printer_state_t st;
+    printer_comm_get_state(&st);
+
+    const char *state_str;
+    switch (st.opstate) {
+        case PRINTER_PRINTING: state_str = "printing"; break;
+        case PRINTER_PAUSED:   state_str = "paused"; break;
+        case PRINTER_ERROR:    state_str = "error"; break;
+        case PRINTER_OPERATIONAL: state_str = "operational"; break;
+        default: state_str = "disconnected"; break;
+    }
+
+    bool usb = usb_serial_is_connected();
+    int32_t layer = st.current_layer;
+    int32_t total_layers = st.total_layers;
+
+    char json[420];
+    snprintf(json, sizeof(json),
+        "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
+        "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
+        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"usb\":%s}",
+        state_str, printer_comm_backend_name(),
+        st.hotend_actual, st.hotend_target,
+        st.bed_actual, st.bed_target,
+        st.progress_pct >= 0 ? st.progress_pct : 0.0f,
+        st.filename,
+        (long)(st.print_time_s >= 0 ? st.print_time_s : 0),
+        (long)(st.print_time_left_s >= 0 ? st.print_time_left_s : 0),
+        (long)(layer >= 0 ? layer : 0),
+        (long)(total_layers >= 0 ? total_layers : 0),
+        st.z,
+        usb ? "true" : "false");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json, strlen(json));
+}
+
+/* ---- / root handler — dashboard ---- */
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    char buf[1200];
-#if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
-    const char *ip = wifi_get_ip_str();
-#endif
+    html_buf_t p;
+    html_buf_init(&p);
 
-    int len = snprintf(buf, sizeof(buf),
-        "<!DOCTYPE html><html><head>"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>ESP32 FDM Bridge</title>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:600px;margin:2em auto;padding:0 1em}"
-        "a{display:block;margin:.5em 0}"
-        "code{background:#eee;padding:2px 6px;border-radius:3px}"
-        "</style></head><body>"
-        "<h1>ESP32 FDM Bridge</h1>"
-        "<h2>Camera</h2>"
-        "<a href=\"/stream\">MJPEG Stream</a>"
-        "<a href=\"/capture\">Snapshot</a>"
-        "<a href=\"/camera/config\">Camera Config</a>"
-        "%s"
-#if CONFIG_OBICO_ENABLED
-        "<h2>Obico</h2>"
-        "<a href=\"/obico/link\">Link to Obico</a>"
-        "<a href=\"/obico/status\">Obico Status</a>"
-        "<a href=\"/printer/config\">Printer Config</a>"
-#elif CONFIG_RFC2217_ENABLED
-        "<h2>Serial</h2>"
-        "<p>RFC 2217 port: <code>rfc2217://%s:%d</code></p>"
-#endif
-        "<h2>WiFi</h2>"
-        "<form method=\"POST\" action=\"/wifi/reset\">"
-        "<button type=\"submit\" onclick=\"return confirm('Reset WiFi credentials and reboot?')\">"
-        "Reset WiFi</button></form>"
-        "</body></html>",
-        sdcard_is_mounted() ? "<h2>SD Card</h2><a href=\"/sd\">File Manager</a>" : ""
-#if !CONFIG_OBICO_ENABLED && CONFIG_RFC2217_ENABLED
-        , ip, CONFIG_RFC2217_PORT
-#endif
-    );
+    layout_html_begin(&p, "ESP32 FDM Dashboard", "/");
+
+    html_buf_printf(&p,
+        "<h2>Dashboard</h2>"
+        "<div style='text-align:center;margin:12px 0'>"
+        "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
+        "</div>"
+        "<div id='dash'>"
+        "<table>"
+        "<tr><td>Hotend</td><td id='he'>--</td></tr>"
+        "<tr><td>Bed</td><td id='bd'>--</td></tr>"
+        "<tr><td>State</td><td id='st'>--</td></tr>"
+        "<tr id='fnr' style='display:none'><td>File</td><td id='fn'></td></tr>"
+        "<tr id='pgr' style='display:none'><td>Progress</td><td id='pg'></td></tr>"
+        "<tr id='lyr' style='display:none'><td>Layer</td><td id='ly'></td></tr>"
+        "<tr id='tmr' style='display:none'><td>Time</td><td id='tm'></td></tr>"
+        "</table>"
+        "</div>");
+    html_buf_printf(&p,
+        "<script>"
+        "var cam=document.getElementById('cam');"
+        "setInterval(function(){cam.src='/capture?'+Date.now()},5000);"
+        "function u(){"
+        "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
+        "document.getElementById('he').textContent=s.hotend[0].toFixed(1)+' / '+s.hotend[1].toFixed(0)+'\\u00b0C';"
+        "document.getElementById('bd').textContent=s.bed[0].toFixed(1)+' / '+s.bed[1].toFixed(0)+'\\u00b0C';"
+        "var pr=s.state=='printing'||s.state=='paused';"
+        "document.getElementById('st').textContent=s.state.charAt(0).toUpperCase()+s.state.slice(1);"
+        "document.getElementById('fnr').style.display=pr?'':'none';"
+        "document.getElementById('pgr').style.display=pr?'':'none';"
+        "document.getElementById('lyr').style.display=pr?'':'none';"
+        "document.getElementById('tmr').style.display=pr?'':'none';"
+        "if(pr){"
+        "document.getElementById('fn').textContent=s.filename;"
+        "document.getElementById('pg').innerHTML=s.progress.toFixed(1)+'%%'+"
+        "'<div class=pbar><div style=\"width:'+Math.min(100,s.progress)+'%%\"></div></div>';"
+        "document.getElementById('ly').textContent=s.layer;"
+        "var e=Math.floor(s.elapsed/60)+'m';var r=s.remaining>0?' / ~'+Math.floor(s.remaining/60)+'m left':'';"
+        "document.getElementById('tm').textContent=e+r;}"
+        "}).catch(function(){})}"
+        "u();setInterval(u,2000);"
+        "</script>");
+
+    layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, buf, len);
+    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
+    html_buf_free(&p);
+    return ret;
 }
 
-/* ---- /camera/config handler ---- */
+/* ---- /settings handler ---- */
 
-static esp_err_t camera_config_get_handler(httpd_req_t *req)
+static esp_err_t settings_get_handler(httpd_req_t *req)
 {
     bool rot = camera_get_rotate180();
-    char buf[512];
-    int len = snprintf(buf, sizeof(buf),
-        "<!DOCTYPE html><html><head>"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>Camera Config</title>"
-        "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
-        "label{font-size:18px}button{font-size:16px;margin-top:12px;padding:8px 24px}</style>"
-        "</head><body><h2>Camera Config</h2>"
-        "<form method=\"POST\" action=\"/camera/config\">"
-        "<label><input type=\"checkbox\" name=\"rotate180\" value=\"1\"%s> Rotate 180&deg;</label><br>"
-        "<button type=\"submit\">Save</button></form></body></html>",
-        rot ? " checked" : "");
+    html_buf_t p;
+    html_buf_init(&p);
+
+    layout_html_begin(&p, "Settings", "/settings");
+
+    const char *ip = wifi_get_ip_str();
+
+    /* Camera section */
+    html_buf_printf(&p,
+        "<h2>Camera</h2>"
+        "<form method='POST' action='/camera/config'>"
+        "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label> "
+        "<button type='submit'>Save</button></form>"
+        "<p style='font-size:13px;color:#666;margin:8px 0'>"
+        "MJPEG Stream: <a href='/stream'>http://%s/stream</a><br>"
+        "Snapshot: <a href='/capture'>http://%s/capture</a></p>",
+        rot ? " checked" : "", ip, ip);
+
+    /* Printer & Obico sections */
+    printer_config_render_settings(&p);
+    obico_render_settings(&p);
+
+    /* RFC 2217 section */
+    html_buf_printf(&p,
+        "<h2>RFC 2217</h2>"
+        "<p style='font-size:13px;color:#666'>"
+        "Serial bridge: <code>rfc2217://%s:%d</code></p>",
+        ip, CONFIG_RFC2217_PORT);
+
+    /* WiFi section */
+    html_buf_printf(&p,
+        "<h2>WiFi</h2>"
+        "<form method='POST' action='/wifi/reset'>"
+        "<button type='submit' onclick=\"return confirm('Reset WiFi credentials and reboot?')\" "
+        "style='background:#f44336;color:#fff;border:none'>Reset WiFi</button></form>");
+
+    layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, buf, len);
+    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
+    html_buf_free(&p);
+    return ret;
+}
+
+/* ---- /camera handler ---- */
+
+static esp_err_t camera_page_handler(httpd_req_t *req)
+{
+    html_buf_t p;
+    html_buf_init(&p);
+
+    layout_html_begin(&p, "Camera", "/camera");
+    html_buf_printf(&p,
+        "<h2>Camera</h2>"
+        "<div style='text-align:center'>"
+        "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='MJPEG Stream'>"
+        "</div>");
+    layout_html_end(&p);
+
+    httpd_resp_set_type(req, "text/html");
+    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
+    html_buf_free(&p);
+    return ret;
 }
 
 static esp_err_t camera_config_post_handler(httpd_req_t *req)
@@ -191,9 +315,9 @@ static esp_err_t camera_config_post_handler(httpd_req_t *req)
     bool enable = (strstr(buf, "rotate180=1") != NULL);
     camera_set_rotate180(enable);
 
-    /* Redirect back to GET to avoid form resubmit */
+    /* Redirect back to settings page */
     httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/camera/config");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_send(req, NULL, 0);
 }
 
@@ -398,12 +522,26 @@ esp_err_t httpd_start_server(void)
     };
     httpd_register_uri_handler(server, &stream_uri);
 
-    httpd_uri_t cam_cfg_get = {
-        .uri      = "/camera/config",
+    httpd_uri_t api_status = {
+        .uri      = "/api/status",
         .method   = HTTP_GET,
-        .handler  = camera_config_get_handler,
+        .handler  = api_status_handler,
     };
-    httpd_register_uri_handler(server, &cam_cfg_get);
+    httpd_register_uri_handler(server, &api_status);
+
+    httpd_uri_t camera_page = {
+        .uri      = "/camera",
+        .method   = HTTP_GET,
+        .handler  = camera_page_handler,
+    };
+    httpd_register_uri_handler(server, &camera_page);
+
+    httpd_uri_t settings_uri = {
+        .uri      = "/settings",
+        .method   = HTTP_GET,
+        .handler  = settings_get_handler,
+    };
+    httpd_register_uri_handler(server, &settings_uri);
 
     httpd_uri_t cam_cfg_post = {
         .uri      = "/camera/config",
@@ -421,10 +559,8 @@ esp_err_t httpd_start_server(void)
 
     sdcard_httpd_register(server);
 
-#if CONFIG_OBICO_ENABLED
     obico_register_httpd(server);
     printer_config_register_httpd(server);
-#endif
 
     ESP_LOGI(TAG, "HTTP server started on port 80 (stream at /stream)");
 

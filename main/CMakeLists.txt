@@ -7,16 +7,11 @@ set(SRCS
     "sdcard.c"
     "sdcard_httpd.c"
     "printer_comm.c"
+    "printer_comm_klipper.c"
+    "obico_client.c"
+    "rfc2217.c"
     "dns_server.c"
 )
-
-if(CONFIG_OBICO_ENABLED)
-    list(APPEND SRCS "printer_comm_klipper.c" "obico_client.c")
-endif()
-
-if(CONFIG_RFC2217_ENABLED)
-    list(APPEND SRCS "rfc2217.c")
-endif()
 
 idf_component_register(
     SRCS ${SRCS}

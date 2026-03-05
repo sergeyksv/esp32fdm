@@ -5,14 +5,8 @@
 #include "usb_serial.h"
 #include "sdcard.h"
 #include "printer_comm.h"
-
-#if CONFIG_OBICO_ENABLED
 #include "obico_client.h"
-#endif
-
-#if CONFIG_RFC2217_ENABLED
 #include "rfc2217.h"
-#endif
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -51,49 +45,28 @@ void app_main(void)
     /* SD card — optional, non-fatal if no card inserted */
     sdcard_init();
 
-    /* HTTP server (MJPEG stream + snapshot + SD card + Obico endpoints) */
+    /* HTTP server (MJPEG stream + snapshot + SD card + all endpoints) */
     ESP_ERROR_CHECK(httpd_start_server());
 
-#if CONFIG_OBICO_ENABLED
-    /* Obico mode: printer_comm owns the USB serial RX callback */
+    /* Printer comm — always init with USB serial */
     ESP_ERROR_CHECK(usb_serial_init(printer_comm_rx_cb, NULL));
     ESP_ERROR_CHECK(printer_comm_init());
+
+    /* Obico client */
     ESP_ERROR_CHECK(obico_client_init());
+
+    /* RFC 2217 serial bridge */
+    ESP_ERROR_CHECK(rfc2217_start());
 
     const char *ip = wifi_get_ip_str();
     printer_backend_t backend = printer_comm_get_backend();
     ESP_LOGI(TAG, "========================================");
     if (backend == PRINTER_BACKEND_KLIPPER) {
-        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico - Klipper → %s:%u)",
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Klipper → %s:%u)",
                  printer_comm_get_mr_host(), printer_comm_get_mr_port());
     } else {
-        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Obico - Marlin)");
+        ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (Marlin)");
     }
     ESP_LOGI(TAG, "  http://%s/", ip);
     ESP_LOGI(TAG, "========================================");
-
-#elif CONFIG_RFC2217_ENABLED
-    /* Legacy mode: RFC 2217 owns the USB serial RX callback */
-    ESP_ERROR_CHECK(usb_serial_init(rfc2217_feed_serial_data, NULL));
-    ESP_ERROR_CHECK(rfc2217_start());
-    /* Also init printer_comm for host SD printing */
-    ESP_ERROR_CHECK(printer_comm_init());
-
-    const char *ip = wifi_get_ip_str();
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32 FDM Bridge READY (RFC2217 mode)");
-    ESP_LOGI(TAG, "  http://%s/", ip);
-    ESP_LOGI(TAG, "========================================");
-
-#else
-    /* Camera + SD print mode */
-    ESP_ERROR_CHECK(usb_serial_init(printer_comm_rx_cb, NULL));
-    ESP_ERROR_CHECK(printer_comm_init());
-
-    const char *ip = wifi_get_ip_str();
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32 FDM Bridge READY");
-    ESP_LOGI(TAG, "  http://%s/", ip);
-    ESP_LOGI(TAG, "========================================");
-#endif
 }

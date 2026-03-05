@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "layout.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -36,6 +37,12 @@ esp_err_t obico_unlink(void);
  * Called from httpd.c during server setup.
  */
 esp_err_t obico_register_httpd(void *server_handle);
+
+/**
+ * Render Obico link section HTML into a page buffer.
+ * Used by the unified settings page.
+ */
+void obico_render_settings(html_buf_t *p);
 
 #ifdef __cplusplus
 }

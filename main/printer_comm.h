@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "layout.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -92,6 +93,11 @@ bool printer_comm_is_simulating(void);
 printer_backend_t printer_comm_get_backend(void);
 
 /**
+ * Get a human-readable name for the current backend ("Marlin" or "Klipper").
+ */
+const char *printer_comm_backend_name(void);
+
+/**
  * Get the configured Moonraker host (empty string if not set).
  */
 const char *printer_comm_get_mr_host(void);
@@ -114,6 +120,12 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
  * Called from httpd.c during server setup.
  */
 esp_err_t printer_config_register_httpd(void *server_handle);
+
+/**
+ * Render printer config section HTML into a page buffer.
+ * Used by the unified settings page.
+ */
+void printer_config_render_settings(html_buf_t *p);
 
 /**
  * Start host-based GCode printing from a file on /sdcard.

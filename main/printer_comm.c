@@ -1,7 +1,5 @@
 #include "printer_comm.h"
-#if CONFIG_OBICO_ENABLED
 #include "printer_comm_klipper.h"
-#endif
 
 #include "usb_serial.h"
 
@@ -16,6 +14,8 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+
+#include "layout.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -998,12 +998,10 @@ void printer_comm_get_state(printer_state_t *out)
         return;
     }
 
-#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         klipper_backend_get_state(out);
         return;
     }
-#endif
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     memcpy(out, &s_state, sizeof(printer_state_t));
@@ -1061,11 +1059,9 @@ esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
         }
         return ESP_OK;
     }
-#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         return klipper_backend_send_cmd(cmd);
     }
-#endif
 
     if (xQueueSend(s_cmd_queue, cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Command queue full");
@@ -1078,12 +1074,10 @@ esp_err_t printer_comm_init(void)
 {
     load_config_from_nvs();
 
-#if CONFIG_OBICO_ENABLED
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         ESP_LOGI(TAG, "Starting Klipper/Moonraker backend → %s:%u", s_mr_host, s_mr_port);
         return klipper_backend_start(s_mr_host, s_mr_port);
     }
-#endif
 
     /* Marlin backend */
     s_state_mutex = xSemaphoreCreateMutex();
@@ -1162,6 +1156,11 @@ printer_backend_t printer_comm_get_backend(void)
     return s_backend;
 }
 
+const char *printer_comm_backend_name(void)
+{
+    return s_backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin";
+}
+
 const char *printer_comm_get_mr_host(void)
 {
     return s_mr_host;
@@ -1199,47 +1198,47 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
 
 /* ---- Web UI HTTP handlers ---- */
 
-static esp_err_t printer_config_get_handler(httpd_req_t *req)
+static void render_printer_config_form(html_buf_t *p)
 {
     const char *checked_marlin  = (s_backend == PRINTER_BACKEND_MARLIN)  ? "checked" : "";
     const char *checked_klipper = (s_backend == PRINTER_BACKEND_KLIPPER) ? "checked" : "";
     const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
     const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
 
-    char html[2048];
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html><html><head><title>Printer Config</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:480px;margin:20px auto;padding:0 10px}"
-        "label{display:block;margin:8px 0 4px}input[type=text],input[type=number]{width:100%%;box-sizing:border-box;padding:6px}"
-        ".radio-group{margin:10px 0}button{margin-top:16px;padding:10px 24px;font-size:16px}"
-        ".klipper-fields{margin-left:20px}"
-        "</style></head><body>"
-        "<h2>Printer Backend</h2>"
+    html_buf_printf(p,
+        "<h2>Printer</h2>"
         "<form method='POST' action='/printer/config'>"
-        "<div class='radio-group'>"
-        "<label><input type='radio' name='backend' value='marlin' %s> Marlin (USB serial)</label>"
-        "<label><input type='radio' name='backend' value='klipper' %s> Klipper (Moonraker HTTP)</label>"
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='marlin' %s> Marlin (USB serial)</label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='klipper' %s> Klipper (Moonraker HTTP)</label>"
         "</div>"
-        "<div class='klipper-fields'>"
-        "<label>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63'></label>"
-        "<label>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535'></label>"
+        "<div style='margin-left:20px'>"
+        "<label style='display:block;margin:8px 0 4px'>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
+        "<label style='display:block;margin:8px 0 4px'>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
         "</div>"
-        "<h2>Pause Command</h2>"
-        "<div class='radio-group'>"
-        "<label><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
-        "<label><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
+        "<h3>Pause Command</h3>"
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
         "</div>"
-        "<button type='submit'>Save &amp; Reboot</button>"
+        "<button type='submit' style='margin-top:8px'>Save &amp; Reboot</button>"
         "</form>"
-        "<p><a href='/printer/config/test'>Test Moonraker connection</a></p>"
-        "</body></html>",
+        "<p style='font-size:13px'><a href='/printer/config/test'>Test Moonraker connection</a></p>",
         checked_marlin, checked_klipper, s_mr_host, s_mr_port,
         checked_m25, checked_m524);
+}
 
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, strlen(html));
+void printer_config_render_settings(html_buf_t *p)
+{
+    render_printer_config_form(p);
+}
+
+static esp_err_t printer_config_get_handler(httpd_req_t *req)
+{
+    /* Redirect to unified settings page */
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t printer_config_post_handler(httpd_req_t *req)
@@ -1287,17 +1286,18 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    const char *resp =
-        "<!DOCTYPE html><html><head><title>Saved</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "</head><body>"
+    html_buf_t pg;
+    html_buf_init(&pg);
+    layout_html_begin(&pg, "Saved", "/settings");
+    html_buf_printf(&pg,
         "<h2>Configuration saved!</h2>"
         "<p>Rebooting in 3 seconds...</p>"
-        "<script>setTimeout(function(){location.href='/printer/config'},5000)</script>"
-        "</body></html>";
+        "<script>setTimeout(function(){location.href='/settings'},5000)</script>");
+    layout_html_end(&pg);
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, resp, strlen(resp));
+    httpd_resp_send(req, pg.data, pg.len);
+    html_buf_free(&pg);
 
     /* Reboot after a short delay so the response can be sent */
     vTaskDelay(pdMS_TO_TICKS(3000));
