@@ -104,13 +104,14 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "</style></head><body>"
         "<nav>"
         "<span class='brand'>ESP32FDM</span>"
-        "%s %s%s %s"
+        "%s %s%s %s %s"
         "</nav>"
         "<div id='pst'></div>",
         title,
         NAV_LINK("/", "Home"),
         NAV_LINK("/camera", "Camera"),
         sd_nav,
+        NAV_LINK("/terminal", "Terminal"),
         NAV_LINK("/settings", "Settings"));
 
     #undef NAV_LINK

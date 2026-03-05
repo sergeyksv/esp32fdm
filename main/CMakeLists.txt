@@ -10,6 +10,7 @@ set(SRCS
     "printer_comm_klipper.c"
     "obico_client.c"
     "rfc2217.c"
+    "terminal.c"
     "dns_server.c"
 )
 

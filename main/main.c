@@ -7,6 +7,7 @@
 #include "printer_comm.h"
 #include "obico_client.h"
 #include "rfc2217.h"
+#include "terminal.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -44,6 +45,9 @@ void app_main(void)
 
     /* SD card — optional, non-fatal if no card inserted */
     sdcard_init();
+
+    /* Terminal ring buffer (must init before HTTP server & USB RX) */
+    terminal_init();
 
     /* HTTP server (MJPEG stream + snapshot + SD card + all endpoints) */
     ESP_ERROR_CHECK(httpd_start_server());

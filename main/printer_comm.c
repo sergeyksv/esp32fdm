@@ -2,6 +2,7 @@
 #include "printer_comm_klipper.h"
 
 #include "usb_serial.h"
+#include "terminal.h"
 
 #include "esp_http_client.h"
 #include "esp_http_server.h"
@@ -985,8 +986,11 @@ static void load_config_from_nvs(void)
 void printer_comm_rx_cb(const uint8_t *data, size_t len, void *user_ctx)
 {
     if (s_backend != PRINTER_BACKEND_MARLIN) return;
-    if (s_rx_stream && len > 0) {
-        xStreamBufferSend(s_rx_stream, data, len, 0);
+    if (len > 0) {
+        if (s_rx_stream) {
+            xStreamBufferSend(s_rx_stream, data, len, 0);
+        }
+        terminal_feed_rx(data, len);
     }
 }
 
