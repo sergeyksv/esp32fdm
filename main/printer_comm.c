@@ -365,6 +365,25 @@ static void process_line(const char *line)
         }
     }
 
+    /* Marlin action commands: //action:pause, //action:out_of_filament, //action:resume */
+    if (strncmp(line, "//action:", 9) == 0) {
+        const char *action = line + 9;
+        if (strcmp(action, "pause") == 0 || strcmp(action, "out_of_filament") == 0) {
+            if (s_host_printing && !s_host_paused) {
+                ESP_LOGW(TAG, "Printer requested pause: %s", action);
+                printer_cmd_t cmd = { .type = PCMD_PAUSE };
+                xQueueSend(s_cmd_queue, &cmd, 0);
+            }
+        } else if (strcmp(action, "resume") == 0) {
+            if (s_host_printing && s_host_paused) {
+                ESP_LOGI(TAG, "Printer requested resume");
+                printer_cmd_t cmd = { .type = PCMD_RESUME };
+                xQueueSend(s_cmd_queue, &cmd, 0);
+            }
+        }
+        return;
+    }
+
     /* Marlin says "busy: processing" when it can't accept commands yet */
     if (strstr(line, "busy:")) {
         s_cmd_cooldown_until_us = esp_timer_get_time() + 4000000LL; /* back off 4s */
