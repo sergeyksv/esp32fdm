@@ -1,13 +1,16 @@
 # ESP32 FDM Printer Bridge
 
 WiFi-to-printer bridge firmware for **Freenove ESP32-S3-WROOM** (OV2640 camera, dual USB-C).
-Designed for OctoPrint integration.
+Dual backend: Marlin (USB serial) or Klipper (Moonraker HTTP).
 
 ## Features
 
 - **MJPEG video stream** from OV2640 (`/stream`, `/capture`)
 - **USB Host** serial bridge to FDM printer (CDC-ACM + CH34x/CP210x/FT23x VCP)
-- **RFC 2217 server** — OctoPrint connects via `rfc2217://<ip>:2217`
+- **Marlin backend**: direct serial, host printing from SD, GCode terminal
+- **Klipper backend**: Moonraker HTTP API, file upload + print, temp/progress tracking
+- **Obico integration**: AI failure detection, remote monitoring
+- **RFC 2217 server** — OctoPrint connects via `rfc2217://<ip>:2217` (Marlin only)
 
 ## Build
 
@@ -25,14 +28,21 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 ```
 main/
-  main.c            — Entry point: NVS → WiFi → Camera → HTTP → USB Host → RFC 2217
-  wifi.c/h          — WiFi STA, EventGroup blocking, auto-reconnect (10 retries)
-  camera.c/h        — OV2640, Freenove pin mapping, VGA JPEG, 2 PSRAM buffers
-  httpd.c/h         — HTTP server :80, /stream (MJPEG multipart), /capture (JPEG)
-  usb_serial.cpp/h  — USB Host CDC-ACM + VCP drivers (C++ for VCP headers, extern "C" API)
-  rfc2217.c/h       — RFC 2217 Telnet COM-PORT-OPTION server, IAC state machine
-  Kconfig.projbuild — Menuconfig: WiFi SSID/pass, RFC2217 port, baud rate
-  idf_component.yml — Component dependencies
+  main.c                — Entry point: NVS → WiFi → Camera → HTTP → USB Host → backend
+  wifi.c/h              — WiFi STA, EventGroup blocking, auto-reconnect
+  camera.c/h            — OV2640, Freenove pin mapping, VGA JPEG, PSRAM buffers
+  httpd.c/h             — HTTP server :80, dashboard, settings, camera, API endpoints
+  usb_serial.cpp/h      — USB Host CDC-ACM + VCP drivers (C++ for VCP headers)
+  printer_backend.h     — Backend enum (Marlin/Klipper), shared by layout.h
+  printer_comm.c/h      — Marlin serial protocol, host printing, temp history, state machine
+  printer_comm_klipper.c/h — Klipper/Moonraker HTTP backend, file upload to Moonraker
+  terminal.c/h          — Web GCode terminal (Marlin only)
+  sdcard.c/h            — SD card mount/unmount
+  sdcard_httpd.c/h      — SD card web UI, backend-aware print/pause/resume/cancel
+  obico_client.c/h      — Obico WebSocket, snapshot upload, Janus signaling
+  rfc2217.c/h           — RFC 2217 Telnet server (Marlin only)
+  layout.h              — Shared HTML layout, nav bar (hides Marlin-only items for Klipper)
+  Kconfig.projbuild     — Menuconfig options
 ```
 
 ## Hardware
@@ -51,10 +61,14 @@ main/
 
 - `usb_serial.cpp` must be C++ because VCP driver headers are `.hpp`
 - C++ exceptions enabled (`CONFIG_COMPILER_CXX_EXCEPTIONS=y`) — required by VCP component
-- Camera XCLK at 20 MHz (not 16) to avoid PSRAM bus contention
+- Camera XCLK at 10 MHz to avoid PSRAM bus contention
 - RFC 2217 uses FreeRTOS StreamBuffer to decouple USB RX callback from TCP send
 - Single RFC 2217 client at a time (matches OctoPrint usage pattern)
 - OTG port may not supply 5V VBUS — user may need powered USB hub
+- `printer_backend_t` enum lives in `printer_backend.h` to break circular include between `layout.h` and `printer_comm.h`
+- Klipper SD print: uploads from local SD to Moonraker with size-based dedup, auto-deletes previous upload
+- Marlin host print uses line numbering + checksums; M110 N0 reset on finish to prevent resend loops
+- Terminal and RFC 2217 hidden from UI when Klipper backend is selected
 
 ## OctoPrint Configuration
 

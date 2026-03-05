@@ -20,6 +20,16 @@ This project replaces all of that with a **single ~$7 ESP32-S3 board** that has 
 
 The ESP32-S3's dual cores, 8MB PSRAM, and native USB OTG make it powerful enough to handle simultaneous MJPEG streaming, printer communication, and cloud connectivity — all in real time.
 
+## Screenshots
+
+| Dashboard | SD Card Printing |
+|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![SD Print](docs/screenshots/sd-print.png) |
+
+| GCode Terminal | Obico Integration |
+|---|---|
+| ![Terminal](docs/screenshots/terminal.png) | ![Obico](docs/screenshots/obico.png) |
+
 ## Web Installer
 
 Flash the firmware directly from your browser — no tools or setup required:
@@ -55,15 +65,16 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - Camera endpoints work directly with OctoPrint's webcam settings
 - Zero-config: just add the IP address
 
-### SD Card & Host Printing
+### SD Card & Printing
 - **On-board SD card** file management — upload, download, delete via web UI
-- **Host-based GCode streaming** — print files from SD through the ESP32, with full progress tracking
-- Pause, resume, and cancel with proper heater/motor shutdown
+- **Marlin**: host-based GCode streaming from SD with line numbering, checksums, and resend handling
+- **Klipper**: uploads from SD to Moonraker with size-based dedup (skips if unchanged), auto-deletes previous upload to prevent storage bloat
+- Pause, resume, and cancel work with both backends
 
-### Web Terminal
+### Web Terminal (Marlin only)
 - **Browser-based GCode terminal** — send commands and see raw printer responses
 - Auto-locked during prints to prevent interference
-- Server-side echo keeps command/response ordering correct
+- Hidden when Klipper backend is selected (use Mainsail/Fluidd instead)
 
 ### WiFi & Configuration
 - **Auto AP fallback** — if WiFi credentials are missing or connection fails, the board creates its own access point (`ESP32FDM-XXXX`) with a captive portal for setup
@@ -75,7 +86,7 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **Temperature history graph** — 1 hour of data, auto-refreshing canvas chart
 - Print progress bar with layer count, elapsed time, and ETA
 - Live camera snapshot (auto-refreshing)
-- Responsive nav: Home, Camera, SD Card, Terminal, Settings
+- Responsive nav: Home, Camera, SD Card, Terminal (Marlin only), Settings
 
 ## Hardware
 
@@ -122,7 +133,7 @@ Or skip `menuconfig` entirely — on first boot with no saved credentials, the b
 After connecting to WiFi, open `http://<esp32-ip>/settings` to configure:
 
 - **Camera** — rotation, stream/snapshot URLs
-- **Printer** — backend (Marlin/Klipper), Moonraker host:port, pause command (M25 vs M524)
+- **Printer** — backend (Marlin/Klipper), Moonraker host:port, pause command (M25 vs M524, Marlin only)
 - **Obico** — link device with 6-digit code
 - **WiFi** — reset credentials (triggers AP mode on reboot)
 
@@ -210,15 +221,16 @@ main/
   camera.c/h           — OV2640 driver, Freenove pin mapping
   httpd.c/h            — HTTP server, dashboard, settings, camera pages
   usb_serial.cpp/h     — USB Host CDC-ACM + VCP drivers
-  printer_comm.c/h     — Marlin serial protocol, state machine, host printing
-  printer_comm_klipper.c/h — Klipper/Moonraker HTTP backend
-  terminal.c/h         — Web serial terminal with ring buffer
+  printer_backend.h    — Backend enum (Marlin/Klipper), avoids circular includes
+  printer_comm.c/h     — Marlin serial protocol, state machine, host printing, temp history
+  printer_comm_klipper.c/h — Klipper/Moonraker HTTP backend, file upload + print
+  terminal.c/h         — Web serial terminal with ring buffer (Marlin only)
   sdcard.c/h           — SD card mount/unmount, file operations
-  sdcard_httpd.c/h     — SD card web UI and file management endpoints
+  sdcard_httpd.c/h     — SD card web UI, backend-aware print/pause/resume/cancel
   obico_client.c/h     — Obico WebSocket, snapshot upload, Janus signaling
-  rfc2217.c/h          — RFC 2217 Telnet COM-PORT-OPTION server
+  rfc2217.c/h          — RFC 2217 Telnet COM-PORT-OPTION server (Marlin only)
   dns_server.c         — Captive portal DNS responder
-  layout.h             — Shared HTML layout, nav bar, status bar
+  layout.h             — Shared HTML layout, nav bar (adapts to backend)
   Kconfig.projbuild    — Menuconfig options
 
 janus_proxy/           — Python sidecar for WebRTC streaming via Obico
