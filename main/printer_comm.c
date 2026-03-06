@@ -122,6 +122,7 @@ static int64_t s_host_start_us, s_host_pause_elapsed_us;
 static char s_host_filename[64];
 static char s_host_pending_line[128]; /* line read but not yet sent */
 static bool s_host_has_pending;
+static bool s_host_line_truncated;    /* true when fgets didn't reach newline (long line split) */
 static float s_park_x, s_park_y, s_park_z; /* saved position before park */
 
 /* Marlin line numbering & checksum for reliable host print transmission */
@@ -754,6 +755,7 @@ static void host_print_start_internal(const char *filename)
     s_host_start_us = esp_timer_get_time();
     s_host_pause_elapsed_us = 0;
     s_host_has_pending = false;
+    s_host_line_truncated = false;
     strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
     s_host_filename[sizeof(s_host_filename) - 1] = '\0';
 
@@ -951,10 +953,31 @@ static void printer_comm_task(void *arg)
                         break;
                     }
 
-                    /* Strip newline */
+                    /* Strip newline and detect truncated (split) long lines.
+                     * fgets fills the buffer without a newline when the line
+                     * is longer than sizeof(line)-1.  The continuations of
+                     * such lines must be skipped until we see a newline. */
                     size_t ln = strlen(line);
+                    bool has_newline = (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'));
                     while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'))
                         line[--ln] = '\0';
+
+                    if (s_host_line_truncated) {
+                        /* Still consuming a split long line — skip until newline */
+                        s_host_line_truncated = !has_newline;
+                        s_host_lines_sent++;
+                        continue;
+                    }
+                    if (!has_newline && ln > 0) {
+                        /* First chunk of a long line — skip it and mark truncated */
+                        s_host_line_truncated = true;
+                        /* Still count and check if it was a comment */
+                        if (line[0] != ';') {
+                            ESP_LOGW(TAG, "Skipping long line (%d chars): %.40s...", (int)ln, line);
+                        }
+                        s_host_lines_sent++;
+                        continue;
+                    }
 
                     /* Parse ;LAYER:N comments for layer tracking */
                     if (strncmp(line, ";LAYER:", 7) == 0) {
