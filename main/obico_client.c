@@ -558,7 +558,23 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGW(TAG, "WebSocket error");
+        if (data->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
+            if (data->error_handle.esp_tls_last_esp_err) {
+                ESP_LOGW(TAG, "WS error: TLS: %s",
+                         esp_err_to_name(data->error_handle.esp_tls_last_esp_err));
+            }
+            if (data->error_handle.esp_tls_stack_err) {
+                ESP_LOGW(TAG, "WS error: TLS stack: 0x%x",
+                         data->error_handle.esp_tls_stack_err);
+            }
+            if (data->error_handle.esp_transport_sock_errno) {
+                ESP_LOGW(TAG, "WS error: socket errno %d (%s)",
+                         data->error_handle.esp_transport_sock_errno,
+                         strerror(data->error_handle.esp_transport_sock_errno));
+            }
+        } else {
+            ESP_LOGW(TAG, "WS error type: %d", data->error_handle.error_type);
+        }
         break;
 
     default:
@@ -598,7 +614,7 @@ static void obico_ws_task(void *arg)
             .uri = ws_url,
             .crt_bundle_attach = esp_crt_bundle_attach,
             .reconnect_timeout_ms = 10000,
-            .network_timeout_ms = 10000,
+            .network_timeout_ms = 20000,
             .buffer_size = 2048,
         };
 
@@ -618,6 +634,7 @@ static void obico_ws_task(void *arg)
 
         ESP_LOGI(TAG, "WS connecting to: %s", ws_url);
 
+        int64_t t0 = esp_timer_get_time();
         esp_err_t err = esp_websocket_client_start(s_ws_client);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "WebSocket start failed: %s", esp_err_to_name(err));
@@ -627,19 +644,21 @@ static void obico_ws_task(void *arg)
             continue;
         }
 
-        /* Wait up to 10s for connection to establish */
-        for (int i = 0; i < 20; i++) {
+        /* Wait up to 20s for connection to establish (TLS handshake is slow) */
+        for (int i = 0; i < 40; i++) {
             if (esp_websocket_client_is_connected(s_ws_client)) break;
             vTaskDelay(pdMS_TO_TICKS(500));
         }
+        int elapsed_ms = (int)((esp_timer_get_time() - t0) / 1000);
         if (!esp_websocket_client_is_connected(s_ws_client)) {
-            ESP_LOGE(TAG, "WebSocket failed to connect within 10s");
+            ESP_LOGE(TAG, "WebSocket failed to connect after %d ms", elapsed_ms);
             esp_websocket_client_stop(s_ws_client);
             esp_websocket_client_destroy(s_ws_client);
             s_ws_client = NULL;
             vTaskDelay(pdMS_TO_TICKS(10000));
             continue;
         }
+        ESP_LOGI(TAG, "WebSocket connected in %d ms", elapsed_ms);
 
         /* Send status periodically while connected */
         while (s_linked && esp_websocket_client_is_connected(s_ws_client)) {

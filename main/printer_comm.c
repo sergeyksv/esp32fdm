@@ -6,6 +6,7 @@
 
 #include "esp_http_client.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -58,7 +59,7 @@ static bool s_filament_check = false;  /* Poll M119 for filament runout during h
 
 /* ---- Temperature history circular buffer ---- */
 
-static temp_sample_t s_temp_history[TEMP_HISTORY_MAX];
+static temp_sample_t *s_temp_history;  /* allocated in PSRAM */
 static int s_temp_head;   /* next write index */
 static int s_temp_count;  /* number of valid samples */
 
@@ -1356,6 +1357,11 @@ esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
 esp_err_t printer_comm_init(void)
 {
     load_config_from_nvs();
+
+    /* Temp history in PSRAM to save internal SRAM */
+    s_temp_history = heap_caps_calloc(TEMP_HISTORY_MAX, sizeof(temp_sample_t),
+                                      MALLOC_CAP_SPIRAM);
+    if (!s_temp_history) return ESP_ERR_NO_MEM;
 
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;

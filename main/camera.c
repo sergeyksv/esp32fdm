@@ -78,9 +78,9 @@ esp_err_t camera_init(void)
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size   = FRAMESIZE_SVGA, /* 800x600 */
         .jpeg_quality = 20,             /* 1-63, lower = better quality */
-        .fb_count     = 2,              /* 2 DMA buffers */
+        .fb_count     = 1,              /* single DMA buffer — capture task copies + returns fast */
         .fb_location  = CAMERA_FB_IN_PSRAM,
-        .grab_mode    = CAMERA_GRAB_LATEST,
+        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
     };
 
     esp_err_t err = esp_camera_init(&config);
@@ -106,7 +106,7 @@ esp_err_t camera_init(void)
         }
     }
 
-    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 2 DMA buffers, rotate180=%d)", s_rotate180);
+    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 1 DMA buffer, rotate180=%d)", s_rotate180);
     return ESP_OK;
 }
 

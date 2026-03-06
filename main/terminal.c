@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "printer_comm.h"
 #include "layout.h"
 
@@ -14,15 +15,16 @@ static const char *TAG = "terminal";
 
 #define TERM_RING_SIZE 4096
 
-static char s_ring[TERM_RING_SIZE];
+static char *s_ring;               /* allocated in PSRAM */
 static int  s_ring_head = 0;       /* write position in ring */
 static uint32_t s_seq = 0;         /* monotonic total bytes written */
 static SemaphoreHandle_t s_mutex;
 
 void terminal_init(void)
 {
+    s_ring = heap_caps_calloc(1, TERM_RING_SIZE, MALLOC_CAP_SPIRAM);
     s_mutex = xSemaphoreCreateMutex();
-    ESP_LOGI(TAG, "Terminal initialized (ring %d bytes)", TERM_RING_SIZE);
+    ESP_LOGI(TAG, "Terminal initialized (ring %d bytes, PSRAM)", TERM_RING_SIZE);
 }
 
 static void ring_write(const char *data, size_t len)

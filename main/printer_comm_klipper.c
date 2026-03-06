@@ -2,6 +2,7 @@
 
 #include "cJSON.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -34,8 +35,8 @@ static TaskHandle_t s_task_handle;
 /* Serialise all HTTP access (ESP32 lwIP struggles with concurrent connections) */
 static SemaphoreHandle_t s_http_mutex;
 
-/* Response buffer for HTTP reads */
-static char s_resp_buf[HTTP_BUF_SIZE];
+/* Response buffer for HTTP reads (allocated in PSRAM) */
+static char *s_resp_buf;
 
 /* ---- HTTP helpers ---- */
 
@@ -397,6 +398,9 @@ esp_err_t klipper_backend_start(const char *host, uint16_t port)
     strncpy(s_host, host, sizeof(s_host) - 1);
     s_host[sizeof(s_host) - 1] = '\0';
     s_port = port;
+
+    s_resp_buf = heap_caps_calloc(1, HTTP_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_resp_buf) return ESP_ERR_NO_MEM;
 
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
