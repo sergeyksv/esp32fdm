@@ -82,7 +82,6 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
 
     if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
         html_buf_printf(&p,
-            "<h2>Terminal</h2>"
             "<p style='padding:20px;background:#fff3e0;color:#e65100;border-radius:4px;text-align:center'>"
             "Terminal is not available with Klipper backend.<br>"
             "Use Mainsail or Fluidd for GCode terminal access.</p>");
@@ -94,7 +93,6 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
     }
 
     html_buf_printf(&p,
-        "<h2>Terminal</h2>"
         "<pre id='out' style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
         "height:400px;overflow-y:auto;font-size:13px;border-radius:4px;"
         "white-space:pre-wrap;word-wrap:break-word'></pre>"

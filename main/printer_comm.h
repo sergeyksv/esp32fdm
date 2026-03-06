@@ -57,10 +57,11 @@ typedef struct {
 #define TEMP_HISTORY_MAX 900    /* 1 hour at 4s intervals */
 
 /**
- * Record a temperature history sample from current state.
- * Must be called with s_state_mutex held (Marlin) or s_state populated (Klipper).
+ * Record a temperature history sample with explicit values.
+ * Called by both Marlin and Klipper backends after updating temps.
  */
-void printer_comm_record_temp_sample(void);
+void printer_comm_record_temp_sample(float hotend_actual, float hotend_target,
+                                     float bed_actual, float bed_target);
 
 /**
  * Copy temperature history samples oldest-first into buf.
@@ -133,10 +134,14 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
 esp_err_t printer_config_register_httpd(void *server_handle);
 
 /**
- * Render printer config section HTML into a page buffer.
- * Used by the unified settings page.
+ * Render backend selection section (Marlin/Klipper, Moonraker fields, Save & Reboot).
  */
-void printer_config_render_settings(html_buf_t *p);
+void printer_config_render_backend(html_buf_t *p);
+
+/**
+ * Render Marlin-specific settings section (pause command, Save).
+ */
+void printer_config_render_marlin(html_buf_t *p);
 
 /**
  * Start host-based GCode printing from a file on /sdcard.

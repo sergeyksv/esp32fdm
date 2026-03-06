@@ -329,7 +329,8 @@ static void parse_moonraker_status(const char *json_str)
     s_state.last_update_us = esp_timer_get_time();
 
     /* Record temperature history sample (shared circular buffer in printer_comm.c) */
-    printer_comm_record_temp_sample();
+    printer_comm_record_temp_sample(s_state.hotend_actual, s_state.hotend_target,
+                                    s_state.bed_actual, s_state.bed_target);
 
     ESP_LOGI(TAG, "=> op=%d temps=%.0f/%.0f bed=%.0f/%.0f prog=%.1f%% file='%s'",
              s_state.opstate,

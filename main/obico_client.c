@@ -806,15 +806,21 @@ static void obico_snap_task(void *arg)
 
 void obico_render_settings(html_buf_t *p)
 {
+    if (s_linked) {
+        html_buf_printf(p,
+            "<form id='f-obico' method='POST' action='/obico/unlink'></form>"
+            "<p>Status: <span style='color:#4CAF50;font-weight:bold'>Linked</span></p>");
+    } else {
+        html_buf_printf(p,
+            "<p>Status: <span style='color:#999'>Not linked</span></p>"
+            "<form id='f-obico' method='POST' action='/obico/link'>"
+            "<p>Enter the 6-digit code from <a href='https://app.obico.io' target='_blank'>Obico</a>:</p>"
+            "<input type='text' name='code' placeholder='123456' maxlength='6' pattern='[0-9]{6}' required "
+            "style='padding:8px;width:100%%;box-sizing:border-box;margin:8px 0'>"
+            "</form>");
+    }
     html_buf_printf(p,
-        "<h2>Obico</h2>"
-        "<p>Enter the 6-digit code from <a href='https://app.obico.io' target='_blank'>Obico</a>:</p>"
-        "<form method='POST' action='/obico/link'>"
-        "<input type='text' name='code' placeholder='123456' maxlength='6' pattern='[0-9]{6}' required "
-        "style='font-size:18px;padding:10px;width:100%%;box-sizing:border-box;margin:8px 0'>"
-        "<button type='submit' style='background:#4CAF50;color:white;border:none;width:100%%;padding:10px;font-size:18px;margin:8px 0'>Link</button>"
-        "</form>"
-        "<p style='font-size:13px'><a href='/obico/status'>Obico Status</a> | "
+        "<p class='hint'><a href='/obico/status'>Status</a> | "
         "<a href='/obico/simulate'>Simulate</a></p>");
 }
 
@@ -874,6 +880,15 @@ static esp_err_t obico_link_post_handler(httpd_req_t *req)
     esp_err_t ret = httpd_resp_send(req, hb.data, hb.len);
     html_buf_free(&hb);
     return ret;
+}
+
+static esp_err_t obico_unlink_handler(httpd_req_t *req)
+{
+    obico_unlink();
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t obico_status_handler(httpd_req_t *req)
@@ -941,6 +956,13 @@ esp_err_t obico_register_httpd(void *server_handle)
         .handler  = obico_link_post_handler,
     };
     httpd_register_uri_handler(server, &link_post);
+
+    httpd_uri_t unlink_post = {
+        .uri      = "/obico/unlink",
+        .method   = HTTP_POST,
+        .handler  = obico_unlink_handler,
+    };
+    httpd_register_uri_handler(server, &unlink_post);
 
     httpd_uri_t status_uri = {
         .uri      = "/obico/status",

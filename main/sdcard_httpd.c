@@ -46,13 +46,6 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
 
     layout_html_begin(&p, "SD Card", "/sd");
     html_buf_printf(&p,
-        "<h2>SD Card</h2>"
-        "<div id='status' style='padding:8px;margin:8px 0;background:#eef;border-radius:4px;display:none'></div>"
-        "<div id='controls' style='display:none'>"
-        "<button class='ctrl' style='background:#48f;color:#fff;border:none;padding:8px 20px;font-size:15px;margin:4px' onclick='doCtrl(\"pause\")'>Pause</button>"
-        "<button class='ctrl' style='background:#48f;color:#fff;border:none;padding:8px 20px;font-size:15px;margin:4px' onclick='doCtrl(\"resume\")'>Resume</button>"
-        "<button class='ctrl' style='background:#f44;color:#fff;border:none;padding:8px 20px;font-size:15px;margin:4px' onclick='doCtrl(\"cancel\")'>Cancel</button>"
-        "</div>"
         "<h3>Upload</h3>"
         "<input type='file' id='file' accept='.gcode,.g,.gc'>"
         "<button onclick='upload()'>Upload</button>"
@@ -80,18 +73,7 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "x.onload=function(){document.getElementById('upload-prog').style.display='none';"
         "document.getElementById('upload-status').textContent=x.status==200?'Done':'Error: '+x.responseText;load();};"
         "x.open('POST','/sd/upload');x.setRequestHeader('X-Filename',f.name);x.send(f);}"
-        "function doCtrl(act){fetch('/sd/'+act,{method:'POST'}).then(function(){pollStatus()});}"
-        "function pollStatus(){"
-        "fetch('/sd/status').then(function(r){return r.json()}).then(function(s){"
-        "var el=document.getElementById('status');"
-        "var ctrl=document.getElementById('controls');"
-        "if(s.printing){"
-        "el.style.display='block';ctrl.style.display='block';"
-        "el.innerHTML='<b>'+(s.paused?'PAUSED':'PRINTING')+':</b> '+s.filename"
-        "+'<br>Progress: '+s.progress.toFixed(1)+'%% | Layer: '+s.layer"
-        "+'<br>Elapsed: '+Math.floor(s.elapsed/60)+'m'+s.elapsed%%60+'s';"
-        "}else{el.style.display='none';ctrl.style.display='none';}});}"
-        "load();pollStatus();setInterval(pollStatus,3000);"
+        "load();"
         "</script>");
     layout_html_end(&p);
 

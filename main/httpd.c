@@ -297,7 +297,6 @@ static esp_err_t root_handler(httpd_req_t *req)
     layout_html_begin(&p, "ESP32 FDM Dashboard", "/");
 
     html_buf_printf(&p,
-        "<h2>Dashboard</h2>"
         "<div style='text-align:center;margin:12px 0'>"
         "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
         "</div>"
@@ -401,44 +400,77 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static esp_err_t settings_get_handler(httpd_req_t *req)
 {
-    bool rot = camera_get_rotate180();
     html_buf_t p;
     html_buf_init(&p);
 
     layout_html_begin(&p, "Settings", "/settings");
 
     const char *ip = wifi_get_ip_str();
+    bool is_marlin = (printer_comm_get_backend() == PRINTER_BACKEND_MARLIN);
 
-    /* Camera section */
+    /* 1. Printer (backend selection) */
     html_buf_printf(&p,
-        "<h2>Camera</h2>"
-        "<form method='POST' action='/camera/config'>"
-        "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label> "
-        "<button type='submit'>Save</button></form>"
-        "<p style='font-size:13px;color:#666;margin:8px 0'>"
-        "MJPEG Stream: <a href='/stream'>http://%s/stream</a><br>"
-        "Snapshot: <a href='/capture'>http://%s/capture</a></p>",
-        rot ? " checked" : "", ip, ip);
+        "<div class='sh' style='margin-top:16px'><h2>Printer</h2>"
+        "<button type='submit' form='f-printer'>Save &amp; Reboot</button></div>");
+    printer_config_render_backend(&p);
 
-    /* Printer & Obico sections */
-    printer_config_render_settings(&p);
-    obico_render_settings(&p);
-
-    /* RFC 2217 section — only relevant for Marlin (USB serial bridge) */
-    if (printer_comm_get_backend() == PRINTER_BACKEND_MARLIN) {
+    /* 2. Marlin (conditionally visible) */
+    if (is_marlin) {
         html_buf_printf(&p,
-            "<h2>RFC 2217</h2>"
-            "<p style='font-size:13px;color:#666'>"
-            "Serial bridge: <code>rfc2217://%s:%d</code></p>",
-            ip, CONFIG_RFC2217_PORT);
+            "<hr><div class='sh'><h2>Marlin</h2>"
+            "<button type='submit' form='f-marlin'>Save</button></div>");
+        printer_config_render_marlin(&p);
     }
 
-    /* WiFi section */
+    /* 3. Camera */
+    bool rot = camera_get_rotate180();
     html_buf_printf(&p,
-        "<h2>WiFi</h2>"
-        "<form method='POST' action='/wifi/reset'>"
-        "<button type='submit' onclick=\"return confirm('Reset WiFi credentials and reboot?')\" "
-        "style='background:#f44336;color:#fff;border:none'>Reset WiFi</button></form>");
+        "<hr><div class='sh'><h2>Camera</h2>"
+        "<button type='submit' form='f-camera'>Save</button></div>"
+        "<form id='f-camera' method='POST' action='/camera/config'>"
+        "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label>"
+        "</form>",
+        rot ? " checked" : "");
+
+    /* 4. Obico */
+    if (obico_is_linked()) {
+        html_buf_printf(&p,
+            "<hr><div class='sh'><h2>Obico</h2>"
+            "<button type='submit' form='f-obico' class='btn-red' "
+            "onclick=\"return confirm('Unlink from Obico?')\">Unlink</button></div>");
+    } else {
+        html_buf_printf(&p,
+            "<hr><div class='sh'><h2>Obico</h2>"
+            "<button type='submit' form='f-obico' class='btn-green'>Link</button></div>");
+    }
+    obico_render_settings(&p);
+
+    /* 5. External Endpoints (read-only) */
+    html_buf_printf(&p,
+        "<hr><h2>External Endpoints</h2>"
+        "<p class='hint'>"
+        "MJPEG Stream: <a href='/stream'>http://%s/stream</a><br>"
+        "Snapshot: <a href='/capture'>http://%s/capture</a>",
+        ip, ip);
+    if (is_marlin) {
+        html_buf_printf(&p,
+            "<br>RFC 2217: <code>rfc2217://%s:%d</code>",
+            ip, CONFIG_RFC2217_PORT);
+    }
+    html_buf_printf(&p, "</p>");
+
+    /* 6. WiFi */
+    char ssid[33] = {0};
+    html_buf_printf(&p,
+        "<hr><div class='sh'><h2>WiFi</h2>"
+        "<form id='f-wifi' method='POST' action='/wifi/reset'>"
+        "<button type='submit' class='btn-red' "
+        "onclick=\"return confirm('Reset WiFi credentials and reboot?')\">Reset WiFi</button>"
+        "</form></div>");
+    if (wifi_get_ssid(ssid, sizeof(ssid))) {
+        html_buf_printf(&p,
+            "<p>Connected to: <b>%s</b></p>", ssid);
+    }
 
     layout_html_end(&p);
 
@@ -457,7 +489,6 @@ static esp_err_t camera_page_handler(httpd_req_t *req)
 
     layout_html_begin(&p, "Camera", "/camera");
     html_buf_printf(&p,
-        "<h2>Camera</h2>"
         "<div style='text-align:center'>"
         "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='MJPEG Stream'>"
         "</div>");
@@ -655,7 +686,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 32;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;

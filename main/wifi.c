@@ -180,6 +180,18 @@ const char *wifi_get_ip_str(void)
     return s_ip_str;
 }
 
+bool wifi_get_ssid(char *buf, size_t buf_size)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
+        return false;
+
+    size_t len = buf_size;
+    bool ok = (nvs_get_str(nvs, NVS_KEY_SSID, buf, &len) == ESP_OK && buf[0] != '\0');
+    nvs_close(nvs);
+    return ok;
+}
+
 void wifi_reset_credentials(void)
 {
     nvs_handle_t nvs;

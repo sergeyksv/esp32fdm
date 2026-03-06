@@ -179,14 +179,15 @@ static bool parse_temp_pair(const char *line, char key,
     return true;
 }
 
-void printer_comm_record_temp_sample(void)
+void printer_comm_record_temp_sample(float hotend_actual, float hotend_target,
+                                     float bed_actual, float bed_target)
 {
     temp_sample_t *sample = &s_temp_history[s_temp_head];
-    sample->timestamp_us = s_state.last_update_us;
-    sample->hotend_actual = s_state.hotend_actual;
-    sample->hotend_target = s_state.hotend_target;
-    sample->bed_actual = s_state.bed_actual;
-    sample->bed_target = s_state.bed_target;
+    sample->timestamp_us = esp_timer_get_time();
+    sample->hotend_actual = hotend_actual;
+    sample->hotend_target = hotend_target;
+    sample->bed_actual = bed_actual;
+    sample->bed_target = bed_target;
     s_temp_head = (s_temp_head + 1) % TEMP_HISTORY_MAX;
     if (s_temp_count < TEMP_HISTORY_MAX) s_temp_count++;
 }
@@ -209,7 +210,8 @@ static void parse_m105(const char *line)
 
     s_state.last_update_us = esp_timer_get_time();
 
-    printer_comm_record_temp_sample();
+    printer_comm_record_temp_sample(s_state.hotend_actual, s_state.hotend_target,
+                                    s_state.bed_actual, s_state.bed_target);
 
     /* Update opstate from temps if not already printing */
     if (s_state.opstate == PRINTER_DISCONNECTED) {
@@ -1287,14 +1289,15 @@ esp_err_t printer_comm_init(void)
 {
     load_config_from_nvs();
 
+    s_state_mutex = xSemaphoreCreateMutex();
+    if (!s_state_mutex) return ESP_ERR_NO_MEM;
+
     if (s_backend == PRINTER_BACKEND_KLIPPER) {
         ESP_LOGI(TAG, "Starting Klipper/Moonraker backend → %s:%u", s_mr_host, s_mr_port);
         return klipper_backend_start(s_mr_host, s_mr_port);
     }
 
     /* Marlin backend */
-    s_state_mutex = xSemaphoreCreateMutex();
-    if (!s_state_mutex) return ESP_ERR_NO_MEM;
 
     s_rx_stream = xStreamBufferCreate(2048, 1);
     if (!s_rx_stream) return ESP_ERR_NO_MEM;
@@ -1411,16 +1414,13 @@ esp_err_t printer_comm_save_config(printer_backend_t backend,
 
 /* ---- Web UI HTTP handlers ---- */
 
-static void render_printer_config_form(html_buf_t *p)
+void printer_config_render_backend(html_buf_t *p)
 {
     const char *checked_marlin  = (s_backend == PRINTER_BACKEND_MARLIN)  ? "checked" : "";
     const char *checked_klipper = (s_backend == PRINTER_BACKEND_KLIPPER) ? "checked" : "";
-    const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
-    const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
 
     html_buf_printf(p,
-        "<h2>Printer</h2>"
-        "<form method='POST' action='/printer/config'>"
+        "<form id='f-printer' method='POST' action='/printer/config'>"
         "<div style='margin:10px 0'>"
         "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='marlin' %s> Marlin (USB serial)</label>"
         "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='klipper' %s> Klipper (Moonraker HTTP)</label>"
@@ -1428,29 +1428,26 @@ static void render_printer_config_form(html_buf_t *p)
         "<div style='margin-left:20px'>"
         "<label style='display:block;margin:8px 0 4px'>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
         "<label style='display:block;margin:8px 0 4px'>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
-        "</div>",
+        "</div>"
+        "<p class='hint'><a href='/printer/config/test'>Test Moonraker connection</a></p>"
+        "</form>",
         checked_marlin, checked_klipper, s_mr_host, s_mr_port);
-
-    /* Pause command section — Marlin only */
-    if (s_backend == PRINTER_BACKEND_MARLIN) {
-        html_buf_printf(p,
-            "<h3>Pause Command</h3>"
-            "<div style='margin:10px 0'>"
-            "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 — Pause SD print (can resume)</label>"
-            "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 — Abort print (if M25 crashes firmware)</label>"
-            "</div>",
-            checked_m25, checked_m524);
-    }
-
-    html_buf_printf(p,
-        "<button type='submit' style='margin-top:8px'>Save &amp; Reboot</button>"
-        "</form>"
-        "<p style='font-size:13px'><a href='/printer/config/test'>Test Moonraker connection</a></p>");
 }
 
-void printer_config_render_settings(html_buf_t *p)
+void printer_config_render_marlin(html_buf_t *p)
 {
-    render_printer_config_form(p);
+    const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
+    const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
+
+    html_buf_printf(p,
+        "<form id='f-marlin' method='POST' action='/printer/config/marlin'>"
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><b>Pause Command</b></label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 &mdash; Pause SD print (can resume)</label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 &mdash; Abort print (if M25 crashes firmware)</label>"
+        "</div>"
+        "</form>",
+        checked_m25, checked_m524);
 }
 
 static esp_err_t printer_config_get_handler(httpd_req_t *req)
@@ -1498,7 +1495,7 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
         if (mr_port == 0) mr_port = 7125;
     }
 
-    bool pause_abort = (strstr(body, "pause_cmd=m524") != NULL);
+    bool pause_abort = (s_pause_cmd == PAUSE_CMD_M524);  /* preserve current */
 
     esp_err_t err = printer_comm_save_config(backend, mr_host, mr_port, pause_abort);
     if (err != ESP_OK) {
@@ -1524,6 +1521,33 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
     esp_restart();
 
     return ESP_OK;
+}
+
+static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
+{
+    char body[64];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    pause_cmd_t new_cmd = (strstr(body, "pause_cmd=m524") != NULL)
+                           ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
+    s_pause_cmd = new_cmd;
+
+    /* Persist to NVS */
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)new_cmd);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t printer_config_test_handler(httpd_req_t *req)
@@ -1580,6 +1604,13 @@ esp_err_t printer_config_register_httpd(void *server_handle)
         .handler = printer_config_post_handler,
     };
     httpd_register_uri_handler(server, &post_cfg);
+
+    httpd_uri_t marlin_cfg = {
+        .uri     = "/printer/config/marlin",
+        .method  = HTTP_POST,
+        .handler = printer_config_marlin_post_handler,
+    };
+    httpd_register_uri_handler(server, &marlin_cfg);
 
     httpd_uri_t test_cfg = {
         .uri     = "/printer/config/test",

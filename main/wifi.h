@@ -1,6 +1,8 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
+#include <stddef.h>
 
 typedef enum {
     WIFI_RESULT_STA_CONNECTED,
@@ -17,6 +19,12 @@ wifi_result_t wifi_init(void);
  * Returns pointer to a static buffer — valid until next call.
  */
 const char *wifi_get_ip_str(void);
+
+/**
+ * Get the stored WiFi SSID from NVS.
+ * Copies into buf (up to buf_size-1 chars + NUL). Returns true if found.
+ */
+bool wifi_get_ssid(char *buf, size_t buf_size);
 
 /**
  * Erase stored WiFi credentials from NVS and reboot.
