@@ -31,6 +31,7 @@ static const char *TAG = "printer_comm";
 #define POLL_M105_HOSTPRINT_INTERVAL_MS 30000   /* Reduced frequency during host print */
 #define POLL_M27_INTERVAL_MS            10000
 #define POLL_M114_INTERVAL_MS           30000
+#define POLL_M119_INTERVAL_MS           30000   /* Filament sensor check during host print */
 #define CMD_RESPONSE_TIMEOUT_MS         6000
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
@@ -40,6 +41,7 @@ static const char *TAG = "printer_comm";
 #define NVS_KEY_MR_HOST         "mr_host"
 #define NVS_KEY_MR_PORT         "mr_port"
 #define NVS_KEY_PAUSE_CMD       "pause_cmd"
+#define NVS_KEY_FILAMENT_CHK    "fil_chk"
 
 /* ---- Backend config ---- */
 
@@ -52,6 +54,7 @@ static printer_backend_t s_backend = PRINTER_BACKEND_MARLIN;
 static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
 static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
+static bool s_filament_check = false;  /* Poll M119 for filament runout during host print */
 
 /* ---- Temperature history circular buffer ---- */
 
@@ -84,6 +87,7 @@ typedef enum {
     QUERY_M27,
     QUERY_M27C,
     QUERY_M114,
+    QUERY_M119,
     QUERY_CMD,
 } query_type_t;
 
@@ -93,6 +97,8 @@ static query_type_t s_pending_query;
 static int64_t s_last_m105_us;
 static int64_t s_last_m27_us;
 static int64_t s_last_m114_us;
+static int64_t s_last_m119_us;
+static bool s_filament_sensor_present;  /* true once M119 reports a filament: line */
 
 /* Print start time tracking */
 static int64_t s_print_start_us;
@@ -311,6 +317,28 @@ static void parse_m114(const char *line)
     xSemaphoreGive(s_state_mutex);
 }
 
+/** Parse M119 response line for filament sensor.
+ *  Marlin reports: "filament: TRIGGERED" (filament present) or "filament: open" (runout).
+ *  Only acts during host printing — triggers auto-pause on runout. */
+static void parse_m119(const char *line)
+{
+    const char *p = strstr(line, "filament:");
+    if (!p) return;
+
+    s_filament_sensor_present = true;
+    const char *val = p + 9;
+    while (*val == ' ') val++;
+
+    if (strncasecmp(val, "open", 4) == 0) {
+        /* Filament runout detected */
+        if (s_host_printing && !s_host_paused) {
+            ESP_LOGW(TAG, "Filament runout detected via M119 — pausing host print");
+            printer_cmd_t cmd = { .type = PCMD_PAUSE };
+            xQueueSend(s_cmd_queue, &cmd, 0);
+        }
+    }
+}
+
 /** Process one complete line from the printer */
 static void process_line(const char *line)
 {
@@ -328,6 +356,8 @@ static void process_line(const char *line)
         parse_m27c(line);
     } else if (strstr(line, "X:") && strstr(line, "Y:") && strstr(line, "Z:")) {
         parse_m114(line);
+    } else if (strstr(line, "filament:")) {
+        parse_m119(line);
     }
 
     /* Detect unsupported commands: echo:Unknown command: "M73 P15 R21" */
@@ -1057,13 +1087,22 @@ static void printer_comm_task(void *arg)
         CHECK_COOLDOWN();
 
         /* During active host printing, only poll M105 at reduced frequency
-         * (for Obico temp display). Skip M27/M114 entirely — position is
-         * tracked from the GCode stream. */
+         * (for Obico temp display). Also poll M119 for filament sensor.
+         * Skip M27/M114 entirely — position is tracked from the GCode stream. */
         if (s_host_printing && !s_host_paused) {
             now = esp_timer_get_time();
             if (now - s_last_m105_us >= POLL_M105_HOSTPRINT_INTERVAL_MS * 1000LL) {
                 send_query("M105", QUERY_M105);
                 s_last_m105_us = esp_timer_get_time();
+                CHECK_COOLDOWN();
+            }
+            /* Poll M119 for filament runout detection (if enabled) */
+            if (s_filament_check) {
+                now = esp_timer_get_time();
+                if (now - s_last_m119_us >= POLL_M119_INTERVAL_MS * 1000LL) {
+                    send_query("M119", QUERY_M119);
+                    s_last_m119_us = esp_timer_get_time();
+                }
             }
             goto poll_done;
         }
@@ -1134,6 +1173,11 @@ static void load_config_from_nvs(void)
         s_pause_cmd = (pause_val == 1) ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
     }
 
+    uint8_t fil_chk = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_FILAMENT_CHK, &fil_chk) == ESP_OK) {
+        s_filament_check = (fil_chk == 1);
+    }
+
     nvs_close(nvs);
 
     /* Fall back to Marlin if Klipper selected but no host configured */
@@ -1142,10 +1186,11 @@ static void load_config_from_nvs(void)
         s_backend = PRINTER_BACKEND_MARLIN;
     }
 
-    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u, pause=%s",
+    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u, pause=%s, filament_check=%s",
              s_backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
              s_mr_host, s_mr_port,
-             s_pause_cmd == PAUSE_CMD_M524 ? "M524 (abort)" : "M25 (pause)");
+             s_pause_cmd == PAUSE_CMD_M524 ? "M524 (abort)" : "M25 (pause)",
+             s_filament_check ? "on" : "off");
 }
 
 /* ---- Public API ---- */
@@ -1438,6 +1483,7 @@ void printer_config_render_marlin(html_buf_t *p)
 {
     const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
     const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
+    const char *checked_fil  = s_filament_check ? "checked" : "";
 
     html_buf_printf(p,
         "<form id='f-marlin' method='POST' action='/printer/config/marlin'>"
@@ -1446,8 +1492,12 @@ void printer_config_render_marlin(html_buf_t *p)
         "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 &mdash; Pause SD print (can resume)</label>"
         "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 &mdash; Abort print (if M25 crashes firmware)</label>"
         "</div>"
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><b>Filament Sensor</b></label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='checkbox' name='filament_chk' value='1' %s> Poll filament sensor (M119) during host print &mdash; auto-pause on runout</label>"
+        "</div>"
         "</form>",
-        checked_m25, checked_m524);
+        checked_m25, checked_m524, checked_fil);
 }
 
 static esp_err_t printer_config_get_handler(httpd_req_t *req)
@@ -1525,7 +1575,7 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
 
 static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
 {
-    char body[64];
+    char body[128];
     int len = httpd_req_recv(req, body, sizeof(body) - 1);
     if (len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
@@ -1537,10 +1587,14 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
                            ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
     s_pause_cmd = new_cmd;
 
+    bool new_fil_chk = (strstr(body, "filament_chk=1") != NULL);
+    s_filament_check = new_fil_chk;
+
     /* Persist to NVS */
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)new_cmd);
+        nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, new_fil_chk ? 1 : 0);
         nvs_commit(nvs);
         nvs_close(nvs);
     }
