@@ -34,8 +34,8 @@ static const char *STREAM_BOUNDARY = "esp32fdm_frame";
 
 static esp_err_t capture_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = camera_capture_frame();
-    if (!fb) {
+    camera_frame_t *frame = camera_get_frame();
+    if (!frame) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -45,8 +45,8 @@ static esp_err_t capture_handler(httpd_req_t *req)
                        "inline; filename=capture.jpg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    esp_camera_fb_return(fb);
+    esp_err_t res = httpd_resp_send(req, (const char *)frame->buf, frame->len);
+    camera_release_frame(frame);
     return res;
 }
 
@@ -71,10 +71,10 @@ static void stream_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS((STREAM_FRAME_INTERVAL_US - elapsed) / 1000));
         }
 
-        camera_fb_t *fb = camera_capture_frame();
+        camera_frame_t *frame = camera_get_frame();
         last_frame_time = esp_timer_get_time();
-        if (!fb) {
-            ESP_LOGW(TAG, "Stream: frame capture failed, retrying...");
+        if (!frame) {
+            ESP_LOGW(TAG, "Stream: no frame available, retrying...");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -84,16 +84,16 @@ static void stream_task(void *arg)
                                "Content-Type: image/jpeg\r\n"
                                "Content-Length: %u\r\n"
                                "\r\n",
-                               STREAM_BOUNDARY, (unsigned)fb->len);
+                               STREAM_BOUNDARY, (unsigned)frame->len);
 
         /* Send part header + JPEG + trailing CRLF via raw socket */
         if (send(fd, part_header, hdr_len, 0) <= 0 ||
-            send(fd, (const char *)fb->buf, fb->len, 0) <= 0 ||
+            send(fd, (const char *)frame->buf, frame->len, 0) <= 0 ||
             send(fd, "\r\n", 2, 0) <= 0) {
-            esp_camera_fb_return(fb);
+            camera_release_frame(frame);
             break;
         }
-        esp_camera_fb_return(fb);
+        camera_release_frame(frame);
     }
 
     ESP_LOGI(TAG, "Stream client disconnected");

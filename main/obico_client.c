@@ -669,7 +669,7 @@ static void obico_ws_task(void *arg)
 
 /* ---- Snapshot upload task ---- */
 
-static esp_err_t upload_snapshot(camera_fb_t *fb)
+static esp_err_t upload_snapshot(const uint8_t *jpeg_buf, size_t jpeg_len)
 {
     char url[256];
     snprintf(url, sizeof(url), "%s/api/v1/octo/pic/",
@@ -705,7 +705,7 @@ static esp_err_t upload_snapshot(camera_fb_t *fb)
     int ftr_len = snprintf(part_footer, sizeof(part_footer),
         "\r\n--%s--\r\n", boundary);
 
-    int total_len = hdr_len + fb->len + ftr_len;
+    int total_len = hdr_len + jpeg_len + ftr_len;
 
     /* Content-Type header with boundary */
     char content_type[80];
@@ -736,7 +736,7 @@ static esp_err_t upload_snapshot(camera_fb_t *fb)
 
     /* Write multipart body */
     esp_http_client_write(client, part_header, hdr_len);
-    esp_http_client_write(client, (const char *)fb->buf, fb->len);
+    esp_http_client_write(client, (const char *)jpeg_buf, jpeg_len);
     esp_http_client_write(client, part_footer, ftr_len);
 
     /* Read response */
@@ -749,7 +749,7 @@ static esp_err_t upload_snapshot(camera_fb_t *fb)
 
     if (status >= 200 && status < 300) {
         ESP_LOGI(TAG, "Snapshot uploaded (%u bytes, HTTP %d)",
-                 (unsigned)fb->len, status);
+                 (unsigned)jpeg_len, status);
         return ESP_OK;
     } else {
         ESP_LOGW(TAG, "Snapshot upload failed: HTTP %d", status);
@@ -783,10 +783,10 @@ static void obico_snap_task(void *arg)
         }
 
         /* Capture and upload */
-        camera_fb_t *fb = camera_capture_frame();
-        if (fb) {
-            upload_snapshot(fb);
-            esp_camera_fb_return(fb);
+        camera_frame_t *frame = camera_get_frame();
+        if (frame) {
+            upload_snapshot(frame->buf, frame->len);
+            camera_release_frame(frame);
         } else {
             ESP_LOGW(TAG, "Snapshot capture failed");
         }

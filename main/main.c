@@ -42,6 +42,7 @@ void app_main(void)
 
     /* Camera */
     ESP_ERROR_CHECK(camera_init());
+    camera_start_capture_task();
 
     /* SD card — optional, non-fatal if no card inserted */
     sdcard_init();
