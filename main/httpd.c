@@ -40,24 +40,43 @@ static bool  s_baby_z_seeded = false;  /* true once we got a real value from the
 
 static const char *STREAM_BOUNDARY = "esp32fdm_frame";
 
-/* ---- /capture handler ---- */
+/* ---- /capture handler (async) ---- */
+
+static void capture_task(void *arg)
+{
+    httpd_req_t *req = (httpd_req_t *)arg;
+
+    camera_frame_t *frame = camera_get_frame();
+    if (!frame) {
+        httpd_resp_send_500(req);
+    } else {
+        httpd_resp_set_type(req, "image/jpeg");
+        httpd_resp_set_hdr(req, "Content-Disposition",
+                           "inline; filename=capture.jpg");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, (const char *)frame->buf, frame->len);
+        camera_release_frame(frame);
+    }
+
+    httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
 
 static esp_err_t capture_handler(httpd_req_t *req)
 {
-    camera_frame_t *frame = camera_get_frame();
-    if (!frame) {
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition",
-                       "inline; filename=capture.jpg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (xTaskCreatePinnedToCore(capture_task, "capture", 4096, async_req,
+                                 5, NULL, 0) != pdPASS) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
 
-    esp_err_t res = httpd_resp_send(req, (const char *)frame->buf, frame->len);
-    camera_release_frame(frame);
-    return res;
+    return ESP_OK;
 }
 
 /* ---- /stream handler (MJPEG multipart) ---- */
@@ -865,6 +884,7 @@ esp_err_t httpd_start_server(void)
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
     config.max_uri_handlers = 32;
+    config.max_open_sockets = 10;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;

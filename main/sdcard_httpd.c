@@ -6,6 +6,8 @@
 
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <dirent.h>
 #include <stdio.h>
@@ -123,40 +125,25 @@ static esp_err_t sd_files_handler(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
-/* ---- POST /sd/upload — stream file to SD ---- */
+/* ---- POST /sd/upload — stream file to SD (async) ---- */
 
-static esp_err_t sd_upload_handler(httpd_req_t *req)
-{
-    if (!sdcard_is_mounted()) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not mounted");
-        return ESP_FAIL;
-    }
-
-    /* Get filename from header */
+typedef struct {
+    httpd_req_t *req;
     char filename[64];
-    if (httpd_req_get_hdr_value_str(req, "X-Filename", filename, sizeof(filename)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing X-Filename header");
-        return ESP_FAIL;
-    }
+} sd_upload_ctx_t;
 
-    /* Sanitize: strip path separators */
-    char *slash = strrchr(filename, '/');
-    if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
-    slash = strrchr(filename, '\\');
-    if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
-
-    if (filename[0] == '\0' || filename[0] == '.') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
-        return ESP_FAIL;
-    }
+static void sd_upload_task(void *arg)
+{
+    sd_upload_ctx_t *ctx = (sd_upload_ctx_t *)arg;
+    httpd_req_t *req = ctx->req;
 
     char path[300];
-    snprintf(path, sizeof(path), MOUNT_POINT "/%s", filename);
+    snprintf(path, sizeof(path), MOUNT_POINT "/%s", ctx->filename);
 
     FILE *f = fopen(path, "w");
     if (!f) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
-        return ESP_FAIL;
+        goto done;
     }
 
     char *buf = malloc(UPLOAD_BUF_SIZE);
@@ -164,7 +151,7 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
         fclose(f);
         unlink(path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
+        goto done;
     }
 
     int remaining = req->content_len;
@@ -193,11 +180,64 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
     if (ret != ESP_OK) {
         unlink(path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
+    } else {
+        ESP_LOGI(TAG, "Uploaded %s (%d bytes)", ctx->filename, total);
+        httpd_resp_send(req, "OK", 2);
+    }
+
+done:
+    httpd_req_async_handler_complete(req);
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t sd_upload_handler(httpd_req_t *req)
+{
+    if (!sdcard_is_mounted()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not mounted");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Uploaded %s (%d bytes)", filename, total);
-    return httpd_resp_send(req, "OK", 2);
+    /* Get filename from header (must read before async clone) */
+    char filename[64];
+    if (httpd_req_get_hdr_value_str(req, "X-Filename", filename, sizeof(filename)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing X-Filename header");
+        return ESP_FAIL;
+    }
+
+    /* Sanitize: strip path separators */
+    char *slash = strrchr(filename, '/');
+    if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
+    slash = strrchr(filename, '\\');
+    if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
+
+    if (filename[0] == '\0' || filename[0] == '.') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
+        return ESP_FAIL;
+    }
+
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
+        return ESP_FAIL;
+    }
+
+    sd_upload_ctx_t *ctx = malloc(sizeof(sd_upload_ctx_t));
+    if (!ctx) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
+    ctx->req = async_req;
+    strlcpy(ctx->filename, filename, sizeof(ctx->filename));
+
+    if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 4096, ctx,
+                                 5, NULL, 0) != pdPASS) {
+        httpd_req_async_handler_complete(async_req);
+        free(ctx);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 /* ---- POST /sd/delete ---- */
@@ -238,7 +278,37 @@ static esp_err_t sd_delete_handler(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
-/* ---- POST /sd/print ---- */
+/* ---- POST /sd/print (async) ---- */
+
+typedef struct {
+    httpd_req_t *req;
+    char filename[64];
+} sd_print_ctx_t;
+
+static void sd_print_task(void *arg)
+{
+    sd_print_ctx_t *ctx = (sd_print_ctx_t *)arg;
+    httpd_req_t *req = ctx->req;
+
+    esp_err_t err;
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        err = klipper_backend_print_file(ctx->filename);
+    } else {
+        err = printer_comm_host_print_start(ctx->filename);
+    }
+
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start print");
+    } else {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/sd");
+        httpd_resp_send(req, NULL, 0);
+    }
+
+    httpd_req_async_handler_complete(req);
+    free(ctx);
+    vTaskDelete(NULL);
+}
 
 static esp_err_t sd_print_handler(httpd_req_t *req)
 {
@@ -260,21 +330,28 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     if (amp) *amp = '\0';
     url_decode_inplace(fn);
 
-    esp_err_t err;
-    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
-        err = klipper_backend_print_file(fn);
-    } else {
-        err = printer_comm_host_print_start(fn);
-    }
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start print");
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
         return ESP_FAIL;
     }
 
-    /* Redirect back to /sd */
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/sd");
-    return httpd_resp_send(req, NULL, 0);
+    sd_print_ctx_t *ctx = malloc(sizeof(sd_print_ctx_t));
+    if (!ctx) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
+    ctx->req = async_req;
+    strlcpy(ctx->filename, fn, sizeof(ctx->filename));
+
+    if (xTaskCreatePinnedToCore(sd_print_task, "sd_print", 4096, ctx,
+                                 5, NULL, 0) != pdPASS) {
+        httpd_req_async_handler_complete(async_req);
+        free(ctx);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 /* ---- POST /sd/pause, /sd/resume, /sd/cancel ---- */

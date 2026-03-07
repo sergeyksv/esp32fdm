@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "layout.h"
@@ -103,23 +104,21 @@ static bool is_heap_line(const char *line, int len)
     return memmem(line, len, "HEAP [", 6) != NULL;
 }
 
-/* ---- HTTP handler ---- */
+/* ---- HTTP handler (async) ---- */
 
 typedef enum { FILTER_ALL, FILTER_PRINTER, FILTER_SYSTEM, FILTER_HEAP } log_filter_t;
 
-static esp_err_t logs_handler(httpd_req_t *req)
+typedef struct {
+    httpd_req_t *req;
+    log_filter_t filter;
+} logs_ctx_t;
+
+static void logs_task(void *arg)
 {
-    /* Parse filter from query string */
-    log_filter_t filter = FILTER_ALL;
-    char qbuf[32] = {0};
-    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
-        char val[16];
-        if (httpd_query_key_value(qbuf, "filter", val, sizeof(val)) == ESP_OK) {
-            if (strcmp(val, "printer") == 0) filter = FILTER_PRINTER;
-            else if (strcmp(val, "system") == 0) filter = FILTER_SYSTEM;
-            else if (strcmp(val, "heap") == 0) filter = FILTER_HEAP;
-        }
-    }
+    logs_ctx_t *ctx = (logs_ctx_t *)arg;
+    httpd_req_t *req = ctx->req;
+    log_filter_t filter = ctx->filter;
+    bool send_ok = true;  /* track client disconnect */
 
     /* Snapshot the ring buffer to avoid holding mutex during HTTP send */
     char *snap = heap_caps_malloc(LOGBUF_SIZE, MALLOC_CAP_SPIRAM);
@@ -174,13 +173,14 @@ static esp_err_t logs_handler(httpd_req_t *req)
         "max-height:70vh;overflow-y:auto' id='log'>");
 
     /* Send header */
-    httpd_resp_send_chunk(req, page.data, page.len);
+    if (httpd_resp_send_chunk(req, page.data, page.len) != ESP_OK)
+        send_ok = false;
     html_buf_free(&page);
 
     /* Stream log lines from snapshot */
-    if (snap && snap_len > 0) {
+    if (send_ok && snap && snap_len > 0) {
         int pos = 0;
-        while (pos < snap_len) {
+        while (pos < snap_len && send_ok) {
             /* Find end of line */
             int line_start = pos;
             while (pos < snap_len && snap[pos] != '\n') pos++;
@@ -201,51 +201,102 @@ static esp_err_t logs_handler(httpd_req_t *req)
             /* Send in small chunks, escaping as needed */
             char chunk[1024];
             int ci = 0;
-            for (int i = line_start; i < line_start + line_len; i++) {
+            for (int i = line_start; i < line_start + line_len && send_ok; i++) {
                 char c = snap[i];
                 if (c == '<') {
                     if (ci + 4 > (int)sizeof(chunk)) {
-                        httpd_resp_send_chunk(req, chunk, ci);
+                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                            send_ok = false;
                         ci = 0;
                     }
                     memcpy(chunk + ci, "&lt;", 4); ci += 4;
                 } else if (c == '>') {
                     if (ci + 4 > (int)sizeof(chunk)) {
-                        httpd_resp_send_chunk(req, chunk, ci);
+                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                            send_ok = false;
                         ci = 0;
                     }
                     memcpy(chunk + ci, "&gt;", 4); ci += 4;
                 } else if (c == '&') {
                     if (ci + 5 > (int)sizeof(chunk)) {
-                        httpd_resp_send_chunk(req, chunk, ci);
+                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                            send_ok = false;
                         ci = 0;
                     }
                     memcpy(chunk + ci, "&amp;", 5); ci += 5;
                 } else {
                     if (ci + 1 > (int)sizeof(chunk)) {
-                        httpd_resp_send_chunk(req, chunk, ci);
+                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                            send_ok = false;
                         ci = 0;
                     }
                     chunk[ci++] = c;
                 }
             }
-            if (ci > 0) httpd_resp_send_chunk(req, chunk, ci);
+            if (ci > 0 && send_ok) {
+                if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                    send_ok = false;
+            }
         }
     }
 
-    /* HTML footer */
-    html_buf_t foot;
-    html_buf_init(&foot);
-    html_buf_printf(&foot, "</pre>"
-        "<script>var e=document.getElementById('log');e.scrollTop=e.scrollHeight;</script>");
-    layout_html_end(&foot);
-    httpd_resp_send_chunk(req, foot.data, foot.len);
-    html_buf_free(&foot);
+    if (send_ok) {
+        /* HTML footer */
+        html_buf_t foot;
+        html_buf_init(&foot);
+        html_buf_printf(&foot, "</pre>"
+            "<script>var e=document.getElementById('log');e.scrollTop=e.scrollHeight;</script>");
+        layout_html_end(&foot);
+        httpd_resp_send_chunk(req, foot.data, foot.len);
+        html_buf_free(&foot);
 
-    /* End chunked response */
-    httpd_resp_send_chunk(req, NULL, 0);
+        /* End chunked response */
+        httpd_resp_send_chunk(req, NULL, 0);
+    }
 
     if (snap) heap_caps_free(snap);
+
+    httpd_req_async_handler_complete(req);
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+    /* Parse filter from query string (before async clone) */
+    log_filter_t filter = FILTER_ALL;
+    char qbuf[32] = {0};
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(qbuf, "filter", val, sizeof(val)) == ESP_OK) {
+            if (strcmp(val, "printer") == 0) filter = FILTER_PRINTER;
+            else if (strcmp(val, "system") == 0) filter = FILTER_SYSTEM;
+            else if (strcmp(val, "heap") == 0) filter = FILTER_HEAP;
+        }
+    }
+
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    logs_ctx_t *ctx = malloc(sizeof(logs_ctx_t));
+    if (!ctx) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
+    ctx->req = async_req;
+    ctx->filter = filter;
+
+    /* 6KB stack: 1KB chunk buf + html_buf + PSRAM snapshot pointer */
+    if (xTaskCreatePinnedToCore(logs_task, "logs", 6144, ctx,
+                                 5, NULL, 0) != pdPASS) {
+        httpd_req_async_handler_complete(async_req);
+        free(ctx);
+        return ESP_FAIL;
+    }
+
     return ESP_OK;
 }
 
