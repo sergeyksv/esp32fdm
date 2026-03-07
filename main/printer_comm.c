@@ -122,6 +122,7 @@ static int s_unsupported_count;
 static FILE *s_host_file;
 static bool s_host_printing, s_host_paused;
 static int32_t s_host_lines_sent, s_host_total_lines, s_host_layer;
+static bool s_host_has_layer_comments;  /* true if file has ;LAYER: comments */
 static int64_t s_host_start_us, s_host_pause_elapsed_us;
 static char s_host_filename[64];
 static char s_host_pending_line[128]; /* line read but not yet sent */
@@ -281,6 +282,12 @@ static void parse_m27(const char *line)
                 s_state.object_height = s_state.z / (s_state.progress_pct / 100.0f);
                 float lh = s_state.layer_height > 0 ? s_state.layer_height : 0.2f;
                 s_state.total_layers = (int32_t)(s_state.object_height / lh + 0.5f);
+                /* Estimate current layer from Z */
+                float flh = s_state.first_layer_height > 0 ? s_state.first_layer_height : lh;
+                if (s_state.z <= flh)
+                    s_state.current_layer = 1;
+                else
+                    s_state.current_layer = 1 + (int32_t)((s_state.z - flh) / lh + 0.5f);
             }
         }
     } else if (strstr(line, "Not SD printing")) {
@@ -683,6 +690,7 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
 
     char buf[128];
     int32_t max_layer = -1;
+    int32_t layer_change_count = 0;
     float first_z = 0, prev_z = 0;
     bool seen_z = false;
 
@@ -711,6 +719,10 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
             if (strncmp(buf, ";LAYER:", 7) == 0) {
                 int32_t n = atoi(buf + 7);
                 if (n > max_layer) max_layer = n;
+            }
+            /* OrcaSlicer: ;LAYER_CHANGE */
+            if (strncmp(buf, ";LAYER_CHANGE", 13) == 0) {
+                layer_change_count++;
             }
             /* Cura: ;Layer height: 0.2 */
             const char *clh = strstr(buf, ";Layer height:");
@@ -742,6 +754,8 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
     /* Derive values if not found in comments */
     if (max_layer >= 0)
         out->total_layers = max_layer + 1;  /* ;LAYER: is 0-based */
+    else if (layer_change_count > 0)
+        out->total_layers = layer_change_count;
 
     if (out->first_layer_height == 0 && first_z > 0)
         out->first_layer_height = first_z;
@@ -836,6 +850,7 @@ static void host_print_start_internal(const char *filename)
     s_host_lines_sent = 0;
     s_host_total_lines = scan.total_lines;
     s_host_layer = 0;
+    s_host_has_layer_comments = false;
     s_host_start_us = esp_timer_get_time();
     s_host_pause_elapsed_us = 0;
     s_host_has_pending = false;
@@ -1068,9 +1083,15 @@ static void printer_comm_task(void *arg)
                         continue;
                     }
 
-                    /* Parse ;LAYER:N comments for layer tracking */
+                    /* Parse layer comments for tracking */
                     if (strncmp(line, ";LAYER:", 7) == 0) {
                         s_host_layer = atoi(line + 7);
+                        s_host_has_layer_comments = true;
+                    } else if (strncmp(line, ";LAYER_CHANGE", 13) == 0) {
+                        /* First LAYER_CHANGE = layer 0 (0-based, like ;LAYER:) */
+                        if (s_host_has_layer_comments)
+                            s_host_layer++;
+                        s_host_has_layer_comments = true;
                     }
 
                     /* Skip empty lines and comments */
@@ -1182,7 +1203,15 @@ static void printer_comm_task(void *arg)
                 }
                 int64_t elapsed_us = s_host_pause_elapsed_us + (esp_timer_get_time() - s_host_start_us);
                 s_state.print_time_s = (int32_t)(elapsed_us / 1000000);
-                s_state.current_layer = s_host_layer;
+                s_state.current_layer = s_host_layer + 1;  /* ;LAYER: is 0-based, display 1-based */
+                /* If no ;LAYER: comments in file, estimate from Z */
+                if (!s_host_has_layer_comments && s_state.z > 0 && s_state.layer_height > 0) {
+                    float flh = s_state.first_layer_height > 0 ? s_state.first_layer_height : s_state.layer_height;
+                    if (s_state.z <= flh)
+                        s_state.current_layer = 1;
+                    else
+                        s_state.current_layer = 1 + (int32_t)((s_state.z - flh) / s_state.layer_height + 0.5f);
+                }
                 if (s_state.progress_pct > 0.1f) {
                     float total_est = (float)s_state.print_time_s / (s_state.progress_pct / 100.0f);
                     s_state.print_time_left_s = (int32_t)(total_est - s_state.print_time_s);
