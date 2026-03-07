@@ -1,0 +1,262 @@
+#include "logbuf.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "layout.h"
+
+static const char *TAG = "logbuf";
+
+/* ---- Ring buffer ---- */
+
+#define LOGBUF_SIZE (2 * 1024 * 1024)   /* 2 MB in PSRAM */
+#define FMT_BUF_SIZE 512                /* stack buffer for vsnprintf */
+
+static char *s_buf;
+static int   s_head;       /* next write position */
+static int   s_count;      /* valid bytes in buffer (≤ LOGBUF_SIZE) */
+static SemaphoreHandle_t s_mutex;
+static vprintf_like_t s_orig_vprintf;
+
+/* ---- Ring helpers ---- */
+
+static void ring_write(const char *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        s_buf[s_head] = data[i];
+        s_head = (s_head + 1) % LOGBUF_SIZE;
+    }
+    if (s_count + (int)len > LOGBUF_SIZE)
+        s_count = LOGBUF_SIZE;
+    else
+        s_count += (int)len;
+}
+
+/* ---- esp_log hook ---- */
+
+static int log_vprintf(const char *fmt, va_list args)
+{
+    /* Format into stack buffer */
+    char tmp[FMT_BUF_SIZE];
+    int len = vsnprintf(tmp, sizeof(tmp), fmt, args);
+    if (len < 0) len = 0;
+    if (len >= (int)sizeof(tmp)) len = (int)sizeof(tmp) - 1;
+
+    /* Write to ring buffer */
+    if (s_mutex) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        ring_write(tmp, len);
+        xSemaphoreGive(s_mutex);
+    }
+
+    /* Forward to original vprintf (UART) */
+    /* We already have the formatted string, just write it */
+    for (int i = 0; i < len; i++)
+        putchar(tmp[i]);
+
+    return len;
+}
+
+/* ---- Init ---- */
+
+void logbuf_init(void)
+{
+    s_buf = heap_caps_calloc(1, LOGBUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_buf) {
+        printf("logbuf: PSRAM alloc failed!\n");
+        return;
+    }
+    s_head = 0;
+    s_count = 0;
+    s_mutex = xSemaphoreCreateMutex();
+
+    s_orig_vprintf = esp_log_set_vprintf(log_vprintf);
+    ESP_LOGI(TAG, "Log buffer initialized (%d KB, PSRAM)", LOGBUF_SIZE / 1024);
+}
+
+/* ---- TAG classification ---- */
+
+static bool is_printer_tag(const char *line, int len)
+{
+    /*
+     * ESP_LOG format: "X (12345) TAG: message\n"
+     * TAG starts after ") " — find it and check.
+     */
+    const char *paren_close = memchr(line, ')', len);
+    if (!paren_close || paren_close - line + 2 >= len) return false;
+
+    const char *tag_start = paren_close + 2;  /* skip ") " */
+    int remaining = len - (int)(tag_start - line);
+
+    if (remaining >= 12 && memcmp(tag_start, "printer_comm", 12) == 0) return true;
+    if (remaining >= 7  && memcmp(tag_start, "klipper", 7) == 0)      return true;
+    return false;
+}
+
+static bool is_heap_line(const char *line, int len)
+{
+    /* Match "HEAP [" anywhere in line — covers log_heap() and heap_monitor_task */
+    return memmem(line, len, "HEAP [", 6) != NULL;
+}
+
+/* ---- HTTP handler ---- */
+
+typedef enum { FILTER_ALL, FILTER_PRINTER, FILTER_SYSTEM, FILTER_HEAP } log_filter_t;
+
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+    /* Parse filter from query string */
+    log_filter_t filter = FILTER_ALL;
+    char qbuf[32] = {0};
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(qbuf, "filter", val, sizeof(val)) == ESP_OK) {
+            if (strcmp(val, "printer") == 0) filter = FILTER_PRINTER;
+            else if (strcmp(val, "system") == 0) filter = FILTER_SYSTEM;
+            else if (strcmp(val, "heap") == 0) filter = FILTER_HEAP;
+        }
+    }
+
+    /* Snapshot the ring buffer to avoid holding mutex during HTTP send */
+    char *snap = heap_caps_malloc(LOGBUF_SIZE, MALLOC_CAP_SPIRAM);
+    int snap_len = 0;
+    int snap_start = 0;
+
+    if (snap && s_mutex) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        snap_len = s_count;
+        snap_start = (s_head - s_count + LOGBUF_SIZE) % LOGBUF_SIZE;
+        /* Linearize ring into snapshot */
+        if (snap_start + snap_len <= LOGBUF_SIZE) {
+            memcpy(snap, s_buf + snap_start, snap_len);
+        } else {
+            int first = LOGBUF_SIZE - snap_start;
+            memcpy(snap, s_buf + snap_start, first);
+            memcpy(snap + first, s_buf, snap_len - first);
+        }
+        xSemaphoreGive(s_mutex);
+    }
+
+    httpd_resp_set_type(req, "text/html");
+
+    /* HTML header via layout */
+    html_buf_t page;
+    html_buf_init(&page);
+    layout_html_begin(&page, "Logs", "/logs");
+
+    /* Filter buttons */
+    html_buf_printf(&page,
+        "<div style='margin:12px 0'>"
+        "<b>Filter:</b> ");
+    if (filter == FILTER_ALL)
+        html_buf_printf(&page, "<b>[All]</b> ");
+    else
+        html_buf_printf(&page, "<a href='/logs'>All</a> ");
+    if (filter == FILTER_PRINTER)
+        html_buf_printf(&page, "<b>[Printer]</b> ");
+    else
+        html_buf_printf(&page, "<a href='/logs?filter=printer'>Printer</a> ");
+    if (filter == FILTER_SYSTEM)
+        html_buf_printf(&page, "<b>[System]</b> ");
+    else
+        html_buf_printf(&page, "<a href='/logs?filter=system'>System</a> ");
+    if (filter == FILTER_HEAP)
+        html_buf_printf(&page, "<b>[Heap]</b> ");
+    else
+        html_buf_printf(&page, "<a href='/logs?filter=heap'>Heap</a> ");
+    html_buf_printf(&page, "</div>"
+        "<pre style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
+        "font-size:13px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;"
+        "max-height:70vh;overflow-y:auto' id='log'>");
+
+    /* Send header */
+    httpd_resp_send_chunk(req, page.data, page.len);
+    html_buf_free(&page);
+
+    /* Stream log lines from snapshot */
+    if (snap && snap_len > 0) {
+        int pos = 0;
+        while (pos < snap_len) {
+            /* Find end of line */
+            int line_start = pos;
+            while (pos < snap_len && snap[pos] != '\n') pos++;
+            if (pos < snap_len) pos++;  /* include the \n */
+
+            int line_len = pos - line_start;
+
+            /* Apply filter */
+            if (filter != FILTER_ALL) {
+                bool printer = is_printer_tag(snap + line_start, line_len);
+                bool heap = is_heap_line(snap + line_start, line_len);
+                if (filter == FILTER_PRINTER && !printer) continue;
+                if (filter == FILTER_SYSTEM && printer) continue;
+                if (filter == FILTER_HEAP && !heap) continue;
+            }
+
+            /* HTML-escape and send: we need to escape <, >, & */
+            /* Send in small chunks, escaping as needed */
+            char chunk[1024];
+            int ci = 0;
+            for (int i = line_start; i < line_start + line_len; i++) {
+                char c = snap[i];
+                if (c == '<') {
+                    if (ci + 4 > (int)sizeof(chunk)) {
+                        httpd_resp_send_chunk(req, chunk, ci);
+                        ci = 0;
+                    }
+                    memcpy(chunk + ci, "&lt;", 4); ci += 4;
+                } else if (c == '>') {
+                    if (ci + 4 > (int)sizeof(chunk)) {
+                        httpd_resp_send_chunk(req, chunk, ci);
+                        ci = 0;
+                    }
+                    memcpy(chunk + ci, "&gt;", 4); ci += 4;
+                } else if (c == '&') {
+                    if (ci + 5 > (int)sizeof(chunk)) {
+                        httpd_resp_send_chunk(req, chunk, ci);
+                        ci = 0;
+                    }
+                    memcpy(chunk + ci, "&amp;", 5); ci += 5;
+                } else {
+                    if (ci + 1 > (int)sizeof(chunk)) {
+                        httpd_resp_send_chunk(req, chunk, ci);
+                        ci = 0;
+                    }
+                    chunk[ci++] = c;
+                }
+            }
+            if (ci > 0) httpd_resp_send_chunk(req, chunk, ci);
+        }
+    }
+
+    /* HTML footer */
+    html_buf_t foot;
+    html_buf_init(&foot);
+    html_buf_printf(&foot, "</pre>"
+        "<script>var e=document.getElementById('log');e.scrollTop=e.scrollHeight;</script>");
+    layout_html_end(&foot);
+    httpd_resp_send_chunk(req, foot.data, foot.len);
+    html_buf_free(&foot);
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    if (snap) heap_caps_free(snap);
+    return ESP_OK;
+}
+
+/* ---- Registration ---- */
+
+esp_err_t logbuf_register_httpd(httpd_handle_t server)
+{
+    httpd_uri_t uri = {
+        .uri = "/logs", .method = HTTP_GET, .handler = logs_handler,
+    };
+    httpd_register_uri_handler(server, &uri);
+    ESP_LOGI(TAG, "Log viewer registered at /logs");
+    return ESP_OK;
+}

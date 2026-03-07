@@ -11,6 +11,7 @@ set(SRCS
     "obico_client.c"
     "rfc2217.c"
     "terminal.c"
+    "logbuf.c"
     "dns_server.c"
 )
 

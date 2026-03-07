@@ -22,6 +22,7 @@
 
 #include "obico_client.h"
 #include "terminal.h"
+#include "logbuf.h"
 
 static const char *TAG = "httpd";
 
@@ -794,6 +795,7 @@ esp_err_t httpd_start_server(void)
     sdcard_httpd_register(server);
 
     terminal_register_httpd(server);
+    logbuf_register_httpd(server);
     obico_register_httpd(server);
     printer_config_register_httpd(server);
 

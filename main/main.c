@@ -8,6 +8,7 @@
 #include "obico_client.h"
 #include "rfc2217.h"
 #include "terminal.h"
+#include "logbuf.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -48,6 +49,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Log buffer — capture boot logs from here on */
+    logbuf_init();
 
     /* WiFi — try STA, fall back to AP */
     wifi_result_t wifi_result = wifi_init();

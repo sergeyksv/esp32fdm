@@ -126,7 +126,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "</style></head><body>"
         "<nav>"
         "<span class='brand'>ESP32FDM</span>"
-        "%s %s%s%s %s"
+        "%s %s%s%s %s %s"
         "<span class='cpu-bars'>"
         "C0<span class='cpu-bar'><div id='cb0'></div></span>"
         "C1<span class='cpu-bar'><div id='cb1'></div></span>"
@@ -138,6 +138,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         NAV_LINK("/camera", "Camera"),
         sd_nav,
         terminal_nav,
+        NAV_LINK("/logs", "Logs"),
         NAV_LINK("/settings", "Settings"));
 
     #undef NAV_LINK
