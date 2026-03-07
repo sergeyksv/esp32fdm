@@ -101,6 +101,9 @@ static int64_t s_last_m114_us;
 static int64_t s_last_m119_us;
 static bool s_filament_sensor_present;  /* true once M119 reports a filament: line */
 
+/* One-shot M290 query on connect */
+static bool s_m290_queried;
+
 /* Print start time tracking */
 static int64_t s_print_start_us;
 static bool s_need_filename;
@@ -368,6 +371,16 @@ static void process_line(const char *line)
         parse_m114(line);
     } else if (strstr(line, "filament:")) {
         parse_m119(line);
+    }
+
+    /* Parse M290 response: "echo:Probe Offset Z-1.69" */
+    const char *poff = strstr(line, "Probe Offset Z");
+    if (poff) {
+        float z = strtof(poff + 14, NULL);
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_state.probe_z_offset = z;
+        xSemaphoreGive(s_state_mutex);
+        ESP_LOGI(TAG, "Probe Z offset: %.2f", z);
     }
 
     /* Detect unsupported commands: echo:Unknown command: "M73 P15 R21" */
@@ -893,6 +906,7 @@ static void printer_comm_task(void *arg)
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
             s_state.opstate = PRINTER_DISCONNECTED;
             xSemaphoreGive(s_state_mutex);
+            s_m290_queried = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -1166,6 +1180,13 @@ static void printer_comm_task(void *arg)
                 }
             }
             goto poll_done;
+        }
+
+        /* Query M290 once on connect to get current probe Z offset */
+        if (!s_m290_queried) {
+            s_m290_queried = true;
+            send_query("M290", QUERY_CMD);
+            CHECK_COOLDOWN();
         }
 
         /* Poll M105 (temperatures) every 4s */

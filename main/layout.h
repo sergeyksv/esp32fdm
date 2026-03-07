@@ -161,7 +161,7 @@ static inline void layout_html_end(html_buf_t *p)
         "bt+='<button class=btn-red onclick=\"if(confirm(\\'Stop print?\\'))fetch(\\'/sd/cancel\\',{method:\\'POST\\'})\">Stop</button></span>';"
         "p.innerHTML=bt+'<b>'+(s.state=='paused'?'PAUSED':'PRINTING')+':</b> '+(s.filename||'')"
         "+'<div class=pbar><div style=\"width:'+Math.min(100,s.progress||0)+'%%\"></div></div>'"
-        "+~~s.progress+'%%';}"
+        "+~~s.progress+'%%'+(s.layer&&s.layer!='0/0'?' &middot; Layer '+s.layer:'');}"
         "else p.textContent=s.state=='error'?s.backend+': Error':s.usb?s.backend+': Ready':s.backend+': Disconnected';"
         "}).catch(function(){})}"
         "u();setInterval(u,3000);"

@@ -32,6 +32,7 @@ typedef struct {
     int32_t total_layers;        /* computed from metadata, -1 if unknown */
     bool host_printing;          /* true if ESP32 is streaming GCode from SD */
     int32_t current_layer;       /* current layer from ;LAYER:N comments */
+    float probe_z_offset;        /* Z probe offset from M290 query (Marlin) */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
 } printer_state_t;
 

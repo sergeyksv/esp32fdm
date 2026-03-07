@@ -26,6 +26,15 @@
 
 static const char *TAG = "httpd";
 
+/* Forward declaration — used by api_command_handler and others */
+static bool parse_form_field(const char *body, const char *name,
+                             char *out, size_t out_size);
+
+/* Baby-step Z offset — seeded from printer (M290 query), updated locally on adjustments.
+ * Re-synced from printer_state_t.probe_z_offset when the printer is queried. */
+static float s_baby_z = 0.0f;
+static bool  s_baby_z_seeded = false;  /* true once we got a real value from the printer */
+
 #define STREAM_TARGET_FPS 5
 #define STREAM_FRAME_INTERVAL_US (1000000 / STREAM_TARGET_FPS)
 
@@ -158,11 +167,17 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     int32_t layer = st.current_layer;
     int32_t total_layers = st.total_layers;
 
-    char json[420];
+    /* Sync baby Z from printer when available (probe_z_offset is 0 until M290 response) */
+    if (!s_baby_z_seeded && st.probe_z_offset != 0.0f) {
+        s_baby_z = st.probe_z_offset;
+        s_baby_z_seeded = true;
+    }
+
+    char json[448];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
-        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"usb\":%s}",
+        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -172,7 +187,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         (long)(st.print_time_left_s >= 0 ? st.print_time_left_s : 0),
         (long)(layer >= 0 ? layer : 0),
         (long)(total_layers >= 0 ? total_layers : 0),
-        st.z,
+        st.z, s_baby_z,
         usb ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
@@ -288,6 +303,40 @@ static esp_err_t api_temp_history_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- POST /api/command — send raw GCode ---- */
+
+static esp_err_t api_command_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recv_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[recv_len] = '\0';
+
+    char cmd[96] = {0};
+    if (!parse_form_field(buf, "cmd", cmd, sizeof(cmd)) || cmd[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "cmd required");
+        return ESP_FAIL;
+    }
+
+    /* Track baby-step Z offset accumulator */
+    const char *m290 = strcasestr(cmd, "M290");
+    if (m290) {
+        const char *zp = strchr(m290, 'Z');
+        if (!zp) zp = strchr(m290, 'z');
+        if (zp) s_baby_z += strtof(zp + 1, NULL);
+    }
+
+    printer_cmd_t pcmd = { .type = PCMD_RAW };
+    strncpy(pcmd.gcode, cmd, sizeof(pcmd.gcode) - 1);
+    printer_comm_send_cmd(&pcmd);
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "OK", 2);
+}
+
 /* ---- / root handler — dashboard ---- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -296,6 +345,105 @@ static esp_err_t root_handler(httpd_req_t *req)
     html_buf_init(&p);
 
     layout_html_begin(&p, "ESP32 FDM Dashboard", "/");
+
+    html_buf_printf(&p,
+        "<style>"
+        ".ctrl{margin:8px 0}"
+        ".ctrl summary{font-weight:bold;cursor:pointer;padding:8px;background:#f5f5f5;border-radius:4px;user-select:none}"
+        ".ctrl .cg{padding:8px 0}"
+        ".ctrl label{font-size:13px;font-weight:bold;display:block;margin:6px 0 2px}"
+        ".bg{display:flex;flex-wrap:wrap;gap:4px;align-items:center}"
+        ".bg button{min-width:44px;padding:6px 8px;font-size:13px}"
+        ".bg input[type=number]{width:64px;padding:5px;font-size:13px}"
+        ".bg .val{min-width:44px;text-align:center;font-weight:bold;font-size:14px}"
+        "</style>");
+
+    /* Controls panel */
+    html_buf_printf(&p,
+        "<details class='ctrl'><summary>Z Offset (Baby Stepping)</summary><div class='cg'>"
+        "<div class='bg'>"
+        "<button onclick=\"zb(-0.05)\">-0.05</button>"
+        "<button onclick=\"zb(-0.01)\">-0.01</button>"
+        "<span class='val' id='zof'>%.2f</span>",
+        s_baby_z);
+    html_buf_printf(&p,
+        "<button onclick=\"zb(0.01)\">+0.01</button>"
+        "<button onclick=\"zb(0.05)\">+0.05</button>"
+        "<button onclick=\"gc('M500')\" style='margin-left:8px' title='Save all settings to EEPROM (M500)'>Save</button>"
+        "</div>"
+        "<p class='hint' style='margin:4px 0 0'>Session offset shown. Save persists Z offset (and all settings) to EEPROM.</p>"
+        "</div></details>");
+
+    html_buf_printf(&p,
+        "<details class='ctrl'><summary>Temperatures</summary><div class='cg'>"
+        "<label>Hotend</label><div class='bg'>"
+        "<button onclick=\"gc('M104 S0')\">Off</button>"
+        "<button onclick=\"gc('M104 S190')\">190</button>"
+        "<button onclick=\"gc('M104 S200')\">200</button>"
+        "<button onclick=\"gc('M104 S210')\">210</button>"
+        "<button onclick=\"gc('M104 S220')\">220</button>"
+        "<input type='number' id='ht' placeholder='&deg;C' min='0' max='300'>"
+        "<button onclick=\"gc('M104 S'+document.getElementById('ht').value)\">Set</button>"
+        "</div>"
+        "<label>Bed</label><div class='bg'>"
+        "<button onclick=\"gc('M140 S0')\">Off</button>"
+        "<button onclick=\"gc('M140 S50')\">50</button>"
+        "<button onclick=\"gc('M140 S55')\">55</button>"
+        "<button onclick=\"gc('M140 S60')\">60</button>"
+        "<button onclick=\"gc('M140 S70')\">70</button>"
+        "<input type='number' id='bt' placeholder='&deg;C' min='0' max='120'>"
+        "<button onclick=\"gc('M140 S'+document.getElementById('bt').value)\">Set</button>"
+        "</div></div></details>");
+
+    html_buf_printf(&p,
+        "<details class='ctrl'><summary>Move / Jog</summary><div class='cg'>"
+        "<label>Step (mm)</label><div class='bg'>"
+        "<button id='s01' onclick=\"setStep(0.1)\" style='font-weight:bold'>0.1</button>"
+        "<button id='s1' onclick=\"setStep(1)\">1</button>"
+        "<button id='s10' onclick=\"setStep(10)\">10</button>"
+        "<button id='s100' onclick=\"setStep(100)\">100</button>"
+        "</div>"
+        "<label>Axes</label><div class='bg'>"
+        "<button id='xm' onclick=\"jog('X',-1)\">X-</button>"
+        "<button id='xp' onclick=\"jog('X',1)\">X+</button>"
+        "<button id='ym' onclick=\"jog('Y',-1)\">Y-</button>"
+        "<button id='yp' onclick=\"jog('Y',1)\">Y+</button>"
+        "<button id='zm' onclick=\"jog('Z',-1)\">Z-</button>"
+        "<button id='zp' onclick=\"jog('Z',1)\">Z+</button>"
+        "</div>"
+        "<label>Extruder</label><div class='bg'>"
+        "<button id='er' onclick=\"extrude(-1)\">Retract</button>"
+        "<button id='ee' onclick=\"extrude(1)\">Extrude</button>"
+        "<button id='esn' onclick=\"setESpd(0)\" style='font-weight:bold'>Normal</button>"
+        "<button id='ess' onclick=\"setESpd(1)\">Slow</button>"
+        "</div>"
+        "<p class='hint' style='margin:2px 0 0'>Normal: 300mm/min. Slow: 60mm/min (for measuring filament length).</p>"
+        "<label>Home</label><div class='bg'>"
+        "<button id='ha' onclick=\"gc('G28')\">All</button>"
+        "<button id='hx' onclick=\"gc('G28 X')\">X</button>"
+        "<button id='hy' onclick=\"gc('G28 Y')\">Y</button>"
+        "<button id='hz' onclick=\"gc('G28 Z')\">Z</button>"
+        "</div></div></details>");
+
+    html_buf_printf(&p,
+        "<details class='ctrl'><summary>Speed / Flow / Fan</summary><div class='cg'>"
+        "<label>Speed</label><div class='bg'>"
+        "<button onclick=\"adj('spd',-10)\">-10%%</button>"
+        "<span class='val' id='spd'>100%%</span>"
+        "<button onclick=\"adj('spd',10)\">+10%%</button>"
+        "</div>"
+        "<label>Flow</label><div class='bg'>"
+        "<button onclick=\"adj('flw',-5)\">-5%%</button>"
+        "<span class='val' id='flw'>100%%</span>"
+        "<button onclick=\"adj('flw',5)\">+5%%</button>"
+        "</div>"
+        "<label>Fan</label><div class='bg'>"
+        "<button onclick=\"gc('M106 S0')\">Off</button>"
+        "<button onclick=\"gc('M106 S64')\">25%%</button>"
+        "<button onclick=\"gc('M106 S128')\">50%%</button>"
+        "<button onclick=\"gc('M106 S191')\">75%%</button>"
+        "<button onclick=\"gc('M106 S255')\">100%%</button>"
+        "</div></div></details>");
 
     html_buf_printf(&p,
         "<div style='text-align:center;margin:12px 0'>"
@@ -307,33 +455,51 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<tr><td>Hotend</td><td id='he'>--</td></tr>"
         "<tr><td>Bed</td><td id='bd'>--</td></tr>"
         "<tr><td>State</td><td id='st'>--</td></tr>"
-        "<tr id='fnr' style='display:none'><td>File</td><td id='fn'></td></tr>"
-        "<tr id='pgr' style='display:none'><td>Progress</td><td id='pg'></td></tr>"
-        "<tr id='lyr' style='display:none'><td>Layer</td><td id='ly'></td></tr>"
-        "<tr id='tmr' style='display:none'><td>Time</td><td id='tm'></td></tr>"
         "</table>"
         "</div>");
+
     html_buf_printf(&p,
         "<script>"
         "var cam=document.getElementById('cam');"
         "setInterval(function(){cam.src='/capture?'+Date.now()},5000);"
+        /* gc() — send GCode via /api/command */
+        "function gc(c){fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(c)})}"
+        "var zoff=%.2f;"
+        "function zb(d){zoff=Math.round((zoff+d)*100)/100;gc('M290 Z'+d);document.getElementById('zof').textContent=zoff.toFixed(2)}",
+        s_baby_z);
+    html_buf_printf(&p,
+        /* Step selector for jog */
+        "var step=0.1;"
+        "function setStep(v){step=v;['s01','s1','s10','s100'].forEach(function(id){document.getElementById(id).style.fontWeight='normal'});"
+        "document.getElementById(v==0.1?'s01':v==1?'s1':v==10?'s10':'s100').style.fontWeight='bold'}"
+        /* Jog function — relative move */
+        "var isPrinting=false;"
+        "function jog(ax,dir){if(isPrinting)return;"
+        "var d=step*dir;var f=ax=='Z'?600:3000;gc('G91\\nG0 '+ax+d+' F'+f+'\\nG90')}"
+        /* Extruder — two speed modes: normal 300mm/min, slow 60mm/min */
+        "var espd=0;"
+        "function setESpd(m){espd=m;document.getElementById('esn').style.fontWeight=m?'normal':'bold';"
+        "document.getElementById('ess').style.fontWeight=m?'bold':'normal'}"
+        "function extrude(dir){if(isPrinting)return;"
+        "var d=step*dir;var f=espd?60:300;gc('M83\\nG1 E'+d+' F'+f+'\\nM82')}"
+        /* Speed/flow adjusters */
+        "var vals={spd:100,flw:100};"
+        "function adj(k,d){vals[k]+=d;"
+        "if(k=='spd'){if(vals[k]<50)vals[k]=50;if(vals[k]>200)vals[k]=200;gc('M220 S'+vals[k])}"
+        "if(k=='flw'){if(vals[k]<75)vals[k]=75;if(vals[k]>150)vals[k]=150;gc('M221 S'+vals[k])}"
+        "document.getElementById(k).textContent=vals[k]+'%%'}"
+        /* Status polling (simplified — no duplicate progress rows) */
         "function u(){"
         "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
         "document.getElementById('he').textContent=s.hotend[0].toFixed(1)+' / '+s.hotend[1].toFixed(0)+'\\u00b0C';"
         "document.getElementById('bd').textContent=s.bed[0].toFixed(1)+' / '+s.bed[1].toFixed(0)+'\\u00b0C';"
-        "var pr=s.state=='printing'||s.state=='paused';"
         "document.getElementById('st').textContent=s.state.charAt(0).toUpperCase()+s.state.slice(1);"
-        "document.getElementById('fnr').style.display=pr?'':'none';"
-        "document.getElementById('pgr').style.display=pr?'':'none';"
-        "document.getElementById('lyr').style.display=pr?'':'none';"
-        "document.getElementById('tmr').style.display=pr?'':'none';"
-        "if(pr){"
-        "document.getElementById('fn').textContent=s.filename;"
-        "document.getElementById('pg').innerHTML=s.progress.toFixed(1)+'%%'+"
-        "'<div class=pbar><div style=\"width:'+Math.min(100,s.progress)+'%%\"></div></div>';"
-        "document.getElementById('ly').textContent=s.layer;"
-        "var e=Math.floor(s.elapsed/60)+'m';var r=s.remaining>0?' / ~'+Math.floor(s.remaining/60)+'m left':'';"
-        "document.getElementById('tm').textContent=e+r;}"
+        "isPrinting=s.state=='printing'||s.state=='paused';"
+        "['xm','xp','ym','yp','zm','zp','er','ee','ha','hx','hy','hz'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=isPrinting});"
+        "if(typeof s.baby_z==='number'){zoff=s.baby_z;document.getElementById('zof').textContent=zoff.toFixed(2)}"
+        "var hi=document.getElementById('ht'),bi=document.getElementById('bt');"
+        "if(hi&&document.activeElement!==hi)hi.value=s.hotend[1]>0?s.hotend[1].toFixed(0):'';"
+        "if(bi&&document.activeElement!==bi)bi.value=s.bed[1]>0?s.bed[1].toFixed(0):'';"
         "}).catch(function(){})}"
         "u();setInterval(u,2000);"
         "</script>"
@@ -488,10 +654,6 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     html_buf_free(&p);
     return ret;
 }
-
-/* Forward declaration (defined in captive portal section) */
-static bool parse_form_field(const char *body, const char *name,
-                             char *out, size_t out_size);
 
 /* ---- /camera handler ---- */
 
@@ -763,6 +925,13 @@ esp_err_t httpd_start_server(void)
         .handler  = api_temp_history_handler,
     };
     httpd_register_uri_handler(server, &api_temp_history);
+
+    httpd_uri_t api_command = {
+        .uri      = "/api/command",
+        .method   = HTTP_POST,
+        .handler  = api_command_handler,
+    };
+    httpd_register_uri_handler(server, &api_command);
 
     httpd_uri_t camera_page = {
         .uri      = "/camera",
