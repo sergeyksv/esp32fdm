@@ -32,10 +32,16 @@ static const char *TAG = "obico";
 
 #define NVS_NAMESPACE "obico"
 #define NVS_KEY_TOKEN "auth_token"
+#define NVS_KEY_JANUS_HOST "janus_host"
+#define NVS_KEY_JANUS_PORT "janus_port"
 #define TOKEN_MAX_LEN 128
 
 static char s_auth_token[TOKEN_MAX_LEN];
 static bool s_linked = false;
+
+/* ---- Janus proxy runtime config ---- */
+static char s_janus_host[64];
+static uint16_t s_janus_port = 17800;
 
 /* ---- Obico state ---- */
 
@@ -47,7 +53,6 @@ static esp_websocket_client_handle_t s_ws_client = NULL;
 
 /* ---- Janus proxy state ---- */
 
-#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
 static int s_janus_sock = -1;
 static TaskHandle_t s_janus_rx_task_handle = NULL;
 static SemaphoreHandle_t s_janus_sock_mutex = NULL;
@@ -59,9 +64,8 @@ static void janus_disconnect(void);
 
 static bool janus_proxy_configured(void)
 {
-    return strlen(CONFIG_OBICO_JANUS_PROXY_HOST) > 0;
+    return s_janus_host[0] != '\0';
 }
-#endif
 
 /* ---- Forward declarations ---- */
 
@@ -111,6 +115,40 @@ static esp_err_t clear_token_from_nvs(void)
     nvs_commit(nvs);
     nvs_close(nvs);
     return ESP_OK;
+}
+
+static void load_janus_config_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        /* NVS not initialized yet — use Kconfig defaults */
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+        strncpy(s_janus_host, CONFIG_OBICO_JANUS_PROXY_HOST, sizeof(s_janus_host) - 1);
+#endif
+#ifdef CONFIG_OBICO_JANUS_PROXY_PORT
+        s_janus_port = CONFIG_OBICO_JANUS_PROXY_PORT;
+#endif
+        return;
+    }
+
+    size_t len = sizeof(s_janus_host);
+    if (nvs_get_str(nvs, NVS_KEY_JANUS_HOST, s_janus_host, &len) != ESP_OK) {
+        /* Not in NVS — fall back to Kconfig */
+#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
+        strncpy(s_janus_host, CONFIG_OBICO_JANUS_PROXY_HOST, sizeof(s_janus_host) - 1);
+#endif
+    }
+
+    uint16_t port = 0;
+    if (nvs_get_u16(nvs, NVS_KEY_JANUS_PORT, &port) == ESP_OK && port > 0) {
+        s_janus_port = port;
+    } else {
+#ifdef CONFIG_OBICO_JANUS_PROXY_PORT
+        s_janus_port = CONFIG_OBICO_JANUS_PROXY_PORT;
+#endif
+    }
+
+    nvs_close(nvs);
 }
 
 /* ---- SNTP ---- */
@@ -242,13 +280,11 @@ esp_err_t obico_link_with_code(const char *code)
                 xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
                                         NULL, 4, &s_snap_task_handle, 0);
             }
-#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
             if (!s_janus_rx_task_handle && janus_proxy_configured()) {
                 s_janus_sock_mutex = xSemaphoreCreateMutex();
                 xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
                                         NULL, 5, &s_janus_rx_task_handle, 0);
             }
-#endif
             return ESP_OK;
         }
     }
@@ -508,7 +544,6 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
                 }
 
                 /* Handle Janus signaling relay */
-#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
                 const cJSON *janus_msg = cJSON_GetObjectItem(root, "janus");
                 if (janus_msg && cJSON_IsString(janus_msg) && janus_proxy_configured()) {
                     const char *janus_str = janus_msg->valuestring;
@@ -516,7 +551,6 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
                     ESP_LOGI(TAG, "WS->sidecar janus msg (%d bytes)", janus_len);
                     janus_send_to_sidecar(janus_str, janus_len);
                 }
-#endif
 
                 /* Handle commands: [{"cmd": "pause", "args": {...}, "initiator": "api"}] */
                 const cJSON *cmds = cJSON_GetObjectItem(root, "commands");
@@ -1003,17 +1037,15 @@ esp_err_t obico_register_httpd(void *server_handle)
 
 /* ---- Janus proxy relay ---- */
 
-#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
-
 static void janus_connect(void)
 {
     if (s_janus_sock >= 0) return;
 
     struct sockaddr_in dest = {
         .sin_family = AF_INET,
-        .sin_port = htons(CONFIG_OBICO_JANUS_PROXY_PORT),
+        .sin_port = htons(s_janus_port),
     };
-    inet_pton(AF_INET, CONFIG_OBICO_JANUS_PROXY_HOST, &dest.sin_addr);
+    inet_pton(AF_INET, s_janus_host, &dest.sin_addr);
 
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
@@ -1028,7 +1060,7 @@ static void janus_connect(void)
 
     if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
         ESP_LOGW(TAG, "Janus proxy connect to %s:%d failed",
-                 CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+                 s_janus_host, s_janus_port);
         close(sock);
         return;
     }
@@ -1038,7 +1070,7 @@ static void janus_connect(void)
     xSemaphoreGive(s_janus_sock_mutex);
 
     ESP_LOGI(TAG, "Connected to Janus proxy at %s:%d",
-             CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+             s_janus_host, s_janus_port);
 }
 
 static void janus_disconnect(void)
@@ -1166,7 +1198,59 @@ static void janus_proxy_task(void *arg)
     }
 }
 
-#endif /* CONFIG_OBICO_JANUS_PROXY_HOST */
+/* ---- Public getters/setters for Janus config ---- */
+
+const char *obico_get_janus_host(void)
+{
+    return s_janus_host;
+}
+
+uint16_t obico_get_janus_port(void)
+{
+    return s_janus_port;
+}
+
+esp_err_t obico_set_janus_proxy(const char *host, uint16_t port)
+{
+    /* Update runtime vars */
+    if (host) {
+        strncpy(s_janus_host, host, sizeof(s_janus_host) - 1);
+        s_janus_host[sizeof(s_janus_host) - 1] = '\0';
+    } else {
+        s_janus_host[0] = '\0';
+    }
+    if (port > 0) {
+        s_janus_port = port;
+    }
+
+    /* Save to NVS */
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    nvs_set_str(nvs, NVS_KEY_JANUS_HOST, s_janus_host);
+    nvs_set_u16(nvs, NVS_KEY_JANUS_PORT, s_janus_port);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    /* Disconnect existing Janus connection so it reconnects with new settings */
+    if (s_janus_sock_mutex) {
+        janus_disconnect();
+    }
+
+    /* Start Janus task if newly configured and linked */
+    if (s_linked && janus_proxy_configured() && !s_janus_rx_task_handle) {
+        if (!s_janus_sock_mutex) {
+            s_janus_sock_mutex = xSemaphoreCreateMutex();
+        }
+        xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+                                NULL, 5, &s_janus_rx_task_handle, 0);
+    }
+
+    ESP_LOGI(TAG, "Janus proxy config updated: host=%s port=%d",
+             s_janus_host, s_janus_port);
+    return ESP_OK;
+}
 
 /* ---- Public init ---- */
 
@@ -1174,6 +1258,9 @@ esp_err_t obico_client_init(void)
 {
     /* Initialize SNTP for timestamps */
     init_sntp();
+
+    /* Load Janus proxy config from NVS (or Kconfig defaults) */
+    load_janus_config_from_nvs();
 
     /* Try to load existing token */
     load_token_from_nvs();
@@ -1185,15 +1272,13 @@ esp_err_t obico_client_init(void)
                                 NULL, 5, &s_ws_task_handle, 0);
         xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
                                 NULL, 4, &s_snap_task_handle, 0);
-#ifdef CONFIG_OBICO_JANUS_PROXY_HOST
         if (janus_proxy_configured()) {
             s_janus_sock_mutex = xSemaphoreCreateMutex();
             xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
                                     NULL, 5, &s_janus_rx_task_handle, 0);
             ESP_LOGI(TAG, "Janus proxy relay enabled -> %s:%d",
-                     CONFIG_OBICO_JANUS_PROXY_HOST, CONFIG_OBICO_JANUS_PROXY_PORT);
+                     s_janus_host, s_janus_port);
         }
-#endif
     } else {
         ESP_LOGI(TAG, "Device not linked — visit /obico/link to connect");
     }

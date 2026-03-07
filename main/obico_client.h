@@ -44,6 +44,22 @@ esp_err_t obico_register_httpd(void *server_handle);
  */
 void obico_render_settings(html_buf_t *p);
 
+/**
+ * Get current Janus proxy host (empty string if not configured).
+ */
+const char *obico_get_janus_host(void);
+
+/**
+ * Get current Janus proxy port.
+ */
+uint16_t obico_get_janus_port(void);
+
+/**
+ * Set Janus proxy host and port. Saves to NVS and reconnects if needed.
+ * Pass empty/NULL host to disable.
+ */
+esp_err_t obico_set_janus_proxy(const char *host, uint16_t port);
+
 #ifdef __cplusplus
 }
 #endif

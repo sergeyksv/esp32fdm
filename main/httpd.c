@@ -422,15 +422,23 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         printer_config_render_marlin(&p);
     }
 
-    /* 3. Camera */
+    /* 3. Video (camera + streaming) */
     bool rot = camera_get_rotate180();
+    const char *jh = obico_get_janus_host();
+    uint16_t jp = obico_get_janus_port();
     html_buf_printf(&p,
-        "<hr><div class='sh'><h2>Camera</h2>"
-        "<button type='submit' form='f-camera'>Save</button></div>"
-        "<form id='f-camera' method='POST' action='/camera/config'>"
+        "<hr><div class='sh'><h2>Video</h2>"
+        "<button type='submit' form='f-video'>Save</button></div>"
+        "<form id='f-video' method='POST' action='/video/config'>"
         "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label>"
+        "<p style='margin:12px 0 4px;font-weight:bold'>Janus Proxy (WebRTC streaming)</p>"
+        "<label>Host<br><input type='text' name='janus_host' value='%s' placeholder='192.168.1.x' "
+        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
+        "<label>Port<br><input type='number' name='janus_port' value='%u' min='1' max='65535' "
+        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
+        "<p class='hint'>Leave host empty to disable Janus proxy.</p>"
         "</form>",
-        rot ? " checked" : "");
+        rot ? " checked" : "", jh, (unsigned)jp);
 
     /* 4. Obico */
     if (obico_is_linked()) {
@@ -480,6 +488,10 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     return ret;
 }
 
+/* Forward declaration (defined in captive portal section) */
+static bool parse_form_field(const char *body, const char *name,
+                             char *out, size_t out_size);
+
 /* ---- /camera handler ---- */
 
 static esp_err_t camera_page_handler(httpd_req_t *req)
@@ -500,17 +512,30 @@ static esp_err_t camera_page_handler(httpd_req_t *req)
     return ret;
 }
 
-static esp_err_t camera_config_post_handler(httpd_req_t *req)
+static esp_err_t video_config_post_handler(httpd_req_t *req)
 {
-    char buf[128];
+    char buf[256];
     int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (recv_len < 0) recv_len = 0;
     buf[recv_len] = '\0';
 
-    bool enable = (strstr(buf, "rotate180=1") != NULL);
-    camera_set_rotate180(enable);
+    /* Camera rotation */
+    bool rotate = (strstr(buf, "rotate180=1") != NULL);
+    camera_set_rotate180(rotate);
 
-    /* Redirect back to settings page */
+    /* Janus proxy host/port */
+    char janus_host[64] = {0};
+    char port_str[8] = {0};
+    parse_form_field(buf, "janus_host", janus_host, sizeof(janus_host));
+    parse_form_field(buf, "janus_port", port_str, sizeof(port_str));
+
+    uint16_t janus_port = 17800;
+    if (port_str[0]) {
+        int p = atoi(port_str);
+        if (p > 0 && p <= 65535) janus_port = (uint16_t)p;
+    }
+    obico_set_janus_proxy(janus_host, janus_port);
+
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_send(req, NULL, 0);
@@ -752,12 +777,12 @@ esp_err_t httpd_start_server(void)
     };
     httpd_register_uri_handler(server, &settings_uri);
 
-    httpd_uri_t cam_cfg_post = {
-        .uri      = "/camera/config",
+    httpd_uri_t video_cfg_post = {
+        .uri      = "/video/config",
         .method   = HTTP_POST,
-        .handler  = camera_config_post_handler,
+        .handler  = video_config_post_handler,
     };
-    httpd_register_uri_handler(server, &cam_cfg_post);
+    httpd_register_uri_handler(server, &video_cfg_post);
 
     httpd_uri_t wifi_reset = {
         .uri      = "/wifi/reset",
