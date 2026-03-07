@@ -449,14 +449,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<div style='text-align:center;margin:12px 0'>"
         "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
         "</div>"
-        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>"
-        "<div id='dash'>"
-        "<table>"
-        "<tr><td>Hotend</td><td id='he'>--</td></tr>"
-        "<tr><td>Bed</td><td id='bd'>--</td></tr>"
-        "<tr><td>State</td><td id='st'>--</td></tr>"
-        "</table>"
-        "</div>");
+        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>");
 
     html_buf_printf(&p,
         "<script>"
@@ -488,12 +481,9 @@ static esp_err_t root_handler(httpd_req_t *req)
         "if(k=='spd'){if(vals[k]<50)vals[k]=50;if(vals[k]>200)vals[k]=200;gc('M220 S'+vals[k])}"
         "if(k=='flw'){if(vals[k]<75)vals[k]=75;if(vals[k]>150)vals[k]=150;gc('M221 S'+vals[k])}"
         "document.getElementById(k).textContent=vals[k]+'%%'}"
-        /* Status polling (simplified — no duplicate progress rows) */
+        /* Status polling — update controls state */
         "function u(){"
         "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
-        "document.getElementById('he').textContent=s.hotend[0].toFixed(1)+' / '+s.hotend[1].toFixed(0)+'\\u00b0C';"
-        "document.getElementById('bd').textContent=s.bed[0].toFixed(1)+' / '+s.bed[1].toFixed(0)+'\\u00b0C';"
-        "document.getElementById('st').textContent=s.state.charAt(0).toUpperCase()+s.state.slice(1);"
         "isPrinting=s.state=='printing'||s.state=='paused';"
         "['xm','xp','ym','yp','zm','zp','er','ee','ha','hx','hy','hz'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=isPrinting});"
         "if(typeof s.baby_z==='number'){zoff=s.baby_z;document.getElementById('zof').textContent=zoff.toFixed(2)}"

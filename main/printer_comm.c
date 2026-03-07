@@ -503,6 +503,30 @@ static int adaptive_timeout_ms(void)
     return timeout;
 }
 
+/** Check if a GCode line is a long-running command that blocks until done.
+ *  M109=wait hotend, M190=wait bed, M116=wait all temps,
+ *  G28=homing, G29=bed leveling.
+ *  These need a long timeout, shouldn't trigger poke, and shouldn't
+ *  pollute the adaptive timeout moving average. */
+static bool is_wait_cmd(const char *gcode)
+{
+    /* Skip line number prefix "N123 " */
+    const char *p = gcode;
+    if (*p == 'N' || *p == 'n') {
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    if (*p == 'M') {
+        int code = atoi(p + 1);
+        return (code == 109 || code == 190 || code == 116);
+    }
+    if (*p == 'G') {
+        int code = atoi(p + 1);
+        return (code == 28 || code == 29);
+    }
+    return false;
+}
+
 /** Send a gcode command to the printer, wait for response lines */
 static bool send_query(const char *gcode, query_type_t qtype)
 {
@@ -529,7 +553,8 @@ static bool send_query(const char *gcode, query_type_t qtype)
         return false;
     }
 
-    /* Wait for "ok" or timeout, processing lines as they arrive */
+    /* Wait for "ok" or timeout, processing lines as they arrive. */
+    bool wait = is_wait_cmd(gcode);
     int timeout_ms = s_host_printing ? adaptive_timeout_ms() : CMD_RESPONSE_TIMEOUT_MS;
     int64_t start_us = esp_timer_get_time();
     int64_t deadline = start_us + timeout_ms * 1000LL;
@@ -554,14 +579,26 @@ static bool send_query(const char *gcode, query_type_t qtype)
                 s_line_buf[s_line_len] = '\0';
                 process_line(s_line_buf);
                 s_line_len = 0;
+
+                /* "busy: processing" clears s_pending_query in process_line.
+                 * For wait/long commands, restore it — we still need the real "ok".
+                 * For all commands, extend deadline since printer is alive. */
+                if (s_pending_query == QUERY_NONE
+                    && esp_timer_get_time() < s_cmd_cooldown_until_us) {
+                    if (wait) {
+                        s_pending_query = qtype;
+                    }
+                    deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
+                }
             }
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
             s_line_buf[s_line_len++] = (char)rx_byte;
         }
     }
 
-    /* Record response time for adaptive timeout during host printing */
-    if (s_host_printing) {
+    /* Record response time for adaptive timeout during host printing.
+     * Skip wait commands — their minutes-long response would poison the average. */
+    if (s_host_printing && !wait) {
         int64_t elapsed = esp_timer_get_time() - start_us;
         s_resp_times_us[s_resp_time_idx] = elapsed;
         s_resp_time_idx = (s_resp_time_idx + 1) % RESP_TIME_HISTORY;
