@@ -133,6 +133,14 @@ static char    s_host_numbered_line[160]; /* Formatted "Nxxx gcode*cs" for resen
 static int     s_host_resend_retries;
 #define HOST_RESEND_MAX_RETRIES 5
 
+/* Adaptive timeout: track response times for host print commands */
+#define RESP_TIME_HISTORY       16
+static int64_t *s_resp_times_us;   /* circular buffer in PSRAM, allocated at init */
+static int     s_resp_time_idx;    /* next write index */
+static int     s_resp_time_count;  /* valid entries (up to RESP_TIME_HISTORY) */
+#define ADAPTIVE_TIMEOUT_MIN_MS   500   /* floor: never poke faster than this */
+#define ADAPTIVE_TIMEOUT_MULT     2.0f  /* multiplier on average response time */
+
 /* Park position and retract settings */
 #define PARK_X       0.0f
 #define PARK_Y       0.0f
@@ -467,6 +475,21 @@ static void drain_rx(void)
     }
 }
 
+/** Compute adaptive timeout in ms based on recent response times.
+ *  Returns CMD_RESPONSE_TIMEOUT_MS if no history yet. */
+static int adaptive_timeout_ms(void)
+{
+    if (s_resp_time_count == 0) return CMD_RESPONSE_TIMEOUT_MS;
+    int n = (s_resp_time_count < RESP_TIME_HISTORY) ? s_resp_time_count : RESP_TIME_HISTORY;
+    int64_t sum = 0;
+    for (int i = 0; i < n; i++) sum += s_resp_times_us[i];
+    int avg_ms = (int)(sum / n / 1000);
+    int timeout = (int)(avg_ms * ADAPTIVE_TIMEOUT_MULT);
+    if (timeout < ADAPTIVE_TIMEOUT_MIN_MS) timeout = ADAPTIVE_TIMEOUT_MIN_MS;
+    if (timeout > CMD_RESPONSE_TIMEOUT_MS) timeout = CMD_RESPONSE_TIMEOUT_MS;
+    return timeout;
+}
+
 /** Send a gcode command to the printer, wait for response lines */
 static bool send_query(const char *gcode, query_type_t qtype)
 {
@@ -494,7 +517,9 @@ static bool send_query(const char *gcode, query_type_t qtype)
     }
 
     /* Wait for "ok" or timeout, processing lines as they arrive */
-    int64_t deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
+    int timeout_ms = s_host_printing ? adaptive_timeout_ms() : CMD_RESPONSE_TIMEOUT_MS;
+    int64_t start_us = esp_timer_get_time();
+    int64_t deadline = start_us + timeout_ms * 1000LL;
     uint8_t rx_byte;
 
     while (s_pending_query != QUERY_NONE) {
@@ -520,6 +545,14 @@ static bool send_query(const char *gcode, query_type_t qtype)
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
             s_line_buf[s_line_len++] = (char)rx_byte;
         }
+    }
+
+    /* Record response time for adaptive timeout during host printing */
+    if (s_host_printing) {
+        int64_t elapsed = esp_timer_get_time() - start_us;
+        s_resp_times_us[s_resp_time_idx] = elapsed;
+        s_resp_time_idx = (s_resp_time_idx + 1) % RESP_TIME_HISTORY;
+        if (s_resp_time_count < RESP_TIME_HISTORY) s_resp_time_count++;
     }
 
     return true;
@@ -759,6 +792,10 @@ static void host_print_start_internal(const char *filename)
     s_host_line_truncated = false;
     strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
     s_host_filename[sizeof(s_host_filename) - 1] = '\0';
+
+    /* Reset adaptive timeout history */
+    s_resp_time_count = 0;
+    s_resp_time_idx = 0;
 
     /* Reset Marlin line numbering for reliable transmission */
     s_host_marlin_line = 0;
@@ -1362,6 +1399,10 @@ esp_err_t printer_comm_init(void)
     s_temp_history = heap_caps_calloc(TEMP_HISTORY_MAX, sizeof(temp_sample_t),
                                       MALLOC_CAP_SPIRAM);
     if (!s_temp_history) return ESP_ERR_NO_MEM;
+
+    s_resp_times_us = heap_caps_calloc(RESP_TIME_HISTORY, sizeof(int64_t),
+                                        MALLOC_CAP_SPIRAM);
+    if (!s_resp_times_us) return ESP_ERR_NO_MEM;
 
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
