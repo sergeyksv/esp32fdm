@@ -562,7 +562,9 @@ static bool send_query(const char *gcode, query_type_t qtype)
 
     /* Wait for "ok" or timeout, processing lines as they arrive. */
     bool wait = is_wait_cmd(gcode);
-    int timeout_ms = s_host_printing ? adaptive_timeout_ms() : CMD_RESPONSE_TIMEOUT_MS;
+    /* Wait commands (M109, M190, G28, G29) can take minutes — always use the
+     * full timeout so the short adaptive timeout doesn't trigger a poke. */
+    int timeout_ms = (s_host_printing && !wait) ? adaptive_timeout_ms() : CMD_RESPONSE_TIMEOUT_MS;
     int64_t start_us = esp_timer_get_time();
     int64_t deadline = start_us + timeout_ms * 1000LL;
     uint8_t rx_byte;
@@ -595,6 +597,11 @@ static bool send_query(const char *gcode, query_type_t qtype)
                     if (wait) {
                         s_pending_query = qtype;
                     }
+                    deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
+                }
+                /* Wait commands: printer sends temp reports ("T:... W:N") while
+                 * waiting — extend deadline on any received line, not just "busy". */
+                else if (wait && s_pending_query != QUERY_NONE) {
                     deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
                 }
             }
