@@ -29,7 +29,7 @@ esp_err_t sdcard_init(void)
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1;
@@ -76,3 +76,4 @@ int32_t sdcard_get_free_kb(void)
     uint64_t free_bytes = (uint64_t)fre_clust * fs->csize * 512;
     return (int32_t)(free_bytes / 1024);
 }
+

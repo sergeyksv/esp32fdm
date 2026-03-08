@@ -778,6 +778,361 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
              out->layer_height, out->first_layer_height);
 }
 
+/* ---- Public file info scan (head + tail for speed) ---- */
+
+void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->total_layers = -1;
+    out->est_time_s = -1;
+    out->filament_used_mm = -1;
+    out->filament_used_g = -1;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    /* Get file size for tail scanning */
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+
+    char buf[256];
+    int32_t max_layer = -1;
+    int32_t layer_change_count = 0;
+    float first_z = 0, prev_z = 0;
+    bool seen_z = false;
+
+    /* Thumbnail state */
+    bool in_thumbnail = false;
+    int best_thumb_pixels = 0;
+    int cur_thumb_w = 0, cur_thumb_h = 0;
+    size_t thumb_alloc = 0, thumb_len = 0;
+    char *thumb_buf = NULL;       /* accumulates current thumbnail */
+    char *best_thumb = NULL;      /* best (largest) thumbnail found */
+    int best_thumb_w = 0, best_thumb_h = 0;
+    #define MAX_THUMB_DECODED 40960  /* 40KB cap */
+
+    /* Parse a block of lines for metadata */
+    #define PARSE_LINE() do { \
+        if (buf[0] == ';') { \
+            /* Layer height */ \
+            const char *lh = strstr(buf, "layer_height"); \
+            if (lh) { \
+                const char *eq = strchr(lh, '='); \
+                if (eq) { \
+                    float v = strtof(eq + 1, NULL); \
+                    if (v > 0.01f && v < 1.0f) { \
+                        if (strstr(buf, "first_layer_height")) \
+                            out->first_layer_height = v; \
+                        else \
+                            out->layer_height = v; \
+                    } \
+                } \
+            } \
+            /* Cura: ;Layer height: 0.2 */ \
+            const char *clh = strstr(buf, ";Layer height:"); \
+            if (clh) { \
+                float v = strtof(clh + 14, NULL); \
+                if (v > 0.01f && v < 1.0f) out->layer_height = v; \
+            } \
+            /* ;LAYER:N */ \
+            if (strncmp(buf, ";LAYER:", 7) == 0) { \
+                int32_t n = atoi(buf + 7); \
+                if (n > max_layer) max_layer = n; \
+            } \
+            if (strncmp(buf, ";LAYER_CHANGE", 13) == 0) \
+                layer_change_count++; \
+            /* Print time: PrusaSlicer/OrcaSlicer */ \
+            if (out->est_time_s < 0) { \
+                const char *etp = strstr(buf, "estimated printing time"); \
+                if (etp) { \
+                    const char *eq = strchr(etp, '='); \
+                    if (eq) { \
+                        eq++; \
+                        int h = 0, m = 0, s = 0; \
+                        const char *p = eq; \
+                        while (*p) { \
+                            if (*p >= '0' && *p <= '9') { \
+                                int val = atoi(p); \
+                                while (*p >= '0' && *p <= '9') p++; \
+                                if (*p == 'h') h = val; \
+                                else if (*p == 'm') m = val; \
+                                else if (*p == 's') s = val; \
+                            } \
+                            if (*p) p++; \
+                        } \
+                        out->est_time_s = h * 3600 + m * 60 + s; \
+                    } \
+                } \
+            } \
+            /* Print time: Cura ;TIME:5025 */ \
+            if (out->est_time_s < 0 && strncmp(buf, ";TIME:", 6) == 0) { \
+                int t = atoi(buf + 6); \
+                if (t > 0) out->est_time_s = t; \
+            } \
+            /* Filament: PrusaSlicer */ \
+            if (out->filament_used_mm < 0) { \
+                const char *fm = strstr(buf, "filament used [mm]"); \
+                if (fm) { \
+                    const char *eq = strchr(fm, '='); \
+                    if (eq) out->filament_used_mm = strtof(eq + 1, NULL); \
+                } \
+            } \
+            if (out->filament_used_g < 0) { \
+                const char *fg = strstr(buf, "filament used [g]"); \
+                if (fg) { \
+                    const char *eq = strchr(fg, '='); \
+                    if (eq) out->filament_used_g = strtof(eq + 1, NULL); \
+                } \
+            } \
+            /* Filament: Cura ;Filament used: 1.234m */ \
+            if (out->filament_used_mm < 0) { \
+                const char *fc = strstr(buf, ";Filament used:"); \
+                if (fc) { \
+                    float v = strtof(fc + 15, NULL); \
+                    if (v > 0) out->filament_used_mm = v * 1000.0f; \
+                } \
+            } \
+            /* Thumbnail parsing */ \
+            if (strstr(buf, "; thumbnail begin")) { \
+                int tw = 0, th = 0, tsz = 0; \
+                if (sscanf(buf, "; thumbnail begin %dx%d %d", &tw, &th, &tsz) >= 2) { \
+                    in_thumbnail = true; \
+                    cur_thumb_w = tw; \
+                    cur_thumb_h = th; \
+                    /* Estimate base64 size (4/3 * decoded + padding) */ \
+                    size_t est = (tsz > 0 ? (size_t)(tsz * 4 / 3 + 100) : 8192); \
+                    if (est > MAX_THUMB_DECODED * 4 / 3 + 100) est = MAX_THUMB_DECODED * 4 / 3 + 100; \
+                    free(thumb_buf); \
+                    thumb_buf = malloc(est + 1); \
+                    thumb_alloc = thumb_buf ? est : 0; \
+                    thumb_len = 0; \
+                } \
+            } else if (in_thumbnail && strstr(buf, "; thumbnail end")) { \
+                in_thumbnail = false; \
+                if (thumb_buf && thumb_len > 0) { \
+                    int pixels = cur_thumb_w * cur_thumb_h; \
+                    if (pixels > best_thumb_pixels) { \
+                        best_thumb_pixels = pixels; \
+                        free(best_thumb); \
+                        thumb_buf[thumb_len] = '\0'; \
+                        best_thumb = thumb_buf; \
+                        thumb_buf = NULL; \
+                        best_thumb_w = cur_thumb_w; \
+                        best_thumb_h = cur_thumb_h; \
+                    } else { \
+                        free(thumb_buf); \
+                        thumb_buf = NULL; \
+                    } \
+                } \
+            } else if (in_thumbnail && thumb_buf) { \
+                /* Strip "; " prefix and append base64 data */ \
+                const char *data = buf; \
+                if (data[0] == ';' && data[1] == ' ') data += 2; \
+                else if (data[0] == ';') data += 1; \
+                size_t dlen = strlen(data); \
+                /* Trim trailing whitespace */ \
+                while (dlen > 0 && (data[dlen-1] == '\n' || data[dlen-1] == '\r' || data[dlen-1] == ' ')) \
+                    dlen--; \
+                if (thumb_len + dlen < thumb_alloc) { \
+                    memcpy(thumb_buf + thumb_len, data, dlen); \
+                    thumb_len += dlen; \
+                } \
+            } \
+        } else if (buf[0] == 'G' && (buf[1] == '0' || buf[1] == '1') && buf[2] == ' ') { \
+            const char *zp = strstr(buf, "Z"); \
+            if (zp && (zp == buf + 3 || *(zp - 1) == ' ')) { \
+                float z = strtof(zp + 1, NULL); \
+                if (z > 0.01f) { \
+                    if (!seen_z) { first_z = z; seen_z = true; } \
+                    if (z > out->max_z) out->max_z = z; \
+                    prev_z = z; \
+                } \
+            } \
+        } \
+    } while(0)
+
+    /* Scan head: first 500 lines for metadata, thumbnails, time, filament */
+    int head_lines = 0;
+    while (head_lines < 500 && fgets(buf, sizeof(buf), f)) {
+        head_lines++;
+        PARSE_LINE();
+    }
+
+    long middle_start = ftell(f);
+
+    /* Scan tail: last ~32KB for slicer summary comments (time, filament, etc.) */
+    if (file_size > 32768) {
+        long tail_offset = file_size - 32768;
+        if (tail_offset > middle_start) {
+            fseek(f, tail_offset, SEEK_SET);
+            fgets(buf, sizeof(buf), f);  /* skip partial line */
+            while (fgets(buf, sizeof(buf), f)) {
+                PARSE_LINE();
+            }
+        } else {
+            /* File small enough that head+tail overlap, scan remainder */
+            while (fgets(buf, sizeof(buf), f)) {
+                PARSE_LINE();
+            }
+        }
+    } else {
+        while (fgets(buf, sizeof(buf), f)) {
+            PARSE_LINE();
+        }
+    }
+
+    #undef PARSE_LINE
+    #undef MAX_THUMB_DECODED
+
+    free(thumb_buf);
+
+    /* Fast bulk scan of the middle section for layers and Z moves only.
+     * Uses large fread() chunks instead of per-line fgets() for SD card speed. */
+    long tail_start = (file_size > 32768) ? (file_size - 32768) : file_size;
+    if (middle_start < tail_start) {
+        fseek(f, middle_start, SEEK_SET);
+        /* Use internal DMA-capable RAM — SDMMC DMA on ESP32-S3 can't access PSRAM,
+         * falls back to 512-byte bounce buffer per sector if buffer is in PSRAM */
+        #define SCAN_BUF_SIZE 4096
+        char *sbuf = heap_caps_malloc(SCAN_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!sbuf) sbuf = malloc(SCAN_BUF_SIZE);  /* PSRAM fallback */
+        if (sbuf) {
+            long bytes_left = tail_start - middle_start;
+            /* Carry-over: partial line from end of previous chunk */
+            char carry[128];
+            int carry_len = 0;
+
+            while (bytes_left > 0) {
+                int to_read = bytes_left < SCAN_BUF_SIZE ? (int)bytes_left : SCAN_BUF_SIZE;
+                int got = fread(sbuf, 1, to_read, f);
+                if (got <= 0) break;
+                bytes_left -= got;
+
+                char *p = sbuf;
+                char *end = sbuf + got;
+
+                /* If we have carry-over, find end of that line first */
+                if (carry_len > 0) {
+                    char *nl = memchr(p, '\n', end - p);
+                    int copy = nl ? (int)(nl - p) : (int)(end - p);
+                    if (carry_len + copy < (int)sizeof(carry) - 1) {
+                        memcpy(carry + carry_len, p, copy);
+                        carry_len += copy;
+                    }
+                    if (nl) {
+                        carry[carry_len] = '\0';
+                        /* Process carried-over line */
+                        if (carry[0] == ';') {
+                            if (strncmp(carry, ";LAYER:", 7) == 0) {
+                                int32_t n = atoi(carry + 7);
+                                if (n > max_layer) max_layer = n;
+                            } else if (strncmp(carry, ";LAYER_CHANGE", 13) == 0) {
+                                layer_change_count++;
+                            }
+                        } else if (carry[0] == 'G' && (carry[1] == '0' || carry[1] == '1') && carry[2] == ' ') {
+                            const char *zp = strstr(carry, "Z");
+                            if (zp && (zp == carry + 3 || *(zp - 1) == ' ')) {
+                                float z = strtof(zp + 1, NULL);
+                                if (z > 0.01f) {
+                                    if (!seen_z) { first_z = z; seen_z = true; }
+                                    if (z > out->max_z) out->max_z = z;
+                                    prev_z = z;
+                                }
+                            }
+                        }
+                        p = nl + 1;
+                        carry_len = 0;
+                    } else {
+                        /* Entire chunk was part of one long line, skip it */
+                        carry_len = 0;
+                        continue;
+                    }
+                }
+
+                /* Process complete lines within this chunk */
+                while (p < end) {
+                    char *nl = memchr(p, '\n', end - p);
+                    if (!nl) {
+                        /* Save partial line as carry-over */
+                        int rem = (int)(end - p);
+                        if (rem < (int)sizeof(carry)) {
+                            memcpy(carry, p, rem);
+                            carry_len = rem;
+                        }
+                        break;
+                    }
+
+                    /* Quick first-char filter — skip lines that can't match */
+                    if (*p == ';') {
+                        if (nl - p >= 7 && strncmp(p, ";LAYER:", 7) == 0) {
+                            int32_t n = atoi(p + 7);
+                            if (n > max_layer) max_layer = n;
+                        } else if (nl - p >= 13 && strncmp(p, ";LAYER_CHANGE", 13) == 0) {
+                            layer_change_count++;
+                        }
+                    } else if (*p == 'G' && nl - p > 3 && (p[1] == '0' || p[1] == '1') && p[2] == ' ') {
+                        /* Look for Z parameter — scan for ' Z' or 'G0 Z'/'G1 Z' */
+                        const char *zp = p + 3;
+                        while (zp < nl - 1) {
+                            if (*zp == 'Z' && (zp == p + 3 || *(zp - 1) == ' ')) {
+                                float z = strtof(zp + 1, NULL);
+                                if (z > 0.01f) {
+                                    if (!seen_z) { first_z = z; seen_z = true; }
+                                    if (z > out->max_z) out->max_z = z;
+                                    prev_z = z;
+                                }
+                                break;
+                            }
+                            zp++;
+                        }
+                    }
+
+                    p = nl + 1;
+                }
+
+                taskYIELD();  /* Let other tasks run between chunks */
+            }
+            free(sbuf);
+        }
+        #undef SCAN_BUF_SIZE
+    }
+
+    fclose(f);
+
+    /* Derive layers */
+    if (max_layer >= 0)
+        out->total_layers = max_layer + 1;
+    else if (layer_change_count > 0)
+        out->total_layers = layer_change_count;
+
+    if (out->first_layer_height == 0 && first_z > 0)
+        out->first_layer_height = first_z;
+
+    if (out->layer_height == 0 && out->total_layers > 1 && out->max_z > 0) {
+        float flh = out->first_layer_height > 0 ? out->first_layer_height : first_z;
+        out->layer_height = (out->max_z - flh) / (float)(out->total_layers - 1);
+    }
+
+    if (out->total_layers <= 0 && out->max_z > 0 && out->layer_height > 0) {
+        float flh = out->first_layer_height > 0 ? out->first_layer_height : out->layer_height;
+        out->total_layers = 1 + (int32_t)((out->max_z - flh) / out->layer_height + 0.5f);
+    }
+
+    /* Assign thumbnail */
+    if (best_thumb) {
+        out->thumbnail_base64 = best_thumb;
+        out->thumb_w = best_thumb_w;
+        out->thumb_h = best_thumb_h;
+    }
+
+    (void)prev_z;
+    ESP_LOGI(TAG, "File info: layers=%ld, maxZ=%.2f, time=%lds, fil=%.0fmm/%.1fg, thumb=%dx%d",
+             (long)out->total_layers, out->max_z, (long)out->est_time_s,
+             out->filament_used_mm, out->filament_used_g,
+             out->thumb_w, out->thumb_h);
+}
+
 /** Query current position and save it, then park the head */
 static void host_print_park(void)
 {

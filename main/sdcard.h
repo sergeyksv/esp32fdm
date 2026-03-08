@@ -25,6 +25,7 @@ bool sdcard_is_mounted(void);
  */
 int32_t sdcard_get_free_kb(void);
 
+
 #ifdef __cplusplus
 }
 #endif

@@ -883,8 +883,8 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 32;
-    config.max_open_sockets = 10;
+    config.max_uri_handlers = 40;
+    config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
