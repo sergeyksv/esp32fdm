@@ -45,6 +45,17 @@ esp_err_t obico_register_httpd(void *server_handle);
 void obico_render_settings(html_buf_t *p);
 
 /**
+ * Get current Obico server URL.
+ */
+const char *obico_get_server_url(void);
+
+/**
+ * Set Obico server URL. Saves to NVS.
+ * Only takes effect on next link or WS reconnect.
+ */
+esp_err_t obico_set_server_url(const char *url);
+
+/**
  * Get current Janus proxy host (empty string if not configured).
  */
 const char *obico_get_janus_host(void);

@@ -34,10 +34,15 @@ static const char *TAG = "obico";
 #define NVS_KEY_TOKEN "auth_token"
 #define NVS_KEY_JANUS_HOST "janus_host"
 #define NVS_KEY_JANUS_PORT "janus_port"
+#define NVS_KEY_SERVER_URL "server_url"
 #define TOKEN_MAX_LEN 128
+#define SERVER_URL_MAX_LEN 128
 
 static char s_auth_token[TOKEN_MAX_LEN];
 static bool s_linked = false;
+
+/* ---- Server URL runtime config ---- */
+static char s_server_url[SERVER_URL_MAX_LEN];
 
 /* ---- Janus proxy runtime config ---- */
 static char s_janus_host[64];
@@ -151,6 +156,21 @@ static void load_janus_config_from_nvs(void)
     nvs_close(nvs);
 }
 
+static void load_server_url_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        strncpy(s_server_url, CONFIG_OBICO_SERVER_URL, sizeof(s_server_url) - 1);
+        return;
+    }
+
+    size_t len = sizeof(s_server_url);
+    if (nvs_get_str(nvs, NVS_KEY_SERVER_URL, s_server_url, &len) != ESP_OK) {
+        strncpy(s_server_url, CONFIG_OBICO_SERVER_URL, sizeof(s_server_url) - 1);
+    }
+    nvs_close(nvs);
+}
+
 /* ---- SNTP ---- */
 
 static void init_sntp(void)
@@ -187,7 +207,7 @@ esp_err_t obico_link_with_code(const char *code)
 {
     char url[256];
     snprintf(url, sizeof(url), "%s/api/v1/octo/verify/?code=%s",
-             CONFIG_OBICO_SERVER_URL, code);
+             s_server_url, code);
 
     esp_http_client_config_t config = {
         .url = url,
@@ -631,7 +651,7 @@ static void obico_ws_task(void *arg)
         /* Build WebSocket URL */
         char ws_url[256];
         /* Convert https:// to wss:// or http:// to ws:// */
-        const char *server = CONFIG_OBICO_SERVER_URL;
+        const char *server = s_server_url;
         if (strncmp(server, "https://", 8) == 0) {
             snprintf(ws_url, sizeof(ws_url), "wss://%s/ws/dev/", server + 8);
         } else if (strncmp(server, "http://", 7) == 0) {
@@ -726,7 +746,7 @@ static esp_err_t upload_snapshot(const uint8_t *jpeg_buf, size_t jpeg_len)
 {
     char url[256];
     snprintf(url, sizeof(url), "%s/api/v1/octo/pic/",
-             CONFIG_OBICO_SERVER_URL);
+             s_server_url);
 
     char auth_header[TOKEN_MAX_LEN + 20];
     snprintf(auth_header, sizeof(auth_header), "Token %s", s_auth_token);
@@ -862,15 +882,23 @@ void obico_render_settings(html_buf_t *p)
     if (s_linked) {
         html_buf_printf(p,
             "<form id='f-obico' method='POST' action='/obico/unlink'></form>"
-            "<p>Status: <span style='color:#4CAF50;font-weight:bold'>Linked</span></p>");
+            "<p>Status: <span style='color:#4CAF50;font-weight:bold'>Linked</span>"
+            " to %s</p>", s_server_url);
     } else {
         html_buf_printf(p,
             "<p>Status: <span style='color:#999'>Not linked</span></p>"
+            "<form id='f-obico-server' method='POST' action='/obico/server'>"
+            "<label>Server URL<br><input type='url' name='server_url' value='%s' "
+            "placeholder='https://app.obico.io' "
+            "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
+            "<button type='submit' style='margin:8px 0'>Save</button>"
+            "</form>"
             "<form id='f-obico' method='POST' action='/obico/link'>"
-            "<p>Enter the 6-digit code from <a href='https://app.obico.io' target='_blank'>Obico</a>:</p>"
+            "<p>Enter the 6-digit code from <a href='%s' target='_blank'>Obico</a>:</p>"
             "<input type='text' name='code' placeholder='123456' maxlength='6' pattern='[0-9]{6}' required "
             "style='padding:8px;width:100%%;box-sizing:border-box;margin:8px 0'>"
-            "</form>");
+            "</form>",
+            s_server_url, s_server_url);
     }
     html_buf_printf(p,
         "<p class='hint'><a href='/obico/status'>Status</a> | "
@@ -935,6 +963,49 @@ static esp_err_t obico_link_post_handler(httpd_req_t *req)
     return ret;
 }
 
+static esp_err_t obico_server_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recv_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[recv_len] = '\0';
+
+    char url[SERVER_URL_MAX_LEN] = {0};
+    const char *p = strstr(buf, "server_url=");
+    if (p) {
+        p += 11;
+        int i = 0;
+        while (*p && *p != '&' && i < (int)sizeof(url) - 1) {
+            if (*p == '%' && p[1] && p[2]) {
+                /* URL-decode %XX */
+                char hex[3] = { p[1], p[2], 0 };
+                url[i++] = (char)strtol(hex, NULL, 16);
+                p += 3;
+            } else if (*p == '+') {
+                url[i++] = ' ';
+                p++;
+            } else {
+                url[i++] = *p++;
+            }
+        }
+        url[i] = '\0';
+    }
+
+    if (strlen(url) == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing server_url");
+        return ESP_FAIL;
+    }
+
+    obico_set_server_url(url);
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t obico_unlink_handler(httpd_req_t *req)
 {
     obico_unlink();
@@ -951,7 +1022,7 @@ static esp_err_t obico_status_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "linked", s_linked);
-    cJSON_AddStringToObject(root, "server", CONFIG_OBICO_SERVER_URL);
+    cJSON_AddStringToObject(root, "server", s_server_url);
     cJSON_AddStringToObject(root, "printer_state", opstate_to_text(ps.opstate));
     cJSON_AddNumberToObject(root, "hotend", ps.hotend_actual);
     cJSON_AddNumberToObject(root, "bed", ps.bed_actual);
@@ -1009,6 +1080,13 @@ esp_err_t obico_register_httpd(void *server_handle)
         .handler  = obico_link_post_handler,
     };
     httpd_register_uri_handler(server, &link_post);
+
+    httpd_uri_t server_post = {
+        .uri      = "/obico/server",
+        .method   = HTTP_POST,
+        .handler  = obico_server_handler,
+    };
+    httpd_register_uri_handler(server, &server_post);
 
     httpd_uri_t unlink_post = {
         .uri      = "/obico/unlink",
@@ -1198,6 +1276,39 @@ static void janus_proxy_task(void *arg)
     }
 }
 
+/* ---- Public getter/setter for server URL ---- */
+
+const char *obico_get_server_url(void)
+{
+    return s_server_url;
+}
+
+esp_err_t obico_set_server_url(const char *url)
+{
+    if (!url || url[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    strncpy(s_server_url, url, sizeof(s_server_url) - 1);
+    s_server_url[sizeof(s_server_url) - 1] = '\0';
+
+    /* Strip trailing slash */
+    size_t len = strlen(s_server_url);
+    while (len > 0 && s_server_url[len - 1] == '/') {
+        s_server_url[--len] = '\0';
+    }
+
+    /* Save to NVS */
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    nvs_set_str(nvs, NVS_KEY_SERVER_URL, s_server_url);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "Obico server URL updated: %s", s_server_url);
+    return ESP_OK;
+}
+
 /* ---- Public getters/setters for Janus config ---- */
 
 const char *obico_get_janus_host(void)
@@ -1258,6 +1369,9 @@ esp_err_t obico_client_init(void)
 {
     /* Initialize SNTP for timestamps */
     init_sntp();
+
+    /* Load server URL from NVS (or Kconfig default) */
+    load_server_url_from_nvs();
 
     /* Load Janus proxy config from NVS (or Kconfig defaults) */
     load_janus_config_from_nvs();
