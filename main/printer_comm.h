@@ -190,6 +190,13 @@ esp_err_t printer_comm_host_print_cancel(void);
  */
 bool printer_comm_is_host_printing(void);
 
+/**
+ * Suppress automatic polling (M105/M27/M114/M119).
+ * Used by terminal manual mode to avoid response clutter.
+ */
+void printer_comm_set_polling_suppressed(bool suppress);
+bool printer_comm_is_polling_suppressed(void);
+
 #ifdef __cplusplus
 }
 #endif

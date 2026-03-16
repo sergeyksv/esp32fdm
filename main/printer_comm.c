@@ -94,6 +94,9 @@ typedef enum {
 
 static query_type_t s_pending_query;
 
+/* Polling suppression (terminal manual mode) */
+static bool s_polling_suppressed;
+
 /* Timestamps for polling intervals */
 static int64_t s_last_m105_us;
 static int64_t s_last_m27_us;
@@ -127,6 +130,7 @@ static int64_t s_host_start_us, s_host_pause_elapsed_us;
 static char s_host_filename[64];
 static char s_host_pending_line[128]; /* line read but not yet sent */
 static bool s_host_has_pending;
+static int  s_host_pending_retries;  /* consecutive timeouts on pending line */
 static bool s_host_line_truncated;    /* true when fgets didn't reach newline (long line split) */
 static float s_park_x, s_park_y, s_park_z; /* saved position before park */
 
@@ -137,13 +141,10 @@ static char    s_host_numbered_line[160]; /* Formatted "Nxxx gcode*cs" for resen
 static int     s_host_resend_retries;
 #define HOST_RESEND_MAX_RETRIES 5
 
-/* Adaptive timeout: track response times for host print commands */
-#define RESP_TIME_HISTORY       16
-static int64_t *s_resp_times_us;   /* circular buffer in PSRAM, allocated at init */
-static int     s_resp_time_idx;    /* next write index */
-static int     s_resp_time_count;  /* valid entries (up to RESP_TIME_HISTORY) */
-#define ADAPTIVE_TIMEOUT_MIN_MS   500   /* floor: never poke faster than this */
-#define ADAPTIVE_TIMEOUT_MULT     2.0f  /* multiplier on average response time */
+/* Host print command timeout: how long to wait for "ok" before poking.
+ * 1200ms covers planner-full delays (~1000ms) while still catching
+ * genuine CDC stalls (G92 E0) within a reasonable time. */
+#define HOST_CMD_TIMEOUT_MS       1200
 
 /* Park position and retract settings */
 #define PARK_X       0.0f
@@ -495,26 +496,10 @@ static void drain_rx(void)
     }
 }
 
-/** Compute adaptive timeout in ms based on recent response times.
- *  Returns CMD_RESPONSE_TIMEOUT_MS if no history yet. */
-static int adaptive_timeout_ms(void)
-{
-    if (s_resp_time_count == 0) return CMD_RESPONSE_TIMEOUT_MS;
-    int n = (s_resp_time_count < RESP_TIME_HISTORY) ? s_resp_time_count : RESP_TIME_HISTORY;
-    int64_t sum = 0;
-    for (int i = 0; i < n; i++) sum += s_resp_times_us[i];
-    int avg_ms = (int)(sum / n / 1000);
-    int timeout = (int)(avg_ms * ADAPTIVE_TIMEOUT_MULT);
-    if (timeout < ADAPTIVE_TIMEOUT_MIN_MS) timeout = ADAPTIVE_TIMEOUT_MIN_MS;
-    if (timeout > CMD_RESPONSE_TIMEOUT_MS) timeout = CMD_RESPONSE_TIMEOUT_MS;
-    return timeout;
-}
-
 /** Check if a GCode line is a long-running command that blocks until done.
  *  M109=wait hotend, M190=wait bed, M116=wait all temps,
  *  G28=homing, G29=bed leveling.
- *  These need a long timeout, shouldn't trigger poke, and shouldn't
- *  pollute the adaptive timeout moving average. */
+ *  These need the full timeout and shouldn't trigger a poke. */
 static bool is_wait_cmd(const char *gcode)
 {
     /* Skip line number prefix "N123 " */
@@ -562,9 +547,9 @@ static bool send_query(const char *gcode, query_type_t qtype)
 
     /* Wait for "ok" or timeout, processing lines as they arrive. */
     bool wait = is_wait_cmd(gcode);
-    /* Wait commands (M109, M190, G28, G29) can take minutes — always use the
-     * full timeout so the short adaptive timeout doesn't trigger a poke. */
-    int timeout_ms = (s_host_printing && !wait) ? adaptive_timeout_ms() : CMD_RESPONSE_TIMEOUT_MS;
+    /* Host printing uses shorter timeout to detect CDC stalls quickly.
+     * Wait commands (M109, M190, G28, G29) and non-host queries use full timeout. */
+    int timeout_ms = (s_host_printing && !wait) ? HOST_CMD_TIMEOUT_MS : CMD_RESPONSE_TIMEOUT_MS;
     int64_t start_us = esp_timer_get_time();
     int64_t deadline = start_us + timeout_ms * 1000LL;
     uint8_t rx_byte;
@@ -608,15 +593,6 @@ static bool send_query(const char *gcode, query_type_t qtype)
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
             s_line_buf[s_line_len++] = (char)rx_byte;
         }
-    }
-
-    /* Record response time for adaptive timeout during host printing.
-     * Skip wait commands — their minutes-long response would poison the average. */
-    if (s_host_printing && !wait) {
-        int64_t elapsed = esp_timer_get_time() - start_us;
-        s_resp_times_us[s_resp_time_idx] = elapsed;
-        s_resp_time_idx = (s_resp_time_idx + 1) % RESP_TIME_HISTORY;
-        if (s_resp_time_count < RESP_TIME_HISTORY) s_resp_time_count++;
     }
 
     return true;
@@ -1216,13 +1192,10 @@ static void host_print_start_internal(const char *filename)
     s_host_start_us = esp_timer_get_time();
     s_host_pause_elapsed_us = 0;
     s_host_has_pending = false;
+    s_host_pending_retries = 0;
     s_host_line_truncated = false;
     strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
     s_host_filename[sizeof(s_host_filename) - 1] = '\0';
-
-    /* Reset adaptive timeout history */
-    s_resp_time_count = 0;
-    s_resp_time_idx = 0;
 
     /* Reset Marlin line numbering for reliable transmission */
     s_host_marlin_line = 0;
@@ -1318,7 +1291,11 @@ static void printer_comm_task(void *arg)
         /* Wait for USB device to connect */
         if (!usb_serial_is_connected()) {
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-            s_state.opstate = PRINTER_DISCONNECTED;
+            /* Preserve printing/paused state during USB disconnect so UI
+             * keeps showing print status — host print will resume on reconnect */
+            if (!s_host_printing) {
+                s_state.opstate = PRINTER_DISCONNECTED;
+            }
             xSemaphoreGive(s_state_mutex);
             s_m290_queried = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1532,9 +1509,7 @@ static void printer_comm_task(void *arg)
                     }
                 }
 
-                /* Send to printer with line numbering & checksum.
-                 * If timeout, poke with M105 to flush stuck USB CDC
-                 * on printer side, then retry once */
+                /* Send to printer with line numbering & checksum. */
                 if (!send_query_numbered(line)) {
                     if (esp_timer_get_time() < s_cmd_cooldown_until_us) {
                         /* Printer said "busy: processing" — don't poke, just defer */
@@ -1542,19 +1517,29 @@ static void printer_comm_task(void *arg)
                         s_host_has_pending = true;
                         break;
                     }
-                    /* Poke: M105 generates USB activity that can unstick
-                     * STM32 CDC TX (same effect as touching LCD encoder) */
-                    ESP_LOGW(TAG, "Poking printer with M105 after timeout");
-                    send_query("M105", QUERY_M105);
-                    s_last_m105_us = esp_timer_get_time();
-
-                    /* Retry the original command */
-                    if (!send_query_numbered(line)) {
+                    /* G92 specifically stalls STM32 CDC TX on MKS/Marlin.
+                     * For other commands, retry once before poking — the first
+                     * timeout may just be a planner-full delay.
+                     * Poke: M105 generates USB activity that unsticks CDC TX.
+                     * The poke's send_query drains RX and picks up the original
+                     * command's "ok", so Marlin already has our line — just
+                     * advance the line counter, don't retry. */
+                    if (strncmp(line, "G92 ", 4) == 0 || s_host_pending_retries > 0) {
+                        ESP_LOGW(TAG, "Poking printer with M105 after timeout (%s)",
+                                 s_host_pending_retries > 0 ? "retry" : "G92");
+                        send_query("M105", QUERY_M105);
+                        s_last_m105_us = esp_timer_get_time();
+                        s_host_marlin_line++;
+                        s_host_pending_retries = 0;
+                    } else {
+                        /* First timeout on non-G92: defer and retry */
+                        s_host_pending_retries++;
                         strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
                         s_host_has_pending = true;
                         break;
                     }
                 }
+                s_host_pending_retries = 0;
                 s_host_lines_sent++;
                 lines_this_batch++;
 
@@ -1588,6 +1573,9 @@ static void printer_comm_task(void *arg)
         do { if (esp_timer_get_time() < s_cmd_cooldown_until_us) goto poll_done; } while(0)
 
         CHECK_COOLDOWN();
+
+        /* Skip all polling when suppressed (terminal manual mode) */
+        if (s_polling_suppressed) goto poll_done;
 
         /* During active host printing, only poll M105 at reduced frequency
          * (for Obico temp display). Also poll M119 for filament sensor.
@@ -1849,10 +1837,6 @@ esp_err_t printer_comm_init(void)
                                       MALLOC_CAP_SPIRAM);
     if (!s_temp_history) return ESP_ERR_NO_MEM;
 
-    s_resp_times_us = heap_caps_calloc(RESP_TIME_HISTORY, sizeof(int64_t),
-                                        MALLOC_CAP_SPIRAM);
-    if (!s_resp_times_us) return ESP_ERR_NO_MEM;
-
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
 
@@ -1927,6 +1911,16 @@ esp_err_t printer_comm_host_print_cancel(void)
 bool printer_comm_is_host_printing(void)
 {
     return s_host_printing;
+}
+
+void printer_comm_set_polling_suppressed(bool suppress)
+{
+    s_polling_suppressed = suppress;
+}
+
+bool printer_comm_is_polling_suppressed(void)
+{
+    return s_polling_suppressed;
 }
 
 /* ---- Backend getters ---- */

@@ -105,6 +105,8 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
         "<input id='inp' type='text' placeholder='GCode command (e.g. M105)'"
         " style='flex:1;padding:8px;font-family:monospace;font-size:14px' autocomplete='off'>"
         "<button type='submit' style='padding:8px 20px'>Send</button>"
+        "<button type='button' id='pbtn' onclick='togglePoll()'"
+        " style='padding:8px 12px;white-space:nowrap'>Pause Polling</button>"
         "</form>");
 
     html_buf_printf(&p,
@@ -113,7 +115,8 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
         "inp=document.getElementById('inp'),"
         "frm=document.getElementById('frm'),"
         "lck=document.getElementById('lock'),"
-        "seq=0,locked=false;"
+        "pbtn=document.getElementById('pbtn'),"
+        "seq=0,locked=false,pollOff=false;"
 
         "function poll(){"
         "fetch('/terminal/poll?seq='+seq).then(function(r){return r.json()}).then(function(j){"
@@ -127,6 +130,14 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
         "inp.disabled=locked;lck.style.display=locked?'':'none'"
         "}).catch(function(){})}"
 
+        "function togglePoll(){"
+        "pollOff=!pollOff;"
+        "fetch('/terminal/polling',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+        "body:'suppress='+(pollOff?'1':'0')});"
+        "pbtn.textContent=pollOff?'Resume Polling':'Pause Polling';"
+        "pbtn.style.background=pollOff?'#e65100':'';"
+        "pbtn.style.color=pollOff?'#fff':''}"
+
         "function send(){"
         "if(locked)return false;"
         "var c=inp.value.trim();if(!c)return false;"
@@ -138,6 +149,8 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
         "poll();setInterval(poll,500);"
         "chk();setInterval(chk,3000);"
         "inp.focus();"
+        "window.addEventListener('beforeunload',function(){"
+        "if(pollOff)navigator.sendBeacon('/terminal/polling','suppress=0')});"
         "</script>");
 
     layout_html_end(&p);
@@ -274,6 +287,26 @@ static esp_err_t terminal_poll_handler(httpd_req_t *req)
     return ret;
 }
 
+static esp_err_t terminal_polling_handler(httpd_req_t *req)
+{
+    char buf[32];
+    int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recv_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[recv_len] = '\0';
+
+    char val[4] = {0};
+    if (httpd_query_key_value(buf, "suppress", val, sizeof(val)) == ESP_OK) {
+        bool suppress = (val[0] == '1');
+        printer_comm_set_polling_suppressed(suppress);
+        ESP_LOGI(TAG, "Polling %s", suppress ? "suppressed" : "resumed");
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 /* ---- Registration ---- */
 
 esp_err_t terminal_register_httpd(httpd_handle_t server)
@@ -292,6 +325,11 @@ esp_err_t terminal_register_httpd(httpd_handle_t server)
         .uri = "/terminal/poll", .method = HTTP_GET, .handler = terminal_poll_handler,
     };
     httpd_register_uri_handler(server, &poll_uri);
+
+    httpd_uri_t polling_uri = {
+        .uri = "/terminal/polling", .method = HTTP_POST, .handler = terminal_polling_handler,
+    };
+    httpd_register_uri_handler(server, &polling_uri);
 
     ESP_LOGI(TAG, "Terminal endpoints registered");
     return ESP_OK;
