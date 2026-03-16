@@ -167,6 +167,10 @@ static void logs_task(void *arg)
         html_buf_printf(&page, "<b>[Heap]</b> ");
     else
         html_buf_printf(&page, "<a href='/logs?filter=heap'>Heap</a> ");
+    html_buf_printf(&page,
+        " | <form method='POST' action='/logs/clear' style='display:inline'>"
+        "<button type='submit' onclick=\"return confirm('Clear all logs?')\">"
+        "Clear</button></form>");
     html_buf_printf(&page, "</div>"
         "<pre style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
         "font-size:13px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;"
@@ -300,14 +304,37 @@ static esp_err_t logs_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- Clear handler ---- */
+
+static esp_err_t logs_clear_handler(httpd_req_t *req)
+{
+    if (s_mutex) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_head = 0;
+        s_count = 0;
+        xSemaphoreGive(s_mutex);
+    }
+    ESP_LOGI(TAG, "Log buffer cleared");
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/logs");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 /* ---- Registration ---- */
 
 esp_err_t logbuf_register_httpd(httpd_handle_t server)
 {
-    httpd_uri_t uri = {
+    httpd_uri_t uri_get = {
         .uri = "/logs", .method = HTTP_GET, .handler = logs_handler,
     };
-    httpd_register_uri_handler(server, &uri);
+    httpd_register_uri_handler(server, &uri_get);
+
+    httpd_uri_t uri_clear = {
+        .uri = "/logs/clear", .method = HTTP_POST, .handler = logs_clear_handler,
+    };
+    httpd_register_uri_handler(server, &uri_clear);
+
     ESP_LOGI(TAG, "Log viewer registered at /logs");
     return ESP_OK;
 }
