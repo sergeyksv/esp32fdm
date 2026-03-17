@@ -22,6 +22,7 @@
 
 #include "obico_client.h"
 #include "terminal.h"
+#include "url_util.h"
 #include "logbuf.h"
 
 static const char *TAG = "httpd";
@@ -381,16 +382,16 @@ static esp_err_t root_handler(httpd_req_t *req)
     html_buf_printf(&p,
         "<details class='ctrl'><summary>Z Offset (Baby Stepping)</summary><div class='cg'>"
         "<div class='bg'>"
-        "<button onclick=\"zb(-0.05)\">-0.05</button>"
-        "<button onclick=\"zb(-0.01)\">-0.01</button>"
+        "<button onclick=\"zb(-0.05)\">\xe2\x96\xbc 0.05</button>"
+        "<button onclick=\"zb(-0.01)\">\xe2\x96\xbc 0.01</button>"
         "<span class='val' id='zof'>%.2f</span>",
         s_baby_z);
     html_buf_printf(&p,
-        "<button onclick=\"zb(0.01)\">+0.01</button>"
-        "<button onclick=\"zb(0.05)\">+0.05</button>"
+        "<button onclick=\"zb(0.01)\">\xe2\x96\xb2 0.01</button>"
+        "<button onclick=\"zb(0.05)\">\xe2\x96\xb2 0.05</button>"
         "<button onclick=\"gc('M500')\" style='margin-left:8px' title='Save all settings to EEPROM (M500)'>Save</button>"
         "</div>"
-        "<p class='hint' style='margin:4px 0 0'>Session offset shown. Save persists Z offset (and all settings) to EEPROM.</p>"
+        "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc closer to bed &middot; \xe2\x96\xb2 farther from bed &middot; Save writes to EEPROM (M500)</p>"
         "</div></details>");
 
     html_buf_printf(&p,
@@ -726,24 +727,6 @@ static esp_err_t wifi_reset_handler(httpd_req_t *req)
 
 /* ---- Captive portal helpers ---- */
 
-static void url_decode(char *dst, const char *src, size_t dst_size)
-{
-    size_t di = 0;
-    while (*src && di < dst_size - 1) {
-        if (*src == '%' && src[1] && src[2]) {
-            char hex[3] = {src[1], src[2], '\0'};
-            dst[di++] = (char)strtol(hex, NULL, 16);
-            src += 3;
-        } else if (*src == '+') {
-            dst[di++] = ' ';
-            src++;
-        } else {
-            dst[di++] = *src++;
-        }
-    }
-    dst[di] = '\0';
-}
-
 static bool parse_form_field(const char *body, const char *name,
                              char *out, size_t out_size)
 {
@@ -753,16 +736,7 @@ static bool parse_form_field(const char *body, const char *name,
     if (!start) return false;
     start += strlen(key);
 
-    const char *end = strchr(start, '&');
-    size_t len = end ? (size_t)(end - start) : strlen(start);
-    if (len >= out_size) len = out_size - 1;
-
-    char encoded[128];
-    if (len >= sizeof(encoded)) len = sizeof(encoded) - 1;
-    memcpy(encoded, start, len);
-    encoded[len] = '\0';
-
-    url_decode(out, encoded, out_size);
+    url_decode_field(start, out, out_size);
     return true;
 }
 

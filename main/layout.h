@@ -93,6 +93,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
 
     html_buf_printf(p,
         "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>%s</title>"
         "<style>"

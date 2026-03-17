@@ -3,6 +3,7 @@
 #include "camera.h"
 #include "printer_comm.h"
 #include "layout.h"
+#include "url_util.h"
 
 #include "cJSON.h"
 #include "esp_camera.h"
@@ -976,22 +977,7 @@ static esp_err_t obico_server_handler(httpd_req_t *req)
     char url[SERVER_URL_MAX_LEN] = {0};
     const char *p = strstr(buf, "server_url=");
     if (p) {
-        p += 11;
-        int i = 0;
-        while (*p && *p != '&' && i < (int)sizeof(url) - 1) {
-            if (*p == '%' && p[1] && p[2]) {
-                /* URL-decode %XX */
-                char hex[3] = { p[1], p[2], 0 };
-                url[i++] = (char)strtol(hex, NULL, 16);
-                p += 3;
-            } else if (*p == '+') {
-                url[i++] = ' ';
-                p++;
-            } else {
-                url[i++] = *p++;
-            }
-        }
-        url[i] = '\0';
+        url_decode_field(p + 11, url, sizeof(url));
     }
 
     if (strlen(url) == 0) {

@@ -8,6 +8,7 @@
 #include "esp_heap_caps.h"
 #include "printer_comm.h"
 #include "layout.h"
+#include "url_util.h"
 
 static const char *TAG = "terminal";
 
@@ -41,15 +42,39 @@ static void ring_write(const char *data, size_t len)
 void terminal_feed_rx(const uint8_t *data, size_t len)
 {
     if (len == 0 || !s_mutex) return;
-    ring_write((const char *)data, len);
+    /* Non-blocking: called from USB Host callback context —
+     * blocking here stalls ALL USB transfers until the mutex
+     * is released.  If the mutex is held (HTTP reading terminal),
+     * just drop these bytes rather than stalling USB. */
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return;
+    for (size_t i = 0; i < len; i++) {
+        s_ring[s_ring_head] = (char)data[i];
+        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
+    }
+    s_seq += len;
+    xSemaphoreGive(s_mutex);
 }
 
 void terminal_feed_tx(const char *cmd)
 {
     if (!cmd || !s_mutex) return;
-    ring_write("> ", 2);
-    ring_write(cmd, strlen(cmd));
-    ring_write("\n", 1);
+    /* Non-blocking — same reason as terminal_feed_rx: the caller
+     * (printer_comm task) must not stall on terminal I/O. */
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return;
+    const char *prefix = "> ";
+    for (int i = 0; prefix[i]; i++) {
+        s_ring[s_ring_head] = prefix[i];
+        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
+    }
+    size_t len = strlen(cmd);
+    for (size_t i = 0; i < len; i++) {
+        s_ring[s_ring_head] = cmd[i];
+        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
+    }
+    s_ring[s_ring_head] = '\n';
+    s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
+    s_seq += 2 + len + 1;
+    xSemaphoreGive(s_mutex);
 }
 
 /* ---- Send command ---- */
@@ -179,23 +204,8 @@ static esp_err_t terminal_send_handler(httpd_req_t *req)
     }
     cmd_start += 4;
 
-    /* URL-decode in place (simple: just handle + and %XX) */
     char cmd[96];
-    size_t ci = 0;
-    const char *s = cmd_start;
-    while (*s && *s != '&' && ci < sizeof(cmd) - 1) {
-        if (*s == '+') {
-            cmd[ci++] = ' ';
-            s++;
-        } else if (*s == '%' && s[1] && s[2]) {
-            char hex[3] = {s[1], s[2], '\0'};
-            cmd[ci++] = (char)strtol(hex, NULL, 16);
-            s += 3;
-        } else {
-            cmd[ci++] = *s++;
-        }
-    }
-    cmd[ci] = '\0';
+    url_decode_field(cmd_start, cmd, sizeof(cmd));
 
     if (cmd[0] == '\0') {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty command");

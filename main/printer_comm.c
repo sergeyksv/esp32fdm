@@ -3,6 +3,7 @@
 
 #include "usb_serial.h"
 #include "terminal.h"
+#include "url_util.h"
 
 #include "esp_http_client.h"
 #include "esp_http_server.h"
@@ -34,6 +35,7 @@ static const char *TAG = "printer_comm";
 #define POLL_M114_INTERVAL_MS           30000
 #define POLL_M119_INTERVAL_MS           30000   /* Filament sensor check during host print */
 #define CMD_RESPONSE_TIMEOUT_MS         6000
+#define WAIT_SILENT_TIMEOUT_MS          120000  /* G28/G29: no interim feedback, needs long timeout */
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
@@ -43,6 +45,7 @@ static const char *TAG = "printer_comm";
 #define NVS_KEY_MR_PORT         "mr_port"
 #define NVS_KEY_PAUSE_CMD       "pause_cmd"
 #define NVS_KEY_FILAMENT_CHK    "fil_chk"
+#define NVS_KEY_ECHO_PING       "echo_ping"
 
 /* ---- Backend config ---- */
 
@@ -56,6 +59,7 @@ static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
 static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
 static bool s_filament_check = false;  /* Poll M119 for filament runout during host print */
+static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
 
 /* ---- Temperature history circular buffer ---- */
 
@@ -128,9 +132,8 @@ static int32_t s_host_lines_sent, s_host_total_lines, s_host_layer;
 static bool s_host_has_layer_comments;  /* true if file has ;LAYER: comments */
 static int64_t s_host_start_us, s_host_pause_elapsed_us;
 static char s_host_filename[64];
-static char s_host_pending_line[128]; /* line read but not yet sent */
+static char s_host_pending_line[256]; /* line read but not yet sent */
 static bool s_host_has_pending;
-static int  s_host_pending_retries;  /* consecutive timeouts on pending line */
 static bool s_host_line_truncated;    /* true when fgets didn't reach newline (long line split) */
 static float s_park_x, s_park_y, s_park_z; /* saved position before park */
 
@@ -141,10 +144,10 @@ static char    s_host_numbered_line[160]; /* Formatted "Nxxx gcode*cs" for resen
 static int     s_host_resend_retries;
 #define HOST_RESEND_MAX_RETRIES 5
 
-/* Host print command timeout: how long to wait for "ok" before poking.
- * 1200ms covers planner-full delays (~1000ms) while still catching
- * genuine CDC stalls (G92 E0) within a reasonable time. */
-#define HOST_CMD_TIMEOUT_MS       1200
+/* Host print command timeout: must be longer than the M113 keepalive
+ * interval (2s) so Marlin has a chance to send "busy: processing"
+ * before we give up and retry. */
+#define HOST_CMD_TIMEOUT_MS       3000
 
 /* Park position and retract settings */
 #define PARK_X       0.0f
@@ -157,6 +160,38 @@ static int     s_host_resend_retries;
 #define PCMD_HOST_PAUSE  101
 #define PCMD_HOST_RESUME 102
 #define PCMD_HOST_CANCEL 103
+
+/** Check if a GCode command matches one of the echo-ping prefixes.
+ *  The gcode may be numbered ("N123 G92 E0*XX") — skip the N-prefix.
+ *  Matches comma-separated prefixes in s_echo_ping_cmds (e.g. "M119,G92"). */
+static bool needs_echo_ping(const char *gcode)
+{
+    if (s_echo_ping_cmds[0] == '\0') return false;
+
+    /* Skip N-prefix for numbered lines: "N123 G92 E0*XX" → "G92 E0*XX" */
+    const char *cmd = gcode;
+    if ((cmd[0] == 'N' || cmd[0] == 'n') && cmd[1] >= '0' && cmd[1] <= '9') {
+        const char *sp = strchr(cmd, ' ');
+        if (sp) cmd = sp + 1;
+    }
+
+    char buf[128];
+    strncpy(buf, s_echo_ping_cmds, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    char *tok = strtok(buf, ", ");
+    while (tok) {
+        /* Skip leading spaces */
+        while (*tok == ' ') tok++;
+        size_t tlen = strlen(tok);
+        if (tlen > 0 && strncasecmp(cmd, tok, tlen) == 0) {
+            /* Match if prefix ends at command boundary (space, *, end) */
+            char next = cmd[tlen];
+            if (next == '\0' || next == ' ' || next == '*') return true;
+        }
+        tok = strtok(NULL, ", ");
+    }
+    return false;
+}
 
 /* ---- Helpers ---- */
 
@@ -497,11 +532,13 @@ static void drain_rx(void)
 }
 
 /** Check if a GCode line is a long-running command that blocks until done.
- *  M109=wait hotend, M190=wait bed, M116=wait all temps,
- *  G28=homing, G29=bed leveling.
- *  These need the full timeout and shouldn't trigger a poke. */
-static bool is_wait_cmd(const char *gcode)
+ *  M109=wait hotend, M190=wait bed, M116=wait all temps — send temp reports while waiting.
+ *  G28=homing, G29=bed leveling — produce NO output while running.
+ *  These need extended timeouts.
+ *  If is_silent is non-NULL, sets it to true for commands that produce no interim feedback. */
+static bool is_wait_cmd(const char *gcode, bool *is_silent)
 {
+    if (is_silent) *is_silent = false;
     /* Skip line number prefix "N123 " */
     const char *p = gcode;
     if (*p == 'N' || *p == 'n') {
@@ -514,12 +551,15 @@ static bool is_wait_cmd(const char *gcode)
     }
     if (*p == 'G') {
         int code = atoi(p + 1);
-        return (code == 28 || code == 29);
+        if (code == 28 || code == 29) {
+            if (is_silent) *is_silent = true;
+            return true;
+        }
     }
     return false;
 }
 
-/** Send a gcode command to the printer, wait for response lines */
+/** Send a gcode command to the printer, wait for response lines. */
 static bool send_query(const char *gcode, query_type_t qtype)
 {
     if (!usb_serial_is_connected()) return false;
@@ -545,11 +585,32 @@ static bool send_query(const char *gcode, query_type_t qtype)
         return false;
     }
 
+    /* Brief pause after TX — gives STM32 CDC time to process the USB
+     * OUT packet before we start polling for the response. */
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Echo ping: some STM32 CDC implementations hold TX data until the
+     * next OUT transaction.  Send a harmless M118 to flush the response.
+     * The "echo:ping" reply is ignored by process_line. */
+    if (needs_echo_ping(gcode)) {
+        const char *ping = "M118 E1 ping\n";
+        usb_serial_send((const uint8_t *)ping, strlen(ping));
+    }
+
     /* Wait for "ok" or timeout, processing lines as they arrive. */
-    bool wait = is_wait_cmd(gcode);
+    bool wait_silent = false;
+    bool wait = is_wait_cmd(gcode, &wait_silent);
     /* Host printing uses shorter timeout to detect CDC stalls quickly.
-     * Wait commands (M109, M190, G28, G29) and non-host queries use full timeout. */
-    int timeout_ms = (s_host_printing && !wait) ? HOST_CMD_TIMEOUT_MS : CMD_RESPONSE_TIMEOUT_MS;
+     * Wait commands (M109, M190, G28, G29) and non-host queries use full timeout.
+     * Silent wait commands (G28, G29) get extra-long timeout since printer
+     * produces no interim feedback at all during homing/leveling. */
+    int timeout_ms;
+    if (wait_silent)
+        timeout_ms = WAIT_SILENT_TIMEOUT_MS;
+    else if (s_host_printing && !wait)
+        timeout_ms = HOST_CMD_TIMEOUT_MS;
+    else
+        timeout_ms = CMD_RESPONSE_TIMEOUT_MS;
     int64_t start_us = esp_timer_get_time();
     int64_t deadline = start_us + timeout_ms * 1000LL;
     uint8_t rx_byte;
@@ -557,7 +618,7 @@ static bool send_query(const char *gcode, query_type_t qtype)
     while (s_pending_query != QUERY_NONE) {
         int64_t remaining_us = deadline - esp_timer_get_time();
         if (remaining_us <= 0) {
-            ESP_LOGW(TAG, "Timeout waiting for response to %s", gcode);
+            ESP_LOGW(TAG, "CDC TX stall on %s — no response, continuing", gcode);
             s_pending_query = QUERY_NONE;
             return false;
         }
@@ -671,7 +732,7 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
     memset(out, 0, sizeof(*out));
     out->total_layers = -1;
 
-    char buf[128];
+    char buf[256];
     int32_t max_layer = -1;
     int32_t layer_change_count = 0;
     float first_z = 0, prev_z = 0;
@@ -1192,7 +1253,6 @@ static void host_print_start_internal(const char *filename)
     s_host_start_us = esp_timer_get_time();
     s_host_pause_elapsed_us = 0;
     s_host_has_pending = false;
-    s_host_pending_retries = 0;
     s_host_line_truncated = false;
     strncpy(s_host_filename, filename, sizeof(s_host_filename) - 1);
     s_host_filename[sizeof(s_host_filename) - 1] = '\0';
@@ -1204,6 +1264,10 @@ static void host_print_start_internal(const char *filename)
     format_numbered_line(sync, sizeof(sync), 0, "M110 N0");
     send_query(sync, QUERY_CMD);
     s_host_marlin_line = 1;
+
+    /* Enable host keepalive — Marlin sends "busy: processing" every 2s
+     * during long-running commands (G28, G29, etc.) so we know it's alive. */
+    send_query("M113 S2", QUERY_CMD);
 
     /* Tell Marlin we're printing — starts LCD print timer & enables host mode */
     send_query("M75", QUERY_CMD);
@@ -1248,12 +1312,20 @@ static void host_print_finish(bool cancelled)
     send_query("M77", QUERY_CMD);
     send_query("M117", QUERY_CMD);  /* Clear LCD message */
 
+    /* Disable host keepalive — restore default (disabled) to reduce chatter */
+    send_query("M113 S0", QUERY_CMD);
+
     if (cancelled) {
-        ESP_LOGI(TAG, "Host print cancelled — turning off heaters");
-        send_query("M400", QUERY_CMD);
-        send_query("M104 S0", QUERY_CMD);
-        send_query("M140 S0", QUERY_CMD);
-        send_query("M84", QUERY_CMD);
+        ESP_LOGI(TAG, "Host print cancelled — parking and turning off heaters");
+        send_query("M400", QUERY_CMD);       /* Wait for planner to drain */
+        send_query("G91", QUERY_CMD);         /* Relative positioning */
+        send_query("G1 Z10 F600", QUERY_CMD); /* Raise nozzle 10mm */
+        send_query("G90", QUERY_CMD);         /* Absolute positioning */
+        send_query("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
+        send_query("M104 S0", QUERY_CMD);     /* Hotend off */
+        send_query("M140 S0", QUERY_CMD);     /* Bed off */
+        send_query("M107", QUERY_CMD);         /* Fan off */
+        send_query("M84", QUERY_CMD);          /* Disable steppers */
     } else {
         int64_t elapsed_us = s_host_pause_elapsed_us + (esp_timer_get_time() - s_host_start_us);
         ESP_LOGI(TAG, "Host print complete: %s (%ld lines, %lds)",
@@ -1380,7 +1452,7 @@ static void printer_comm_task(void *arg)
         /* ---- Host print: stream GCode lines ---- */
         if (s_host_printing && !s_host_paused) {
             int lines_this_batch = 0;
-            char line[128];
+            char line[256];
 
             while (lines_this_batch < 4 && s_host_file) {
                 if (esp_timer_get_time() < s_cmd_cooldown_until_us) break;
@@ -1512,34 +1584,25 @@ static void printer_comm_task(void *arg)
                 /* Send to printer with line numbering & checksum. */
                 if (!send_query_numbered(line)) {
                     if (esp_timer_get_time() < s_cmd_cooldown_until_us) {
-                        /* Printer said "busy: processing" — don't poke, just defer */
+                        /* Printer said "busy: processing" — defer */
                         strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
                         s_host_has_pending = true;
                         break;
                     }
-                    /* G92 specifically stalls STM32 CDC TX on MKS/Marlin.
-                     * For other commands, retry once before poking — the first
-                     * timeout may just be a planner-full delay.
-                     * Poke: M105 generates USB activity that unsticks CDC TX.
-                     * The poke's send_query drains RX and picks up the original
-                     * command's "ok", so Marlin already has our line — just
-                     * advance the line counter, don't retry. */
-                    if (strncmp(line, "G92 ", 4) == 0 || s_host_pending_retries > 0) {
-                        ESP_LOGW(TAG, "Poking printer with M105 after timeout (%s)",
-                                 s_host_pending_retries > 0 ? "retry" : "G92");
-                        send_query("M105", QUERY_M105);
-                        s_last_m105_us = esp_timer_get_time();
-                        s_host_marlin_line++;
-                        s_host_pending_retries = 0;
-                    } else {
-                        /* First timeout on non-G92: defer and retry */
-                        s_host_pending_retries++;
-                        strncpy(s_host_pending_line, line, sizeof(s_host_pending_line));
-                        s_host_has_pending = true;
-                        break;
+                    /* Wait commands (G28/G29) already had a long timeout in send_query.
+                     * If they still failed, it's a real problem — abort. */
+                    if (is_wait_cmd(line, NULL)) {
+                        ESP_LOGE(TAG, "Wait command timed out, aborting host print: %s", line);
+                        goto host_print_end;
                     }
+                    /* STM32 CDC TX flush bug: the printer holds "ok" in its
+                     * USB TX FIFO until the next OUT transaction triggers a
+                     * flush.  Don't waste time retrying — advance immediately.
+                     * The NEXT numbered command will flush USB, and if Marlin
+                     * disagrees it will send Resend: which we handle. */
+                    ESP_LOGW(TAG, "CDC TX stall on %s — advancing to next line", line);
+                    s_host_marlin_line++;
                 }
-                s_host_pending_retries = 0;
                 s_host_lines_sent++;
                 lines_this_batch++;
 
@@ -1568,6 +1631,11 @@ static void printer_comm_task(void *arg)
             }
         }
 
+        if (0) {
+host_print_end:
+            host_print_finish(true);
+        }
+
         /* Macro: skip remaining polls if cooldown active (set by busy: handler) */
 #define CHECK_COOLDOWN() \
         do { if (esp_timer_get_time() < s_cmd_cooldown_until_us) goto poll_done; } while(0)
@@ -1579,8 +1647,14 @@ static void printer_comm_task(void *arg)
 
         /* During active host printing, only poll M105 at reduced frequency
          * (for Obico temp display). Also poll M119 for filament sensor.
-         * Skip M27/M114 entirely — position is tracked from the GCode stream. */
+         * Skip M27/M114 entirely — position is tracked from the GCode stream.
+         *
+         * CRITICAL: skip polling entirely when a retry is pending.
+         * drain_rx() inside send_query would consume the late "ok" for the
+         * timed-out command, desynchronising Marlin's line counter and
+         * causing an unrecoverable retry loop. */
         if (s_host_printing && !s_host_paused) {
+            if (s_host_has_pending) goto poll_done;
             now = esp_timer_get_time();
             if (now - s_last_m105_us >= POLL_M105_HOSTPRINT_INTERVAL_MS * 1000LL) {
                 send_query("M105", QUERY_M105);
@@ -1676,6 +1750,11 @@ static void load_config_from_nvs(void)
         s_filament_check = (fil_chk == 1);
     }
 
+    size_t ping_len = sizeof(s_echo_ping_cmds);
+    if (nvs_get_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds, &ping_len) != ESP_OK) {
+        s_echo_ping_cmds[0] = '\0';
+    }
+
     nvs_close(nvs);
 
     /* Fall back to Marlin if Klipper selected but no host configured */
@@ -1684,11 +1763,12 @@ static void load_config_from_nvs(void)
         s_backend = PRINTER_BACKEND_MARLIN;
     }
 
-    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u, pause=%s, filament_check=%s",
+    ESP_LOGI(TAG, "Config loaded: backend=%s, moonraker=%s:%u, pause=%s, filament_check=%s, echo_ping=[%s]",
              s_backend == PRINTER_BACKEND_KLIPPER ? "Klipper" : "Marlin",
              s_mr_host, s_mr_port,
              s_pause_cmd == PAUSE_CMD_M524 ? "M524 (abort)" : "M25 (pause)",
-             s_filament_check ? "on" : "off");
+             s_filament_check ? "on" : "off",
+             s_echo_ping_cmds);
 }
 
 /* ---- Public API ---- */
@@ -2009,8 +2089,16 @@ void printer_config_render_marlin(html_buf_t *p)
         "<label style='display:block;margin:8px 0 4px'><b>Filament Sensor</b></label>"
         "<label style='display:block;margin:8px 0 4px'><input type='checkbox' name='filament_chk' value='1' %s> Poll filament sensor (M119) during host print &mdash; auto-pause on runout</label>"
         "</div>"
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><b>CDC Echo Ping</b></label>"
+        "<p style='margin:4px 0;font-size:13px;color:#666'>Some printers hold USB responses until the next command is sent. "
+        "Adding commands here sends a harmless M118 ping after them to flush the response. "
+        "Typical candidates: <b>M119, G92</b></p>"
+        "<input type='text' name='echo_ping' value='%s' placeholder='e.g. M119, G92'"
+        " style='width:100%%;padding:6px;font-family:monospace'>"
+        "</div>"
         "</form>",
-        checked_m25, checked_m524, checked_fil);
+        checked_m25, checked_m524, checked_fil, s_echo_ping_cmds);
 }
 
 static esp_err_t printer_config_get_handler(httpd_req_t *req)
@@ -2088,7 +2176,7 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
 
 static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
 {
-    char body[128];
+    char body[256];
     int len = httpd_req_recv(req, body, sizeof(body) - 1);
     if (len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
@@ -2103,11 +2191,27 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
     bool new_fil_chk = (strstr(body, "filament_chk=1") != NULL);
     s_filament_check = new_fil_chk;
 
+    /* Parse echo_ping field */
+    char new_ping[128] = "";
+    char *ep = strstr(body, "echo_ping=");
+    if (ep) {
+        url_decode_field(ep + 10, new_ping, sizeof(new_ping));
+        /* Trim whitespace */
+        char *start = new_ping;
+        while (*start == ' ') start++;
+        if (start != new_ping) memmove(new_ping, start, strlen(start) + 1);
+        size_t plen = strlen(new_ping);
+        while (plen > 0 && new_ping[plen-1] == ' ') new_ping[--plen] = '\0';
+    }
+    strncpy(s_echo_ping_cmds, new_ping, sizeof(s_echo_ping_cmds));
+    s_echo_ping_cmds[sizeof(s_echo_ping_cmds) - 1] = '\0';
+
     /* Persist to NVS */
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)new_cmd);
         nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, new_fil_chk ? 1 : 0);
+        nvs_set_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds);
         nvs_commit(nvs);
         nvs_close(nvs);
     }

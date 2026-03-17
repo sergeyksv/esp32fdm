@@ -3,6 +3,7 @@
 #include "printer_comm.h"
 #include "printer_comm_klipper.h"
 #include "layout.h"
+#include "url_util.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -23,24 +24,6 @@ static const char *TAG = "sdcard_httpd";
 #define MOUNT_POINT "/sdcard"
 #define UPLOAD_BUF_SIZE 8192
 
-/* URL-decode a string in-place (handles %XX and '+' → space) */
-static void url_decode_inplace(char *s)
-{
-    char *dst = s;
-    while (*s) {
-        if (*s == '+') {
-            *dst++ = ' ';
-            s++;
-        } else if (*s == '%' && s[1] && s[2]) {
-            char hex[3] = { s[1], s[2], '\0' };
-            *dst++ = (char)strtol(hex, NULL, 16);
-            s += 3;
-        } else {
-            *dst++ = *s++;
-        }
-    }
-    *dst = '\0';
-}
 
 /* ---- GET /sd — HTML file manager ---- */
 
