@@ -100,12 +100,14 @@ esp_err_t camera_init(void)
         }
         nvs_close(nvs);
     }
-    if (s_rotate180) {
-        sensor_t *s = esp_camera_sensor_get();
-        if (s) {
-            s->set_hmirror(s, 1);
-            s->set_vflip(s, 1);
-        }
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        bool is_ov3660 = (s->id.PID == OV3660_PID);
+        /* OV3660 native orientation is 180° rotated vs OV2640.
+         * Invert vflip for OV3660 so rotate180 toggle works the same way. */
+        s->set_hmirror(s, s_rotate180 ? 1 : 0);
+        s->set_vflip(s, s_rotate180 != is_ov3660 ? 1 : 0);
+        ESP_LOGI(TAG, "Sensor: %s", is_ov3660 ? "OV3660" : "OV2640");
     }
 
     ESP_LOGI(TAG, "Camera initialized (SVGA JPEG Q%d, %d DMA buffers, XCLK %d MHz, rotate180=%d)",
@@ -276,8 +278,9 @@ void camera_set_rotate180(bool enable)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
+        bool is_ov3660 = (s->id.PID == OV3660_PID);
         s->set_hmirror(s, enable ? 1 : 0);
-        s->set_vflip(s, enable ? 1 : 0);
+        s->set_vflip(s, enable != is_ov3660 ? 1 : 0);
     }
 
     nvs_handle_t nvs;
