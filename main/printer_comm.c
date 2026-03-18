@@ -511,6 +511,9 @@ static void process_line(const char *line)
             parse_m105(line);
         }
         s_pending_query = QUERY_NONE;
+        /* Clear cooldown so the wait-loop doesn't mistake this real "ok"
+         * for a "busy: processing" clear and re-arm the query. */
+        s_cmd_cooldown_until_us = 0;
     }
 }
 
