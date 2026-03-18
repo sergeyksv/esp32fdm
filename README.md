@@ -1,6 +1,6 @@
 # ESP32 FDM Bridge
 
-A WiFi-to-printer bridge firmware for the **Freenove ESP32-S3-WROOM** board, turning a ~$7 microcontroller into a full-featured wireless print server with camera monitoring and cloud AI failure detection — at a fraction of the cost of a Raspberry Pi setup.
+A WiFi-to-printer bridge firmware for generic **ESP32-S3 camera modules** (Freenove ESP32-S3-WROOM and compatible clones), turning a ~$7 microcontroller into a full-featured wireless print server with camera monitoring and cloud AI failure detection — at a fraction of the cost of a Raspberry Pi setup.
 
 ## Why This Exists
 
@@ -15,7 +15,7 @@ This project replaces all of that with a **single ~$7 ESP32-S3 board** that has 
 | **Setup** | OS install, SSH, packages | Flash and go |
 | **Boot time** | 30-60 seconds | ~3 seconds |
 | **Power** | 5W+ | <1W |
-| **Camera** | Separate USB webcam | Built-in OV2640 |
+| **Camera** | Separate USB webcam | Built-in OV2640/OV3660 |
 | **USB Host** | Native | OTG port |
 
 The ESP32-S3's dual cores, 8MB PSRAM, and native USB OTG make it powerful enough to handle simultaneous MJPEG streaming, printer communication, and cloud connectivity — all in real time.
@@ -90,12 +90,12 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 
 ## Hardware
 
-### Target Board: Freenove ESP32-S3-WROOM
+### Target Board: ESP32-S3 Camera Module
 
-Any ESP32-S3 board with the following should work, but pin mappings are configured for the **Freenove ESP32-S3-WROOM**:
+Developed on the **Freenove ESP32-S3-WROOM**, but works with compatible clones that share the same pin layout (many generic ESP32-S3-CAM boards on AliExpress/Amazon are near-identical). Some clones may require holding a BOOT button during flashing. Required features:
 
 - **ESP32-S3** dual-core with **8MB PSRAM** (OPI)
-- **OV2640 camera** on DVP bus
+- **OV2640 or OV3660 camera** on DVP bus
 - **SD card slot** (1-bit SDMMC on GPIO 38/39/40)
 - **Two USB-C ports:**
   - **Right:** UART bridge — for flashing and debug console
@@ -218,7 +218,7 @@ Browser/Obico → printer_comm_send_cmd() → FreeRTOS queue → USB TX
 main/
   main.c               — Entry point, init sequence
   wifi.c/h             — STA + AP fallback with captive portal
-  camera.c/h           — OV2640 driver, Freenove pin mapping
+  camera.c/h           — OV2640/OV3660 driver, Freenove pin mapping, triple-buffered PSRAM
   httpd.c/h            — HTTP server, dashboard, settings, camera pages
   usb_serial.cpp/h     — USB Host CDC-ACM + VCP drivers
   printer_backend.h    — Backend enum (Marlin/Klipper), avoids circular includes

@@ -1,11 +1,11 @@
 # ESP32 FDM Printer Bridge
 
-WiFi-to-printer bridge firmware for **Freenove ESP32-S3-WROOM** (OV2640 camera, dual USB-C).
+WiFi-to-printer bridge firmware for **Freenove ESP32-S3-WROOM** (OV2640/OV3660 camera, dual USB-C).
 Dual backend: Marlin (USB serial) or Klipper (Moonraker HTTP).
 
 ## Features
 
-- **MJPEG video stream** from OV2640 (`/stream`, `/capture`)
+- **MJPEG video stream** from OV2640/OV3660 (`/stream`, `/capture`)
 - **USB Host** serial bridge to FDM printer (CDC-ACM + CH34x/CP210x/FT23x VCP)
 - **Marlin backend**: direct serial, host printing from SD, GCode terminal
 - **Klipper backend**: Moonraker HTTP API, file upload + print, temp/progress tracking
@@ -30,7 +30,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 main/
   main.c                — Entry point: NVS → WiFi → Camera → HTTP → USB Host → backend
   wifi.c/h              — WiFi STA, EventGroup blocking, auto-reconnect
-  camera.c/h            — OV2640, Freenove pin mapping, VGA JPEG, PSRAM buffers
+  camera.c/h            — OV2640/OV3660, Freenove pin mapping, SVGA JPEG Q12, triple-buffered PSRAM
   httpd.c/h             — HTTP server :80, dashboard, settings, camera, API endpoints
   usb_serial.cpp/h      — USB Host CDC-ACM + VCP drivers (C++ for VCP headers)
   printer_backend.h     — Backend enum (Marlin/Klipper), shared by layout.h
@@ -49,7 +49,7 @@ main/
 
 - **Right USB-C:** UART bridge — flashing/debug
 - **Left USB-C:** ESP32-S3 native USB (GPIO19/20) — OTG Host to printer
-- **Camera:** OV2640 on DVP (GPIOs 4-18, no conflict with USB)
+- **Camera:** OV2640 or OV3660 on DVP (GPIOs 4-18, no conflict with USB)
 - **PSRAM:** 8MB OPI — camera frame buffers
 
 ## Core Affinity
@@ -61,7 +61,7 @@ main/
 
 - `usb_serial.cpp` must be C++ because VCP driver headers are `.hpp`
 - C++ exceptions enabled (`CONFIG_COMPILER_CXX_EXCEPTIONS=y`) — required by VCP component
-- Camera XCLK at 10 MHz to avoid PSRAM bus contention
+- Camera XCLK at 20 MHz, SVGA JPEG Q12, 2 DMA buffers with GRAB_LATEST
 - RFC 2217 uses FreeRTOS StreamBuffer to decouple USB RX callback from TCP send
 - Single RFC 2217 client at a time (matches OctoPrint usage pattern)
 - OTG port may not supply 5V VBUS — user may need powered USB hub

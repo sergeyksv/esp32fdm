@@ -1,12 +1,13 @@
 #include "camera.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "camera";
@@ -16,20 +17,21 @@ static const char *TAG = "camera";
 
 static bool s_rotate180 = false;
 
-/* ---- Double-buffered PSRAM frames ---- */
+/* ---- Triple-buffered PSRAM frames ---- */
 
-#define FRAME_BUF_INIT_SIZE (50 * 1024)  /* 50 KB — covers most SVGA Q20 frames */
+#define FRAME_BUF_INIT_SIZE (50 * 1024)  /* 50 KB — covers most SVGA Q12 frames */
 #define CAPTURE_FPS         10
 #define CAPTURE_INTERVAL_MS (1000 / CAPTURE_FPS)
+#define STATS_INTERVAL_S    60           /* how often to log capture stats */
 
 #define FRAME_COUNT 3
 
 static camera_frame_t s_frames[FRAME_COUNT];
 static camera_frame_t *s_latest;       /* consumer-facing (front buffer) */
-static SemaphoreHandle_t s_frame_mutex;
+static portMUX_TYPE s_frame_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /*
- * Freenove ESP32-S3-WROOM pin mapping for OV2640 (DVP parallel interface).
+ * Freenove ESP32-S3-WROOM pin mapping (DVP parallel interface).
  * Reference: Freenove schematic + board silkscreen.
  */
 #define CAM_PIN_PWDN   -1  /* No power-down pin */
@@ -71,16 +73,16 @@ esp_err_t camera_init(void)
         .pin_href     = CAM_PIN_HREF,
         .pin_pclk     = CAM_PIN_PCLK,
 
-        .xclk_freq_hz = 10000000,  /* 10 MHz — less PSRAM bus contention */
+        .xclk_freq_hz = 20000000,  /* 20 MHz */
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size   = FRAMESIZE_SVGA, /* 800x600 */
-        .jpeg_quality = 20,             /* 1-63, lower = better quality */
-        .fb_count     = 1,              /* single DMA buffer — capture task copies + returns fast */
+        .jpeg_quality = 12,             /* 1-63, lower = better quality */
+        .fb_count     = 2,              /* 2 DMA buffers in PSRAM, GRAB_LATEST drops stale */
         .fb_location  = CAMERA_FB_IN_PSRAM,
-        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode    = CAMERA_GRAB_LATEST,
     };
 
     esp_err_t err = esp_camera_init(&config);
@@ -106,7 +108,9 @@ esp_err_t camera_init(void)
         }
     }
 
-    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG, 1 DMA buffer, rotate180=%d)", s_rotate180);
+    ESP_LOGI(TAG, "Camera initialized (SVGA JPEG Q%d, %d DMA buffers, XCLK %d MHz, rotate180=%d)",
+             config.jpeg_quality, config.fb_count,
+             (int)(config.xclk_freq_hz / 1000000), s_rotate180);
     return ESP_OK;
 }
 
@@ -114,30 +118,84 @@ esp_err_t camera_init(void)
 
 static void camera_capture_task(void *arg)
 {
-    ESP_LOGI(TAG, "Capture task started (%d FPS)", CAPTURE_FPS);
+    ESP_LOGI(TAG, "Capture task started (%d FPS target)", CAPTURE_FPS);
+
+    /* Accept frames up to 20% early to avoid skipping a frame that's "close enough" */
+    const int64_t min_interval_us = CAPTURE_INTERVAL_MS * 1000 * 80 / 100;
+    int64_t last_kept_us = 0;
+
+    /* Stats */
+    const int64_t stats_interval_us = STATS_INTERVAL_S * 1000000LL;
+    int64_t stats_start_us = esp_timer_get_time();
+    uint32_t stats_captured = 0;
+    uint64_t stats_total_bytes = 0;
+    uint64_t stats_hold_us = 0;
+    bool stats_pending = false;
+    float stats_log_fps;
+    uint32_t stats_log_frames, stats_log_avg_size, stats_log_avg_hold;
+    int stats_log_secs;
 
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(CAPTURE_INTERVAL_MS));
+        /* Deferred stats log — outside DMA buffer hold */
+        if (stats_pending) {
+            stats_pending = false;
+            ESP_LOGI(TAG, "capture: %.1f FPS, avg %"PRIu32" B, hold %"PRIu32" us (%"PRIu32" frames / %ds)",
+                     stats_log_fps, stats_log_avg_size, stats_log_avg_hold,
+                     stats_log_frames, stats_log_secs);
+        }
 
-        /* Find a free buffer (refcount == 0, not s_latest) */
+        /* Capture from DMA — blocks until camera has a frame */
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGW(TAG, "Frame capture failed");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        int64_t fb_get_us = esp_timer_get_time();
+        int64_t now_us = fb_get_us;
+        stats_captured++;
+        stats_total_bytes += fb->len;
+
+        /* Check if stats are due — snapshot values, log deferred to next iteration */
+        int64_t stats_elapsed = now_us - stats_start_us;
+        if (stats_elapsed >= stats_interval_us) {
+            stats_log_fps = stats_captured * 1000000.0f / stats_elapsed;
+            stats_log_frames = stats_captured;
+            stats_log_avg_size = (uint32_t)(stats_total_bytes / stats_captured);
+            stats_log_avg_hold = (uint32_t)(stats_hold_us / stats_captured);
+            stats_log_secs = (int)(stats_elapsed / 1000000);
+            stats_captured = 0;
+            stats_total_bytes = 0;
+            stats_hold_us = 0;
+            stats_start_us = now_us;
+            stats_pending = true;
+        }
+
+        /* Drop frame if too soon since last kept frame */
+        if (last_kept_us && (now_us - last_kept_us) < min_interval_us) {
+            stats_hold_us += esp_timer_get_time() - fb_get_us;
+            esp_camera_fb_return(fb);
+            continue;
+        }
+
+        /* Find a free buffer (refcount == 0, not s_latest).
+         * No lock needed: only capture task selects buffers, and consumers
+         * can only increment refcount on s_latest — a non-latest buffer's
+         * refcount can only stay the same or decrease. */
+        camera_frame_t *latest = s_latest;
         camera_frame_t *back = NULL;
-        xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
         for (int i = 0; i < FRAME_COUNT; i++) {
-            if (&s_frames[i] != s_latest && s_frames[i].refcount == 0) {
+            if (&s_frames[i] != latest &&
+                __atomic_load_n(&s_frames[i].refcount, __ATOMIC_ACQUIRE) == 0) {
                 back = &s_frames[i];
                 break;
             }
         }
-        xSemaphoreGive(s_frame_mutex);
         if (!back) {
+            stats_hold_us += esp_timer_get_time() - fb_get_us;
+            esp_camera_fb_return(fb);
             continue;  /* all buffers held by consumers */
-        }
-
-        /* Capture from DMA */
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGW(TAG, "Frame capture failed");
-            continue;
         }
 
         /* Grow PSRAM buffer if needed */
@@ -147,6 +205,7 @@ static void camera_capture_task(void *arg)
                                                   MALLOC_CAP_SPIRAM);
             if (!new_buf) {
                 ESP_LOGW(TAG, "PSRAM realloc failed (%u bytes)", (unsigned)new_size);
+                stats_hold_us += esp_timer_get_time() - fb_get_us;
                 esp_camera_fb_return(fb);
                 continue;
             }
@@ -159,19 +218,24 @@ static void camera_capture_task(void *arg)
         back->len = fb->len;
 
         /* Return DMA buffer immediately */
+        stats_hold_us += esp_timer_get_time() - fb_get_us;
         esp_camera_fb_return(fb);
 
-        /* Swap: back buffer becomes the new latest */
-        xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
+        last_kept_us = now_us;
+
+        /* Swap: back buffer becomes the new latest.
+         * Spinlock pairs with camera_get_frame() to prevent a consumer
+         * from reading s_latest and incrementing refcount on a stale frame
+         * that the capture task is about to reuse. */
+        taskENTER_CRITICAL(&s_frame_mux);
         s_latest = back;
-        xSemaphoreGive(s_frame_mutex);
+        taskEXIT_CRITICAL(&s_frame_mux);
+
     }
 }
 
 void camera_start_capture_task(void)
 {
-    s_frame_mutex = xSemaphoreCreateMutex();
-
     /* Allocate PSRAM frame buffers */
     for (int i = 0; i < FRAME_COUNT; i++) {
         s_frames[i].buf = heap_caps_malloc(FRAME_BUF_INIT_SIZE, MALLOC_CAP_SPIRAM);
@@ -191,23 +255,19 @@ void camera_start_capture_task(void)
 
 camera_frame_t *camera_get_frame(void)
 {
-    xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
+    taskENTER_CRITICAL(&s_frame_mux);
     camera_frame_t *f = s_latest;
     if (f) {
         f->refcount++;
     }
-    xSemaphoreGive(s_frame_mutex);
+    taskEXIT_CRITICAL(&s_frame_mux);
     return f;
 }
 
 void camera_release_frame(camera_frame_t *frame)
 {
     if (!frame) return;
-    xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
-    if (frame->refcount > 0) {
-        frame->refcount--;
-    }
-    xSemaphoreGive(s_frame_mutex);
+    __atomic_sub_fetch(&frame->refcount, 1, __ATOMIC_RELEASE);
 }
 
 void camera_set_rotate180(bool enable)

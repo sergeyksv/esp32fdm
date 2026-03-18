@@ -18,14 +18,14 @@ typedef struct {
 } camera_frame_t;
 
 /**
- * Initialize the OV2640 camera with Freenove ESP32-S3 pin mapping.
- * JPEG VGA, 2 frame buffers in PSRAM, GRAB_LATEST mode.
+ * Initialize the camera with Freenove ESP32-S3 pin mapping.
+ * SVGA JPEG, 2 DMA buffers in PSRAM, GRAB_LATEST mode.
  */
 esp_err_t camera_init(void);
 
 /**
  * Start the background capture task.
- * Allocates double-buffered PSRAM slots and captures at ~10 FPS.
+ * Allocates triple-buffered PSRAM slots, captures at HW rate, outputs at ~10 FPS.
  * Call once after camera_init().
  */
 void camera_start_capture_task(void);
