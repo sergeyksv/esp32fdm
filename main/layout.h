@@ -6,6 +6,7 @@
 #include <string.h>
 #include "sdcard.h"
 #include "printer_backend.h"
+#include "version.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -183,7 +184,7 @@ static inline void layout_html_end(html_buf_t *p)
         "cs();setInterval(cs,3000)}()"
         "</script>"
         "<footer style='margin-top:32px;padding:12px 0;border-top:1px solid #ddd;text-align:center;font-size:12px;color:#999'>"
-        "&copy; Sergey Korotkov &amp; Claude 2026</footer>"
+        "&copy; Sergey Korotkov &amp; Claude 2026 &middot; v" FW_VERSION "</footer>"
         "</body></html>");
 }
 
