@@ -1,6 +1,6 @@
 {
   "name": "ESP32 FDM Bridge",
-  "version": "1.0.0",
+  "version": "1.3",
   "new_install_prompt_erase": true,
   "builds": [
     {
@@ -8,7 +8,8 @@
       "parts": [
         { "path": "firmware/bootloader.bin", "offset": 0 },
         { "path": "firmware/partition-table.bin", "offset": 32768 },
-        { "path": "firmware/esp32fdm.bin", "offset": 65536 }
+        { "path": "firmware/ota_data_initial.bin", "offset": 61440 },
+        { "path": "firmware/esp32fdm.bin", "offset": 131072 }
       ]
     }
   ]
