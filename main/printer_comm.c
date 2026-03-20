@@ -467,6 +467,61 @@ static void process_line(const char *line)
         }
     }
 
+    /* Marlin safety errors — cancel print immediately.
+     *
+     * Fatal (printer halts, ignores further commands):
+     *   "Error:Thermal Runaway, system stopped! Heater_ID: ..."
+     *   "Error:Heating failed, system stopped! Heater_ID: ..."
+     *   "Error:MAXTEMP triggered, system stopped! Heater_ID: ..."
+     *   "Error:MINTEMP triggered, system stopped! Heater_ID: ..."
+     *   "Error:Thermal Malfunction, system stopped! Heater_ID: ..."
+     *   "Error:Printer halted. kill() called!"
+     *   "Error:Printer stopped due to errors. ..."
+     *
+     * Non-fatal (printer keeps running but output is garbage):
+     *   "echo: cold extrusion prevented"
+     *   "echo: too long extrusion prevented"
+     */
+    {
+        bool fatal = false;
+        bool safety_err = false;
+
+        if (strncmp(line, "Error:", 6) == 0) {
+            const char *msg = line + 6;
+            if (strstr(msg, "Thermal Runaway") ||
+                strstr(msg, "Heating failed") ||
+                strstr(msg, "MAXTEMP triggered") ||
+                strstr(msg, "MINTEMP triggered") ||
+                strstr(msg, "Thermal Malfunction") ||
+                strstr(msg, "Printer halted") ||
+                strstr(msg, "Printer stopped")) {
+                fatal = true;
+                safety_err = true;
+            }
+        } else if (strstr(line, "cold extrusion prevented") ||
+                   strstr(line, "too long extrusion prevented")) {
+            safety_err = true;
+        }
+
+        if (safety_err) {
+            if (s_host_printing) {
+                ESP_LOGE(TAG, "Safety error — aborting host print: %s", line);
+                printer_cmd_t cmd = { .type = PCMD_HOST_CANCEL };
+                xQueueSend(s_cmd_queue, &cmd, 0);
+            } else if (s_state.opstate == PRINTER_PRINTING) {
+                ESP_LOGE(TAG, "Safety error — cancelling SD print: %s", line);
+                printer_cmd_t cmd = { .type = PCMD_CANCEL };
+                xQueueSend(s_cmd_queue, &cmd, 0);
+            }
+            if (fatal) {
+                xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                s_state.opstate = PRINTER_ERROR;
+                xSemaphoreGive(s_state_mutex);
+            }
+            return;
+        }
+    }
+
     /* Marlin action commands: //action:pause, //action:out_of_filament, //action:resume */
     if (strncmp(line, "//action:", 9) == 0) {
         const char *action = line + 9;
