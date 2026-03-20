@@ -30,3 +30,14 @@ bool wifi_get_ssid(char *buf, size_t buf_size);
  * Erase stored WiFi credentials from NVS and reboot.
  */
 void wifi_reset_credentials(void);
+
+/**
+ * Get the device hostname (used for DHCP and mDNS).
+ * Returns pointer to a static buffer — always valid, never NULL.
+ */
+const char *wifi_get_hostname(void);
+
+/**
+ * Set the device hostname. Saves to NVS and takes effect on next reboot.
+ */
+void wifi_set_hostname(const char *name);

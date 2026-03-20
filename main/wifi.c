@@ -19,6 +19,8 @@ static const char *TAG = "wifi";
 #define NVS_WIFI_NAMESPACE "wifi"
 #define NVS_KEY_SSID       "ssid"
 #define NVS_KEY_PASSWORD   "password"
+#define NVS_KEY_HOSTNAME   "hostname"
+#define DEFAULT_HOSTNAME   "esp32fdm"
 
 #define ROAM_RSSI_THRESHOLD   (-70)   /* trigger scan when below this */
 #define ROAM_RSSI_HYSTERESIS  10      /* only roam if new AP is this much better */
@@ -31,6 +33,7 @@ static char s_ip_str[16];
 static bool s_sta_netif_created;
 static char s_current_ssid[33];
 static char s_current_pass[65];
+static char s_hostname[32] = DEFAULT_HOSTNAME;
 
 /* Scan for all APs matching ssid, return the BSSID of the strongest one.
  * Returns true if a match was found (best_bssid and best_rssi populated). */
@@ -216,6 +219,37 @@ static void nvs_save_creds(const char *ssid, const char *pass)
     ESP_LOGI(TAG, "WiFi credentials saved to NVS");
 }
 
+static void load_hostname(void)
+{
+    bool loaded = false;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = sizeof(s_hostname);
+        if (nvs_get_str(nvs, NVS_KEY_HOSTNAME, s_hostname, &len) == ESP_OK &&
+            s_hostname[0] != '\0') {
+            loaded = true;
+        }
+        nvs_close(nvs);
+    }
+
+    if (!loaded) {
+        /* Default: esp32fdm-XXYY using last 2 bytes of STA MAC */
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(s_hostname, sizeof(s_hostname), "%s-%02x%02x",
+                 DEFAULT_HOSTNAME, mac[4], mac[5]);
+    }
+}
+
+static void apply_hostname(void)
+{
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_set_hostname(netif, s_hostname);
+        ESP_LOGI(TAG, "DHCP hostname set to \"%s\"", s_hostname);
+    }
+}
+
 static esp_err_t try_sta_connect(const char *ssid, const char *pass)
 {
     ESP_LOGI(TAG, "Connecting to \"%s\"...", ssid);
@@ -223,6 +257,7 @@ static esp_err_t try_sta_connect(const char *ssid, const char *pass)
     if (!s_sta_netif_created) {
         esp_netif_create_default_wifi_sta();
         s_sta_netif_created = true;
+        apply_hostname();
     }
 
     wifi_config_t wifi_config = {};
@@ -318,6 +353,7 @@ static void start_ap_mode(void)
 wifi_result_t wifi_init(void)
 {
     s_wifi_event_group = xEventGroupCreate();
+    load_hostname();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -378,11 +414,34 @@ void wifi_reset_credentials(void)
 {
     nvs_handle_t nvs;
     if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_erase_all(nvs);
+        nvs_erase_key(nvs, NVS_KEY_SSID);
+        nvs_erase_key(nvs, NVS_KEY_PASSWORD);
         nvs_commit(nvs);
         nvs_close(nvs);
     }
     ESP_LOGW(TAG, "WiFi credentials erased — rebooting...");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+}
+
+const char *wifi_get_hostname(void)
+{
+    return s_hostname;
+}
+
+void wifi_set_hostname(const char *name)
+{
+    if (!name || !name[0])
+        return;
+
+    strncpy(s_hostname, name, sizeof(s_hostname) - 1);
+    s_hostname[sizeof(s_hostname) - 1] = '\0';
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_str(nvs, NVS_KEY_HOSTNAME, s_hostname);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGI(TAG, "Hostname saved: \"%s\" (takes effect on reboot)", s_hostname);
 }

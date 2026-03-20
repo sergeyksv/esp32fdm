@@ -644,7 +644,23 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     }
     html_buf_printf(&p, "</p>");
 
-    /* 6. WiFi */
+    /* 6. Device */
+    const char *hostname = wifi_get_hostname();
+    html_buf_printf(&p,
+        "<hr><div class='sh'><h2>Device</h2>"
+        "<button type='submit' form='f-device'>Save &amp; Reboot</button></div>"
+        "<form id='f-device' method='POST' action='/device/config'>"
+        "<label>Hostname<br>"
+        "<input type='text' name='hostname' value='%s' maxlength='31' "
+        "pattern='[a-zA-Z][a-zA-Z0-9-]*' "
+        "title='Letters, digits, hyphens. Must start with a letter.' "
+        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'>"
+        "</label>"
+        "<p class='hint'>Visible on router and as <b>%s.local</b> via mDNS.</p>"
+        "</form>",
+        hostname, hostname);
+
+    /* 7. WiFi */
     char ssid[33] = {0};
     html_buf_printf(&p,
         "<hr><div class='sh'><h2>WiFi</h2>"
@@ -708,6 +724,31 @@ static esp_err_t video_config_post_handler(httpd_req_t *req)
         if (p > 0 && p <= 65535) janus_port = (uint16_t)p;
     }
     obico_set_janus_proxy(janus_host, janus_port);
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+/* ---- /device/config handler ---- */
+
+static esp_err_t device_config_post_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recv_len < 0) recv_len = 0;
+    buf[recv_len] = '\0';
+
+    char hostname[32] = {0};
+    parse_form_field(buf, "hostname", hostname, sizeof(hostname));
+
+    if (hostname[0]) {
+        wifi_set_hostname(hostname);
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_sendstr(req, "Device name saved. Rebooting...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
 
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/settings");
@@ -937,6 +978,13 @@ esp_err_t httpd_start_server(void)
         .handler  = video_config_post_handler,
     };
     httpd_register_uri_handler(server, &video_cfg_post);
+
+    httpd_uri_t device_cfg_post = {
+        .uri      = "/device/config",
+        .method   = HTTP_POST,
+        .handler  = device_config_post_handler,
+    };
+    httpd_register_uri_handler(server, &device_cfg_post);
 
     httpd_uri_t wifi_reset = {
         .uri      = "/wifi/reset",

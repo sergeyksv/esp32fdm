@@ -13,6 +13,7 @@ set(SRCS
     "terminal.c"
     "logbuf.c"
     "dns_server.c"
+    "mdns_service.c"
 )
 
 idf_component_register(

@@ -9,6 +9,7 @@
 #include "rfc2217.h"
 #include "terminal.h"
 #include "logbuf.h"
+#include "mdns_service.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -55,6 +56,10 @@ void app_main(void)
 
     /* WiFi — try STA, fall back to AP */
     wifi_result_t wifi_result = wifi_init();
+
+    if (wifi_result == WIFI_RESULT_STA_CONNECTED) {
+        mdns_service_init();
+    }
 
     if (wifi_result == WIFI_RESULT_AP_MODE) {
         dns_server_start();
