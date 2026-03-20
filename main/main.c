@@ -10,6 +10,7 @@
 #include "terminal.h"
 #include "logbuf.h"
 #include "mdns_service.h"
+#include "ota.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -50,6 +51,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Confirm OTA boot — cancels rollback if this is a newly flashed firmware */
+    ota_confirm_boot();
 
     /* Log buffer — capture boot logs from here on */
     logbuf_init();

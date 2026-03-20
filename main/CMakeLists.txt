@@ -14,6 +14,7 @@ set(SRCS
     "logbuf.c"
     "dns_server.c"
     "mdns_service.c"
+    "ota.c"
 )
 
 idf_component_register(

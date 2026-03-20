@@ -24,6 +24,7 @@
 #include "terminal.h"
 #include "url_util.h"
 #include "logbuf.h"
+#include "ota.h"
 
 static const char *TAG = "httpd";
 
@@ -660,7 +661,10 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         "</form>",
         hostname, hostname);
 
-    /* 7. WiFi */
+    /* 7. Firmware Update (OTA) */
+    ota_render_settings(&p);
+
+    /* 8. WiFi */
     char ssid[33] = {0};
     html_buf_printf(&p,
         "<hr><div class='sh'><h2>WiFi</h2>"
@@ -999,6 +1003,7 @@ esp_err_t httpd_start_server(void)
     logbuf_register_httpd(server);
     obico_register_httpd(server);
     printer_config_register_httpd(server);
+    ota_register_httpd(server);
 
     ESP_LOGI(TAG, "HTTP server started on port 80 (stream at /stream)");
 
