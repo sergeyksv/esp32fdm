@@ -674,6 +674,13 @@ static bool send_query(const char *gcode, query_type_t qtype)
     uint8_t rx_byte;
 
     while (s_pending_query != QUERY_NONE) {
+        /* Bail immediately if USB was unplugged while waiting */
+        if (!usb_serial_is_connected()) {
+            ESP_LOGW(TAG, "USB disconnected while waiting for %s", gcode);
+            s_pending_query = QUERY_NONE;
+            return false;
+        }
+
         int64_t remaining_us = deadline - esp_timer_get_time();
         if (remaining_us <= 0) {
             ESP_LOGW(TAG, "CDC TX stall on %s — no response, continuing", gcode);
@@ -1359,44 +1366,54 @@ static void host_print_finish(bool cancelled)
         s_host_file = NULL;
     }
 
-    /* Reset Marlin's line counter so it stops expecting numbered lines.
-     * Must be sent as a numbered command with the expected line number. */
-    char reset[40];
-    format_numbered_line(reset, sizeof(reset), s_host_marlin_line, "M110 N0");
-    send_query(reset, QUERY_CMD);
+    bool connected = usb_serial_is_connected();
+
+    if (connected) {
+        /* Reset Marlin's line counter so it stops expecting numbered lines.
+         * Must be sent as a numbered command with the expected line number. */
+        char reset[40];
+        format_numbered_line(reset, sizeof(reset), s_host_marlin_line, "M110 N0");
+        send_query(reset, QUERY_CMD);
+
+        /* Stop Marlin print timer */
+        send_query("M77", QUERY_CMD);
+        send_query("M117", QUERY_CMD);  /* Clear LCD message */
+
+        /* Disable host keepalive — restore default (disabled) to reduce chatter */
+        send_query("M113 S0", QUERY_CMD);
+    }
     s_host_resend_line = -1;
 
-    /* Stop Marlin print timer */
-    send_query("M77", QUERY_CMD);
-    send_query("M117", QUERY_CMD);  /* Clear LCD message */
-
-    /* Disable host keepalive — restore default (disabled) to reduce chatter */
-    send_query("M113 S0", QUERY_CMD);
-
     if (cancelled) {
-        ESP_LOGI(TAG, "Host print cancelled — parking and turning off heaters");
-        send_query("M400", QUERY_CMD);       /* Wait for planner to drain */
-        send_query("G91", QUERY_CMD);         /* Relative positioning */
-        send_query("G1 Z10 F600", QUERY_CMD); /* Raise nozzle 10mm */
-        send_query("G90", QUERY_CMD);         /* Absolute positioning */
-        send_query("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
-        send_query("M104 S0", QUERY_CMD);     /* Hotend off */
-        send_query("M140 S0", QUERY_CMD);     /* Bed off */
-        send_query("M107", QUERY_CMD);         /* Fan off */
-        send_query("M84", QUERY_CMD);          /* Disable steppers */
+        if (connected) {
+            ESP_LOGI(TAG, "Host print cancelled — parking and turning off heaters");
+            send_query("M400", QUERY_CMD);       /* Wait for planner to drain */
+            send_query("G91", QUERY_CMD);         /* Relative positioning */
+            send_query("G1 Z10 F600", QUERY_CMD); /* Raise nozzle 10mm */
+            send_query("G90", QUERY_CMD);         /* Absolute positioning */
+            send_query("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
+            send_query("M104 S0", QUERY_CMD);     /* Hotend off */
+            send_query("M140 S0", QUERY_CMD);     /* Bed off */
+            send_query("M107", QUERY_CMD);         /* Fan off */
+            send_query("M84", QUERY_CMD);          /* Disable steppers */
+        } else {
+            ESP_LOGW(TAG, "Host print cancelled — USB disconnected, skipping park/cooldown");
+        }
     } else {
         int64_t elapsed_us = s_host_pause_elapsed_us + (esp_timer_get_time() - s_host_start_us);
         ESP_LOGI(TAG, "Host print complete: %s (%ld lines, %lds)",
                  s_host_filename, (long)s_host_lines_sent,
                  (long)(elapsed_us / 1000000));
-        send_query("M117 Print complete", QUERY_CMD);
+        if (connected) {
+            send_query("M117 Print complete", QUERY_CMD);
+        }
     }
 
     s_host_printing = false;
     s_host_paused = false;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    s_state.opstate = PRINTER_OPERATIONAL;
+    s_state.opstate = connected ? PRINTER_OPERATIONAL : PRINTER_DISCONNECTED;
     s_state.progress_pct = -1;
     s_state.print_time_s = -1;
     s_state.print_time_left_s = -1;
