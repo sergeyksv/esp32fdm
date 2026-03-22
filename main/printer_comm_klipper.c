@@ -69,9 +69,9 @@ static int http_get(const char *path)
     int status = esp_http_client_get_status_code(client);
 
     int total = 0;
-    while (total < (int)sizeof(s_resp_buf) - 1) {
+    while (total < (int)HTTP_BUF_SIZE - 1) {
         int r = esp_http_client_read(client, s_resp_buf + total,
-                                     sizeof(s_resp_buf) - 1 - total);
+                                     HTTP_BUF_SIZE - 1 - total);
         if (r <= 0) break;
         total += r;
     }

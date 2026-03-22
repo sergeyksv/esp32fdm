@@ -1,6 +1,6 @@
 {
   "name": "ESP32 FDM Bridge",
-  "version": "1.4",
+  "version": "1.5",
   "new_install_prompt_erase": true,
   "builds": [
     {
