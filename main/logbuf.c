@@ -1,4 +1,5 @@
 #include "logbuf.h"
+#include "httpd.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -328,12 +329,12 @@ esp_err_t logbuf_register_httpd(httpd_handle_t server)
     httpd_uri_t uri_get = {
         .uri = "/logs", .method = HTTP_GET, .handler = logs_handler,
     };
-    httpd_register_uri_handler(server, &uri_get);
+    HTTPD_REGISTER(server, &uri_get);
 
     httpd_uri_t uri_clear = {
         .uri = "/logs/clear", .method = HTTP_POST, .handler = logs_clear_handler,
     };
-    httpd_register_uri_handler(server, &uri_clear);
+    HTTPD_REGISTER(server, &uri_clear);
 
     ESP_LOGI(TAG, "Log viewer registered at /logs");
     return ESP_OK;

@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "httpd.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -204,7 +205,7 @@ void ota_register_httpd(httpd_handle_t server)
         .method  = HTTP_POST,
         .handler = ota_upload_handler,
     };
-    httpd_register_uri_handler(server, &upload_uri);
+    HTTPD_REGISTER(server, &upload_uri);
 }
 
 /* ---- Settings page section ---- */

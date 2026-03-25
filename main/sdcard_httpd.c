@@ -1,4 +1,5 @@
 #include "sdcard_httpd.h"
+#include "httpd.h"
 #include "sdcard.h"
 #include "printer_comm.h"
 #include "printer_comm_klipper.h"
@@ -713,7 +714,7 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
     };
 
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        httpd_register_uri_handler(server, &uris[i]);
+        HTTPD_REGISTER(server, &uris[i]);
     }
 
     ESP_LOGI(TAG, "SD card HTTP endpoints registered");

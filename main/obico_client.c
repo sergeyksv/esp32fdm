@@ -1,4 +1,5 @@
 #include "obico_client.h"
+#include "httpd.h"
 
 #include "camera.h"
 #include "printer_comm.h"
@@ -1058,42 +1059,42 @@ esp_err_t obico_register_httpd(void *server_handle)
         .method   = HTTP_GET,
         .handler  = obico_link_get_handler,
     };
-    httpd_register_uri_handler(server, &link_get);
+    HTTPD_REGISTER(server, &link_get);
 
     httpd_uri_t link_post = {
         .uri      = "/obico/link",
         .method   = HTTP_POST,
         .handler  = obico_link_post_handler,
     };
-    httpd_register_uri_handler(server, &link_post);
+    HTTPD_REGISTER(server, &link_post);
 
     httpd_uri_t server_post = {
         .uri      = "/obico/server",
         .method   = HTTP_POST,
         .handler  = obico_server_handler,
     };
-    httpd_register_uri_handler(server, &server_post);
+    HTTPD_REGISTER(server, &server_post);
 
     httpd_uri_t unlink_post = {
         .uri      = "/obico/unlink",
         .method   = HTTP_POST,
         .handler  = obico_unlink_handler,
     };
-    httpd_register_uri_handler(server, &unlink_post);
+    HTTPD_REGISTER(server, &unlink_post);
 
     httpd_uri_t status_uri = {
         .uri      = "/obico/status",
         .method   = HTTP_GET,
         .handler  = obico_status_handler,
     };
-    httpd_register_uri_handler(server, &status_uri);
+    HTTPD_REGISTER(server, &status_uri);
 
     httpd_uri_t sim_uri = {
         .uri      = "/obico/simulate",
         .method   = HTTP_GET,
         .handler  = obico_simulate_handler,
     };
-    httpd_register_uri_handler(server, &sim_uri);
+    HTTPD_REGISTER(server, &sim_uri);
 
     ESP_LOGI(TAG, "Obico HTTP endpoints registered");
     return ESP_OK;

@@ -994,17 +994,17 @@ esp_err_t httpd_start_captive_portal(void)
     httpd_uri_t root_get = {
         .uri = "/", .method = HTTP_GET, .handler = captive_root_get_handler,
     };
-    httpd_register_uri_handler(server, &root_get);
+    HTTPD_REGISTER(server, &root_get);
 
     httpd_uri_t root_post = {
         .uri = "/", .method = HTTP_POST, .handler = captive_root_post_handler,
     };
-    httpd_register_uri_handler(server, &root_post);
+    HTTPD_REGISTER(server, &root_post);
 
     httpd_uri_t wildcard = {
         .uri = "/*", .method = HTTP_GET, .handler = captive_redirect_handler,
     };
-    httpd_register_uri_handler(server, &wildcard);
+    HTTPD_REGISTER(server, &wildcard);
 
     ESP_LOGI(TAG, "Captive portal started on port 80");
     return ESP_OK;
@@ -1033,105 +1033,105 @@ esp_err_t httpd_start_server(void)
         .method   = HTTP_GET,
         .handler  = root_handler,
     };
-    httpd_register_uri_handler(server, &root_uri);
+    HTTPD_REGISTER(server, &root_uri);
 
     httpd_uri_t favicon_uri = {
         .uri      = "/favicon.svg",
         .method   = HTTP_GET,
         .handler  = favicon_handler,
     };
-    httpd_register_uri_handler(server, &favicon_uri);
+    HTTPD_REGISTER(server, &favicon_uri);
 
     httpd_uri_t capture_uri = {
         .uri      = "/capture",
         .method   = HTTP_GET,
         .handler  = capture_handler,
     };
-    httpd_register_uri_handler(server, &capture_uri);
+    HTTPD_REGISTER(server, &capture_uri);
 
     httpd_uri_t stream_uri = {
         .uri      = "/stream",
         .method   = HTTP_GET,
         .handler  = stream_handler,
     };
-    httpd_register_uri_handler(server, &stream_uri);
+    HTTPD_REGISTER(server, &stream_uri);
 
     httpd_uri_t api_status = {
         .uri      = "/api/status",
         .method   = HTTP_GET,
         .handler  = api_status_handler,
     };
-    httpd_register_uri_handler(server, &api_status);
+    HTTPD_REGISTER(server, &api_status);
 
     httpd_uri_t api_stats = {
         .uri      = "/api/stats",
         .method   = HTTP_GET,
         .handler  = api_stats_handler,
     };
-    httpd_register_uri_handler(server, &api_stats);
+    HTTPD_REGISTER(server, &api_stats);
 
     httpd_uri_t api_temp_history = {
         .uri      = "/api/temp_history",
         .method   = HTTP_GET,
         .handler  = api_temp_history_handler,
     };
-    httpd_register_uri_handler(server, &api_temp_history);
+    HTTPD_REGISTER(server, &api_temp_history);
 
     httpd_uri_t api_command = {
         .uri      = "/api/command",
         .method   = HTTP_POST,
         .handler  = api_command_handler,
     };
-    httpd_register_uri_handler(server, &api_command);
+    HTTPD_REGISTER(server, &api_command);
 
     httpd_uri_t camera_page = {
         .uri      = "/camera",
         .method   = HTTP_GET,
         .handler  = camera_page_handler,
     };
-    httpd_register_uri_handler(server, &camera_page);
+    HTTPD_REGISTER(server, &camera_page);
 
     httpd_uri_t settings_uri = {
         .uri      = "/settings",
         .method   = HTTP_GET,
         .handler  = settings_get_handler,
     };
-    httpd_register_uri_handler(server, &settings_uri);
+    HTTPD_REGISTER(server, &settings_uri);
 
     httpd_uri_t video_cfg_post = {
         .uri      = "/video/config",
         .method   = HTTP_POST,
         .handler  = video_config_post_handler,
     };
-    httpd_register_uri_handler(server, &video_cfg_post);
+    HTTPD_REGISTER(server, &video_cfg_post);
 
     httpd_uri_t cam_settings_post = {
         .uri      = "/camera/settings",
         .method   = HTTP_POST,
         .handler  = camera_settings_post_handler,
     };
-    httpd_register_uri_handler(server, &cam_settings_post);
+    HTTPD_REGISTER(server, &cam_settings_post);
 
     httpd_uri_t device_cfg_post = {
         .uri      = "/device/config",
         .method   = HTTP_POST,
         .handler  = device_config_post_handler,
     };
-    httpd_register_uri_handler(server, &device_cfg_post);
+    HTTPD_REGISTER(server, &device_cfg_post);
 
     httpd_uri_t wifi_reset = {
         .uri      = "/wifi/reset",
         .method   = HTTP_POST,
         .handler  = wifi_reset_handler,
     };
-    httpd_register_uri_handler(server, &wifi_reset);
+    HTTPD_REGISTER(server, &wifi_reset);
 
     httpd_uri_t utils_uri = {
         .uri      = "/utils",
         .method   = HTTP_GET,
         .handler  = utils_page_handler,
     };
-    httpd_register_uri_handler(server, &utils_uri);
+    HTTPD_REGISTER(server, &utils_uri);
 
     sdcard_httpd_register(server);
 

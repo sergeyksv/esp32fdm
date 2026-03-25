@@ -1,4 +1,5 @@
 #include "terminal.h"
+#include "httpd.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -324,22 +325,22 @@ esp_err_t terminal_register_httpd(httpd_handle_t server)
     httpd_uri_t page = {
         .uri = "/terminal", .method = HTTP_GET, .handler = terminal_page_handler,
     };
-    httpd_register_uri_handler(server, &page);
+    HTTPD_REGISTER(server, &page);
 
     httpd_uri_t send_uri = {
         .uri = "/terminal/send", .method = HTTP_POST, .handler = terminal_send_handler,
     };
-    httpd_register_uri_handler(server, &send_uri);
+    HTTPD_REGISTER(server, &send_uri);
 
     httpd_uri_t poll_uri = {
         .uri = "/terminal/poll", .method = HTTP_GET, .handler = terminal_poll_handler,
     };
-    httpd_register_uri_handler(server, &poll_uri);
+    HTTPD_REGISTER(server, &poll_uri);
 
     httpd_uri_t polling_uri = {
         .uri = "/terminal/polling", .method = HTTP_POST, .handler = terminal_polling_handler,
     };
-    httpd_register_uri_handler(server, &polling_uri);
+    HTTPD_REGISTER(server, &polling_uri);
 
     ESP_LOGI(TAG, "Terminal endpoints registered");
     return ESP_OK;

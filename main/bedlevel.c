@@ -1,4 +1,5 @@
 #include "bedlevel.h"
+#include "httpd.h"
 #include "printer_comm.h"
 #include "cache.h"
 #include "layout.h"
@@ -783,10 +784,7 @@ esp_err_t bedlevel_register_httpd(httpd_handle_t server)
     };
 
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        esp_err_t err = httpd_register_uri_handler(server, &uris[i]);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to register %s: %s", uris[i].uri, esp_err_to_name(err));
-        }
+        HTTPD_REGISTER(server, &uris[i]);
     }
 
     return ESP_OK;

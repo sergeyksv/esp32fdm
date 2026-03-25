@@ -1,5 +1,6 @@
 #include "printer_comm.h"
 #include "printer_comm_klipper.h"
+#include "httpd.h"
 
 #include "usb_serial.h"
 #include "terminal.h"
@@ -2585,28 +2586,28 @@ esp_err_t printer_config_register_httpd(void *server_handle)
         .method  = HTTP_GET,
         .handler = printer_config_get_handler,
     };
-    httpd_register_uri_handler(server, &get_cfg);
+    HTTPD_REGISTER(server, &get_cfg);
 
     httpd_uri_t post_cfg = {
         .uri     = "/printer/config",
         .method  = HTTP_POST,
         .handler = printer_config_post_handler,
     };
-    httpd_register_uri_handler(server, &post_cfg);
+    HTTPD_REGISTER(server, &post_cfg);
 
     httpd_uri_t marlin_cfg = {
         .uri     = "/printer/config/marlin",
         .method  = HTTP_POST,
         .handler = printer_config_marlin_post_handler,
     };
-    httpd_register_uri_handler(server, &marlin_cfg);
+    HTTPD_REGISTER(server, &marlin_cfg);
 
     httpd_uri_t test_cfg = {
         .uri     = "/printer/config/test",
         .method  = HTTP_GET,
         .handler = printer_config_test_handler,
     };
-    httpd_register_uri_handler(server, &test_cfg);
+    HTTPD_REGISTER(server, &test_cfg);
 
     return ESP_OK;
 }
