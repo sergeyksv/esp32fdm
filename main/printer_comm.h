@@ -197,6 +197,18 @@ bool printer_comm_is_host_printing(void);
 void printer_comm_set_polling_suppressed(bool suppress);
 bool printer_comm_is_polling_suppressed(void);
 
+/**
+ * Set a callback invoked for every line received from the printer.
+ * Called from the comm task context.  Pass NULL to clear.
+ */
+void printer_comm_set_line_callback(void (*cb)(const char *line));
+
+/**
+ * Send a raw GCode command and block until the printer responds with "ok".
+ * Only one caller at a time.  Returns ESP_ERR_TIMEOUT if no response within timeout_ms.
+ */
+esp_err_t printer_comm_send_gcode_sync(const char *gcode, int timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

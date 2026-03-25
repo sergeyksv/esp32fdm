@@ -13,6 +13,7 @@ set(SRCS
     "terminal.c"
     "logbuf.c"
     "cache.c"
+    "bedlevel.c"
     "dns_server.c"
     "mdns_service.c"
     "ota.c"

@@ -1,3 +1,3 @@
 #pragma once
 
-#define FW_VERSION "1.5"
+#define FW_VERSION "2.0"

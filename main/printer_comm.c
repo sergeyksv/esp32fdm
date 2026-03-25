@@ -44,6 +44,13 @@ static const char *TAG = "printer_comm";
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
+/* ---- Line callback (used by bedlevel mesh parsing) ---- */
+static void (*s_line_callback)(const char *line);
+
+/* ---- Synchronous command send ---- */
+static SemaphoreHandle_t s_sync_cmd_sem;
+static bool              s_sync_cmd_pending;
+
 #define NVS_NAMESPACE           "pcomm"
 #define NVS_KEY_BACKEND         "backend"
 #define NVS_KEY_MR_HOST         "mr_host"
@@ -413,6 +420,11 @@ static void process_line(const char *line)
 {
     /* Skip empty lines */
     if (line[0] == '\0') return;
+
+    /* Forward line to callback (used by bedlevel mesh parser) */
+    if (s_line_callback) {
+        s_line_callback(line);
+    }
 
     ESP_LOGI(TAG, "RX: %s", line);
 
@@ -1718,6 +1730,12 @@ static void printer_comm_task(void *arg)
                 ESP_LOGI(TAG, "Sending command: %s", gcode);
                 send_query(gcode, QUERY_CMD);
 
+                /* Notify synchronous caller if waiting */
+                if (cmd.type == PCMD_RAW && s_sync_cmd_pending) {
+                    s_sync_cmd_pending = false;
+                    if (s_sync_cmd_sem) xSemaphoreGive(s_sync_cmd_sem);
+                }
+
                 if (cmd.type == PCMD_PAUSE) {
                     s_cmd_cooldown_until_us = esp_timer_get_time() + 5000000LL; /* 5s */
                 }
@@ -2268,6 +2286,39 @@ void printer_comm_set_polling_suppressed(bool suppress)
 bool printer_comm_is_polling_suppressed(void)
 {
     return s_polling_suppressed;
+}
+
+/* ---- Line callback ---- */
+
+void printer_comm_set_line_callback(void (*cb)(const char *line))
+{
+    s_line_callback = cb;
+}
+
+/* ---- Synchronous GCode send ---- */
+
+esp_err_t printer_comm_send_gcode_sync(const char *gcode, int timeout_ms)
+{
+    if (!s_sync_cmd_sem) {
+        s_sync_cmd_sem = xSemaphoreCreateBinary();
+        if (!s_sync_cmd_sem) return ESP_ERR_NO_MEM;
+    }
+
+    printer_cmd_t cmd = { .type = PCMD_RAW };
+    strlcpy(cmd.gcode, gcode, sizeof(cmd.gcode));
+
+    s_sync_cmd_pending = true;
+    esp_err_t err = printer_comm_send_cmd(&cmd);
+    if (err != ESP_OK) {
+        s_sync_cmd_pending = false;
+        return err;
+    }
+
+    if (xSemaphoreTake(s_sync_cmd_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        s_sync_cmd_pending = false;
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
 }
 
 /* ---- Backend getters ---- */

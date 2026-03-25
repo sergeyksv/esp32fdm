@@ -22,6 +22,7 @@
 
 #include "obico_client.h"
 #include "terminal.h"
+#include "bedlevel.h"
 #include "url_util.h"
 #include "logbuf.h"
 #include "ota.h"
@@ -704,6 +705,25 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
 
 /* ---- /camera handler ---- */
 
+static esp_err_t utils_page_handler(httpd_req_t *req)
+{
+    html_buf_t p;
+    html_buf_init(&p);
+    layout_html_begin(&p, "Utilities", "/utils");
+    html_buf_printf(&p,
+        "<h2>Utilities</h2>"
+        "<table>"
+        "<tr><td><a href='/bedlevel'><b>Bed Leveling</b></a></td>"
+        "<td>Probe bed mesh, visualize, and calculate screw adjustments</td></tr>"
+        "</table>");
+    layout_html_end(&p);
+
+    httpd_resp_set_type(req, "text/html");
+    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
+    html_buf_free(&p);
+    return ret;
+}
+
 static esp_err_t camera_page_handler(httpd_req_t *req)
 {
     html_buf_t p;
@@ -1021,9 +1041,19 @@ esp_err_t httpd_start_server(void)
     };
     httpd_register_uri_handler(server, &wifi_reset);
 
+    httpd_uri_t utils_uri = {
+        .uri      = "/utils",
+        .method   = HTTP_GET,
+        .handler  = utils_page_handler,
+    };
+    httpd_register_uri_handler(server, &utils_uri);
+
     sdcard_httpd_register(server);
 
     terminal_register_httpd(server);
+    if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER) {
+        bedlevel_register_httpd(server);
+    }
     logbuf_register_httpd(server);
     obico_register_httpd(server);
     printer_config_register_httpd(server);

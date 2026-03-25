@@ -80,16 +80,23 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
     const char *sd_nav = "";
     if (sdcard_is_mounted()) {
         sd_nav = strcmp(current_path, "/sd") == 0
-            ? " <b>SD Card</b>"
-            : " <a href='/sd'>SD Card</a>";
+            ? " <b>SD</b>"
+            : " <a href='/sd'>SD</a>";
     }
 
     int is_klipper = (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER);
     const char *terminal_nav = "";
     if (!is_klipper) {
         terminal_nav = strcmp(current_path, "/terminal") == 0
-            ? " <b>Terminal</b>"
-            : " <a href='/terminal'>Terminal</a>";
+            ? " <b>Term</b>"
+            : " <a href='/terminal'>Term</a>";
+    }
+
+    const char *utils_nav = "";
+    if (!is_klipper) {
+        utils_nav = (strcmp(current_path, "/utils") == 0 || strncmp(current_path, "/bedlevel", 9) == 0)
+            ? " <b>Utils</b>"
+            : " <a href='/utils'>Utils</a>";
     }
 
     html_buf_printf(p,
@@ -129,7 +136,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "</style></head><body>"
         "<nav>"
         "<span class='brand'>ESP32FDM</span>"
-        "%s %s%s%s %s %s"
+        "%s %s%s%s%s %s %s"
         "<span class='cpu-bars'>"
         "C0<span class='cpu-bar'><div id='cb0'></div></span>"
         "C1<span class='cpu-bar'><div id='cb1'></div></span>"
@@ -138,9 +145,10 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "<div id='pst'></div>",
         title,
         NAV_LINK("/", "Home"),
-        NAV_LINK("/camera", "Camera"),
+        NAV_LINK("/camera", "Cam"),
         sd_nav,
         terminal_nav,
+        utils_nav,
         NAV_LINK("/logs", "Logs"),
         NAV_LINK("/settings", "Settings"));
 

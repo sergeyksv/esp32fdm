@@ -9,6 +9,7 @@ Dual backend: Marlin (USB serial) or Klipper (Moonraker HTTP).
 - **USB Host** serial bridge to FDM printer (CDC-ACM + CH34x/CP210x/FT23x VCP)
 - **Marlin backend**: direct serial, host printing from SD, GCode terminal
 - **Klipper backend**: Moonraker HTTP API, file upload + print, temp/progress tracking
+- **Bed leveling** (Marlin): probe mesh via G29, color-coded grid visualization, mesh history, screw adjustment calculator with 1/8-turn precision
 - **Obico integration**: AI failure detection, remote monitoring
 - **RFC 2217 server** — OctoPrint connects via `rfc2217://<ip>:2217` (Marlin only)
 
@@ -40,6 +41,7 @@ main/
   sdcard.c/h            — SD card mount/unmount
   sdcard_httpd.c/h      — SD card web UI, backend-aware print/pause/resume/cancel
   cache.c/h             — LittleFS cache housekeeping (LRU eviction by mtime)
+  bedlevel.c/h          — Bed leveling: mesh probe, visualization, screw adjustment (Marlin only)
   obico_client.c/h      — Obico WebSocket, snapshot upload, Janus signaling
   rfc2217.c/h           — RFC 2217 Telnet server (Marlin only)
   layout.h              — Shared HTML layout, nav bar (hides Marlin-only items for Klipper)
@@ -72,6 +74,8 @@ main/
 - Marlin host print uses line numbering + checksums; M110 N0 reset on finish to prevent resend loops
 - Terminal and RFC 2217 hidden from UI when Klipper backend is selected
 - GCode file info (layers, time, filament, thumbnail) cached in `/cache/gcode/` on LittleFS — keyed by filename + file size, LRU eviction at 50 entries
+- Bed mesh auto-captured from any G29 output (probe button, terminal, printer UI); history stored in `/cache/beds/`, LRU eviction at 100 entries
+- Screw adjustment: 4-screw centered layout, configurable bed size/origin/pitch, tighten or loosen mode, 1/4 + 1/8 turn display
 
 ## OctoPrint Configuration
 
