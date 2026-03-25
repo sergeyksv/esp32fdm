@@ -64,6 +64,23 @@ static void capture_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Inline SVG favicon: 3D printer hotend silhouette */
+static const char FAVICON_SVG[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    "<rect x='4' y='2' width='24' height='6' rx='1' fill='#555'/>"
+    "<rect x='6' y='8' width='20' height='4' fill='#777'/>"
+    "<rect x='13' y='12' width='6' height='8' fill='#555'/>"
+    "<polygon points='12,20 20,20 18,26 14,26' fill='#d4a017'/>"
+    "<circle cx='16' cy='28' r='2' fill='#e74c3c'/>"
+    "</svg>";
+
+static esp_err_t favicon_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/svg+xml");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    return httpd_resp_send(req, FAVICON_SVG, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t capture_handler(httpd_req_t *req)
 {
     httpd_req_t *async_req = NULL;
@@ -919,6 +936,13 @@ esp_err_t httpd_start_server(void)
         .handler  = root_handler,
     };
     httpd_register_uri_handler(server, &root_uri);
+
+    httpd_uri_t favicon_uri = {
+        .uri      = "/favicon.svg",
+        .method   = HTTP_GET,
+        .handler  = favicon_handler,
+    };
+    httpd_register_uri_handler(server, &favicon_uri);
 
     httpd_uri_t capture_uri = {
         .uri      = "/capture",

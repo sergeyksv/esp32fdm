@@ -96,6 +96,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "<!DOCTYPE html><html><head>"
         "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<link rel='icon' type='image/svg+xml' href='/favicon.svg'>"
         "<title>%s</title>"
         "<style>"
         "body{font-family:sans-serif;max-width:600px;margin:0 auto;padding:0 1em}"

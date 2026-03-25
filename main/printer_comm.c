@@ -36,6 +36,8 @@ static const char *TAG = "printer_comm";
 #define POLL_M119_INTERVAL_MS           30000   /* Filament sensor check during host print */
 #define CMD_RESPONSE_TIMEOUT_MS         6000
 #define WAIT_SILENT_TIMEOUT_MS          120000  /* G28/G29: no interim feedback, needs long timeout */
+#define WAIT_TEMP_TIMEOUT_MS            30000   /* M109/M190/M116: first temp report can be delayed */
+#define HOST_STALL_PING_RETRIES         5       /* Echo-ping retries before giving up on a stalled cmd */
 #define RX_LINE_BUF_SIZE        256
 #define CMD_QUEUE_SIZE          8
 
@@ -143,6 +145,14 @@ static int32_t s_host_resend_line;        /* Line requested by Resend:, or -1 */
 static char    s_host_numbered_line[160]; /* Formatted "Nxxx gcode*cs" for resend */
 static int     s_host_resend_retries;
 #define HOST_RESEND_MAX_RETRIES 5
+
+/* Rolling history of recently sent numbered lines so we can resend when
+ * Marlin asks for a line we already advanced past (e.g. spurious "ok"
+ * from EEPROM auto-save made us skip ahead). */
+#define HOST_LINE_HISTORY_SIZE  5
+static char    s_host_line_history[HOST_LINE_HISTORY_SIZE][160];
+static int32_t s_host_line_history_num[HOST_LINE_HISTORY_SIZE]; /* Marlin line number for each slot */
+static int     s_host_line_history_idx;  /* next slot to write */
 
 /* Host print command timeout: must be longer than the M113 keepalive
  * interval (2s) so Marlin has a chance to send "busy: processing"
@@ -659,18 +669,23 @@ static bool send_query(const char *gcode, query_type_t qtype)
     bool wait_silent = false;
     bool wait = is_wait_cmd(gcode, &wait_silent);
     /* Host printing uses shorter timeout to detect CDC stalls quickly.
-     * Wait commands (M109, M190, G28, G29) and non-host queries use full timeout.
-     * Silent wait commands (G28, G29) get extra-long timeout since printer
-     * produces no interim feedback at all during homing/leveling. */
+     * Wait commands need longer initial timeouts:
+     * - Silent waits (G28, G29): 120s — no interim feedback at all.
+     * - Temp waits (M109, M190, M116): 30s — Marlin may delay the first
+     *   temp report while draining its motion planner.  Once reports start
+     *   flowing, the deadline is extended per-line below. */
     int timeout_ms;
     if (wait_silent)
         timeout_ms = WAIT_SILENT_TIMEOUT_MS;
-    else if (s_host_printing && !wait)
+    else if (wait)
+        timeout_ms = WAIT_TEMP_TIMEOUT_MS;
+    else if (s_host_printing)
         timeout_ms = HOST_CMD_TIMEOUT_MS;
     else
         timeout_ms = CMD_RESPONSE_TIMEOUT_MS;
     int64_t start_us = esp_timer_get_time();
     int64_t deadline = start_us + timeout_ms * 1000LL;
+    int stall_pings = 0;
     uint8_t rx_byte;
 
     while (s_pending_query != QUERY_NONE) {
@@ -683,7 +698,20 @@ static bool send_query(const char *gcode, query_type_t qtype)
 
         int64_t remaining_us = deadline - esp_timer_get_time();
         if (remaining_us <= 0) {
-            ESP_LOGW(TAG, "CDC TX stall on %s — no response, continuing", gcode);
+            /* During host printing, send an echo ping to flush a stuck CDC
+             * response before giving up.  This keeps us in sync with Marlin
+             * instead of advancing past a command that was already sent. */
+            if (s_host_printing && stall_pings < HOST_STALL_PING_RETRIES) {
+                stall_pings++;
+                ESP_LOGW(TAG, "CDC stall on %s — ping flush attempt %d/%d",
+                         gcode, stall_pings, HOST_STALL_PING_RETRIES);
+                const char *ping = "M118 E1 ping\n";
+                usb_serial_send((const uint8_t *)ping, strlen(ping));
+                deadline = esp_timer_get_time() + HOST_CMD_TIMEOUT_MS * 1000LL;
+                continue;
+            }
+            ESP_LOGW(TAG, "CDC TX stall on %s — no response after %d pings, giving up",
+                     gcode, stall_pings);
             s_pending_query = QUERY_NONE;
             return false;
         }
@@ -726,6 +754,27 @@ static bool send_query(const char *gcode, query_type_t qtype)
 
 /** Send a numbered GCode command with checksum, handle Resend: retries.
  *  Used only for host print streaming lines. */
+/** Look up a previously sent numbered line from the rolling history.
+ *  Returns pointer to the formatted line, or NULL if not found. */
+static const char *history_lookup(int32_t line_num)
+{
+    for (int i = 0; i < HOST_LINE_HISTORY_SIZE; i++) {
+        if (s_host_line_history_num[i] == line_num && s_host_line_history[i][0])
+            return s_host_line_history[i];
+    }
+    return NULL;
+}
+
+/** Store a numbered line in the rolling history. */
+static void history_store(int32_t line_num, const char *formatted)
+{
+    int idx = s_host_line_history_idx;
+    strncpy(s_host_line_history[idx], formatted, sizeof(s_host_line_history[idx]));
+    s_host_line_history[idx][sizeof(s_host_line_history[idx]) - 1] = '\0';
+    s_host_line_history_num[idx] = line_num;
+    s_host_line_history_idx = (idx + 1) % HOST_LINE_HISTORY_SIZE;
+}
+
 static bool send_query_numbered(const char *gcode)
 {
     s_host_resend_line = -1;
@@ -736,6 +785,8 @@ static bool send_query_numbered(const char *gcode)
         ESP_LOGE(TAG, "Line too long for numbering: %s", gcode);
         return send_query(gcode, QUERY_CMD); /* fallback unnumbered */
     }
+
+    history_store(s_host_marlin_line, s_host_numbered_line);
 
     if (!send_query(s_host_numbered_line, QUERY_CMD)) {
         return false;
@@ -753,14 +804,41 @@ static bool send_query_numbered(const char *gcode)
             return true;
         }
         if (s_host_resend_line != s_host_marlin_line) {
-            ESP_LOGE(TAG, "Resend line mismatch: expected N%ld, got N%ld — resync",
-                     (long)s_host_marlin_line, (long)s_host_resend_line);
-            /* Resync Marlin's line counter to our current line */
+            /* Marlin wants a different line than the one we just sent.
+             * Look it up in history and replay from there. */
+            const char *old = history_lookup(s_host_resend_line);
+            if (old) {
+                int32_t replay_from = s_host_resend_line;
+                ESP_LOGW(TAG, "Replaying from N%ld to N%ld (history hit)",
+                         (long)replay_from, (long)s_host_marlin_line);
+                s_host_resend_line = -1;
+                /* Resend all lines from the requested one up to current */
+                for (int32_t n = replay_from; ; n++) {
+                    const char *line_data;
+                    if (n == s_host_marlin_line) {
+                        line_data = s_host_numbered_line;
+                    } else {
+                        line_data = history_lookup(n);
+                        if (!line_data) break; /* shouldn't happen */
+                    }
+                    if (!send_query(line_data, QUERY_CMD)) {
+                        return false;
+                    }
+                    if (n == s_host_marlin_line) break;
+                }
+                continue; /* check for further resend requests */
+            }
+            /* Not in history — resync as last resort */
+            ESP_LOGW(TAG, "Resend N%ld not in history — resync + retry",
+                     (long)s_host_resend_line);
             char sync[40];
             format_numbered_line(sync, sizeof(sync), s_host_marlin_line, "M110");
             send_query(sync, QUERY_CMD);
             s_host_resend_line = -1;
-            return false;
+            if (!send_query(s_host_numbered_line, QUERY_CMD)) {
+                return false;
+            }
+            break;
         }
 
         s_host_resend_retries++;
@@ -1325,6 +1403,8 @@ static void host_print_start_internal(const char *filename)
     /* Reset Marlin line numbering for reliable transmission */
     s_host_marlin_line = 0;
     s_host_resend_line = -1;
+    memset(s_host_line_history, 0, sizeof(s_host_line_history));
+    s_host_line_history_idx = 0;
     char sync[40];
     format_numbered_line(sync, sizeof(sync), 0, "M110 N0");
     send_query(sync, QUERY_CMD);
@@ -1664,19 +1744,11 @@ static void printer_comm_task(void *arg)
                         s_host_has_pending = true;
                         break;
                     }
-                    /* Wait commands (G28/G29) already had a long timeout in send_query.
-                     * If they still failed, it's a real problem — abort. */
-                    if (is_wait_cmd(line, NULL)) {
-                        ESP_LOGE(TAG, "Wait command timed out, aborting host print: %s", line);
-                        goto host_print_end;
-                    }
-                    /* STM32 CDC TX flush bug: the printer holds "ok" in its
-                     * USB TX FIFO until the next OUT transaction triggers a
-                     * flush.  Don't waste time retrying — advance immediately.
-                     * The NEXT numbered command will flush USB, and if Marlin
-                     * disagrees it will send Resend: which we handle. */
-                    ESP_LOGW(TAG, "CDC TX stall on %s — advancing to next line", line);
-                    s_host_marlin_line++;
+                    /* send_query already retried with echo pings.  If we still
+                     * got no response, something is genuinely wrong — abort to
+                     * avoid losing sync with Marlin's line counter. */
+                    ESP_LOGE(TAG, "Command failed after retries, aborting host print: %s", line);
+                    goto host_print_end;
                 }
                 s_host_lines_sent++;
                 lines_this_batch++;
