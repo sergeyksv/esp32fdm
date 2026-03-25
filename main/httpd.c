@@ -620,6 +620,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
 
     /* 3. Video (camera + streaming) */
     bool rot = camera_get_rotate180();
+    int xclk = camera_get_xclk_mhz();
     const char *jh = obico_get_janus_host();
     uint16_t jp = obico_get_janus_port();
     html_buf_printf(&p,
@@ -627,6 +628,14 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         "<button type='submit' form='f-video'>Save</button></div>"
         "<form id='f-video' method='POST' action='/video/config'>"
         "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label>"
+        "<div style='margin:8px 0'><label>XCLK: "
+        "<select name='xclk'>"
+        "<option value='10'%s>10 MHz (safe)</option>"
+        "<option value='12'%s>12 MHz</option>"
+        "<option value='16'%s>16 MHz</option>"
+        "<option value='20'%s>20 MHz (fast)</option>"
+        "</select></label>"
+        " <span class='hint'>Reboot to apply</span></div>"
         "<p style='margin:12px 0 4px;font-weight:bold'>Janus Proxy (WebRTC streaming)</p>"
         "<label>Host<br><input type='text' name='janus_host' value='%s' placeholder='192.168.1.x' "
         "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
@@ -634,7 +643,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
         "<p class='hint'>Leave host empty to disable Janus proxy.</p>"
         "</form>",
-        rot ? " checked" : "", jh, (unsigned)jp);
+        rot ? " checked" : "",
+        xclk == 10 ? " selected" : "",
+        xclk == 12 ? " selected" : "",
+        xclk == 16 ? " selected" : "",
+        xclk == 20 ? " selected" : "",
+        jh, (unsigned)jp);
 
     /* 4. Obico */
     if (obico_is_linked()) {
@@ -726,20 +740,78 @@ static esp_err_t utils_page_handler(httpd_req_t *req)
 
 static esp_err_t camera_page_handler(httpd_req_t *req)
 {
+    int bright, contrast, sat, ae;
+    camera_get_image_params(&bright, &contrast, &sat, &ae);
+
     html_buf_t p;
     html_buf_init(&p);
 
     layout_html_begin(&p, "Camera", "/camera");
     html_buf_printf(&p,
+        "<style>"
+        ".cam-ctl{margin:12px 0;font-size:14px}"
+        ".cam-ctl label{display:inline-block;width:90px}"
+        ".cam-ctl input[type=range]{width:140px;vertical-align:middle}"
+        ".cam-ctl .val{display:inline-block;width:24px;text-align:center}"
+        "</style>"
         "<div style='text-align:center'>"
         "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='MJPEG Stream'>"
-        "</div>");
+        "</div>"
+        "<details open>"
+        "<summary>Image Settings</summary>"
+        "<div class='cam-ctl'><label>Brightness</label>"
+        "<input type='range' min='-2' max='2' value='%d' id='s-br' oninput='camUpd(this,\"vbr\")'>"
+        "<span class='val' id='vbr'>%d</span></div>"
+        "<div class='cam-ctl'><label>Contrast</label>"
+        "<input type='range' min='-2' max='2' value='%d' id='s-co' oninput='camUpd(this,\"vco\")'>"
+        "<span class='val' id='vco'>%d</span></div>"
+        "<div class='cam-ctl'><label>Saturation</label>"
+        "<input type='range' min='-2' max='2' value='%d' id='s-sa' oninput='camUpd(this,\"vsa\")'>"
+        "<span class='val' id='vsa'>%d</span></div>"
+        "<div class='cam-ctl'><label>AE Level</label>"
+        "<input type='range' min='-2' max='2' value='%d' id='s-ae' oninput='camUpd(this,\"vae\")'>"
+        "<span class='val' id='vae'>%d</span></div>"
+        "</details>"
+        "<script>"
+        "function camUpd(el,vid){"
+        "document.getElementById(vid).textContent=el.value;"
+        "fetch('/camera/settings',{method:'POST',"
+        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+        "body:'brightness='+document.getElementById('s-br').value"
+        "+'&contrast='+document.getElementById('s-co').value"
+        "+'&saturation='+document.getElementById('s-sa').value"
+        "+'&ae_level='+document.getElementById('s-ae').value})}"
+        "</script>",
+        bright, bright, contrast, contrast, sat, sat, ae, ae);
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
     esp_err_t ret = httpd_resp_send(req, p.data, p.len);
     html_buf_free(&p);
     return ret;
+}
+
+static esp_err_t camera_settings_post_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    int bright = 0, contrast = 0, sat = 0, ae = 0;
+    char val[8];
+    if (parse_form_field(buf, "brightness", val, sizeof(val))) bright = atoi(val);
+    if (parse_form_field(buf, "contrast", val, sizeof(val)))   contrast = atoi(val);
+    if (parse_form_field(buf, "saturation", val, sizeof(val))) sat = atoi(val);
+    if (parse_form_field(buf, "ae_level", val, sizeof(val)))   ae = atoi(val);
+
+    camera_set_image_params(bright, contrast, sat, ae);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t video_config_post_handler(httpd_req_t *req)
@@ -752,6 +824,12 @@ static esp_err_t video_config_post_handler(httpd_req_t *req)
     /* Camera rotation */
     bool rotate = (strstr(buf, "rotate180=1") != NULL);
     camera_set_rotate180(rotate);
+
+    /* Camera XCLK */
+    char xclk_str[4] = {0};
+    if (parse_form_field(buf, "xclk", xclk_str, sizeof(xclk_str))) {
+        camera_set_xclk_mhz(atoi(xclk_str));
+    }
 
     /* Janus proxy host/port */
     char janus_host[64] = {0};
@@ -939,7 +1017,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 40;
+    config.max_uri_handlers = 56;
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1026,6 +1104,13 @@ esp_err_t httpd_start_server(void)
         .handler  = video_config_post_handler,
     };
     httpd_register_uri_handler(server, &video_cfg_post);
+
+    httpd_uri_t cam_settings_post = {
+        .uri      = "/camera/settings",
+        .method   = HTTP_POST,
+        .handler  = camera_settings_post_handler,
+    };
+    httpd_register_uri_handler(server, &cam_settings_post);
 
     httpd_uri_t device_cfg_post = {
         .uri      = "/device/config",

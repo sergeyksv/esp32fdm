@@ -316,6 +316,7 @@ static void probe_task(void *arg)
 
     s_state = BL_PROBING;
     ESP_LOGI(TAG, "Probe: leveling (G29)...");
+    int64_t mesh_ts_before = s_current_mesh.timestamp;
     err = printer_comm_send_gcode_sync("G29", PROBE_TIMEOUT_MS);
 
     if (err != ESP_OK) {
@@ -328,8 +329,18 @@ static void probe_task(void *arg)
     printer_comm_set_polling_suppressed(false);
 
     /* Mesh is auto-captured by the always-active line callback.
-     * Check if it was picked up. */
-    if (s_current_mesh.grid_y == 0 || s_current_mesh.grid_x == 0) {
+     * The parser may still be processing trailing lines — poll briefly. */
+    bool found = false;
+    for (int i = 0; i < 10; i++) {
+        if (s_current_mesh.timestamp != mesh_ts_before &&
+            s_current_mesh.grid_y > 0 && s_current_mesh.grid_x > 0) {
+            found = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (!found) {
         snprintf(s_error_msg, sizeof(s_error_msg), "No mesh found in G29 output");
         ESP_LOGW(TAG, "%s", s_error_msg);
         s_state = BL_ERROR;
@@ -604,7 +615,7 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "var avg=sum/cnt;sum2=0;"
         "for(var y=0;y<r;y++)for(var x=0;x<g;x++){var v=d[y][x]-avg;sum2+=v*v}"
         "var sd=Math.sqrt(sum2/cnt);"
-        "var badge=range<0.1?'good':range<0.2?'fair':'poor';"
+        "var badge=range<0.3?'good':range<0.6?'fair':'poor';"
         "document.getElementById('mesh-stats').innerHTML="
         "'<div class=\"stats\">"
         "<span>Range: '+range.toFixed(3)+' mm</span>"

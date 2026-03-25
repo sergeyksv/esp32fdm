@@ -52,3 +52,25 @@ void camera_set_rotate180(bool enable);
  * Get current 180° rotation state.
  */
 bool camera_get_rotate180(void);
+
+/**
+ * Set image parameters (brightness, contrast, saturation, AE level).
+ * Each value in range -2..2. Applied immediately and saved to NVS.
+ */
+void camera_set_image_params(int brightness, int contrast, int saturation, int ae_level);
+
+/**
+ * Get current image parameters. Pass NULL for any you don't need.
+ */
+void camera_get_image_params(int *brightness, int *contrast, int *saturation, int *ae_level);
+
+/**
+ * Set camera XCLK frequency. Allowed values: 10, 12, 16, 20 MHz.
+ * Saved to NVS — takes effect after reboot.
+ */
+void camera_set_xclk_mhz(int mhz);
+
+/**
+ * Get current XCLK frequency in MHz.
+ */
+int camera_get_xclk_mhz(void);

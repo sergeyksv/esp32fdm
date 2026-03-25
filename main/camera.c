@@ -14,8 +14,18 @@ static const char *TAG = "camera";
 
 #define NVS_NS_CAMERA  "camera"
 #define NVS_KEY_ROT180 "rotate180"
+#define NVS_KEY_BRIGHTNESS "bright"
+#define NVS_KEY_CONTRAST   "contrast"
+#define NVS_KEY_SATURATION "satur"
+#define NVS_KEY_AE_LEVEL   "ae_level"
+#define NVS_KEY_XCLK       "xclk_mhz"
 
 static bool s_rotate180 = false;
+static uint8_t s_xclk_mhz = 10;  /* default safe value */
+static int8_t s_brightness = 0;   /* -2..2 */
+static int8_t s_contrast = 0;     /* -2..2 */
+static int8_t s_saturation = 0;   /* -2..2 */
+static int8_t s_ae_level = 0;     /* -2..2 */
 
 /* ---- Triple-buffered PSRAM frames ---- */
 
@@ -55,6 +65,15 @@ static portMUX_TYPE s_frame_mux = portMUX_INITIALIZER_UNLOCKED;
 
 esp_err_t camera_init(void)
 {
+    /* Load XCLK from NVS before camera init (needs reboot to change) */
+    nvs_handle_t nvs_pre;
+    if (nvs_open(NVS_NS_CAMERA, NVS_READONLY, &nvs_pre) == ESP_OK) {
+        uint8_t val = 0;
+        if (nvs_get_u8(nvs_pre, NVS_KEY_XCLK, &val) == ESP_OK && val >= 8 && val <= 20)
+            s_xclk_mhz = val;
+        nvs_close(nvs_pre);
+    }
+
     camera_config_t config = {
         .pin_pwdn     = CAM_PIN_PWDN,
         .pin_reset    = CAM_PIN_RESET,
@@ -73,7 +92,7 @@ esp_err_t camera_init(void)
         .pin_href     = CAM_PIN_HREF,
         .pin_pclk     = CAM_PIN_PCLK,
 
-        .xclk_freq_hz = 20000000,  /* 20 MHz */
+        .xclk_freq_hz = s_xclk_mhz * 1000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
@@ -95,9 +114,13 @@ esp_err_t camera_init(void)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NS_CAMERA, NVS_READONLY, &nvs) == ESP_OK) {
         uint8_t val = 0;
-        if (nvs_get_u8(nvs, NVS_KEY_ROT180, &val) == ESP_OK) {
+        if (nvs_get_u8(nvs, NVS_KEY_ROT180, &val) == ESP_OK)
             s_rotate180 = (val != 0);
-        }
+        int8_t sval;
+        if (nvs_get_i8(nvs, NVS_KEY_BRIGHTNESS, &sval) == ESP_OK) s_brightness = sval;
+        if (nvs_get_i8(nvs, NVS_KEY_CONTRAST, &sval) == ESP_OK)   s_contrast = sval;
+        if (nvs_get_i8(nvs, NVS_KEY_SATURATION, &sval) == ESP_OK) s_saturation = sval;
+        if (nvs_get_i8(nvs, NVS_KEY_AE_LEVEL, &sval) == ESP_OK)   s_ae_level = sval;
         nvs_close(nvs);
     }
     sensor_t *s = esp_camera_sensor_get();
@@ -107,6 +130,10 @@ esp_err_t camera_init(void)
          * Invert vflip for OV3660 so rotate180 toggle works the same way. */
         s->set_hmirror(s, s_rotate180 ? 1 : 0);
         s->set_vflip(s, s_rotate180 != is_ov3660 ? 1 : 0);
+        s->set_brightness(s, s_brightness);
+        s->set_contrast(s, s_contrast);
+        s->set_saturation(s, s_saturation);
+        s->set_ae_level(s, s_ae_level);
         ESP_LOGI(TAG, "Sensor: %s", is_ov3660 ? "OV3660" : "OV2640");
     }
 
@@ -296,4 +323,63 @@ void camera_set_rotate180(bool enable)
 bool camera_get_rotate180(void)
 {
     return s_rotate180;
+}
+
+void camera_set_image_params(int brightness, int contrast, int saturation, int ae_level)
+{
+    /* Clamp to -2..2 */
+    #define CLAMP(v) ((v) < -2 ? -2 : (v) > 2 ? 2 : (v))
+    s_brightness = CLAMP(brightness);
+    s_contrast   = CLAMP(contrast);
+    s_saturation = CLAMP(saturation);
+    s_ae_level   = CLAMP(ae_level);
+    #undef CLAMP
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_brightness(s, s_brightness);
+        s->set_contrast(s, s_contrast);
+        s->set_saturation(s, s_saturation);
+        s->set_ae_level(s, s_ae_level);
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS_CAMERA, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_i8(nvs, NVS_KEY_BRIGHTNESS, s_brightness);
+        nvs_set_i8(nvs, NVS_KEY_CONTRAST,   s_contrast);
+        nvs_set_i8(nvs, NVS_KEY_SATURATION, s_saturation);
+        nvs_set_i8(nvs, NVS_KEY_AE_LEVEL,   s_ae_level);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    ESP_LOGI(TAG, "Image: bright=%d contrast=%d sat=%d ae=%d",
+             s_brightness, s_contrast, s_saturation, s_ae_level);
+}
+
+void camera_get_image_params(int *brightness, int *contrast, int *saturation, int *ae_level)
+{
+    if (brightness) *brightness = s_brightness;
+    if (contrast)   *contrast   = s_contrast;
+    if (saturation) *saturation = s_saturation;
+    if (ae_level)   *ae_level   = s_ae_level;
+}
+
+void camera_set_xclk_mhz(int mhz)
+{
+    if (mhz != 10 && mhz != 12 && mhz != 16 && mhz != 20) return;
+    s_xclk_mhz = mhz;
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS_CAMERA, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_XCLK, s_xclk_mhz);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGI(TAG, "XCLK set to %d MHz (reboot to apply)", mhz);
+}
+
+int camera_get_xclk_mhz(void)
+{
+    return s_xclk_mhz;
 }
