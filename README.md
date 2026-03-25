@@ -77,6 +77,16 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - Auto-locked during prints to prevent interference
 - Hidden when Klipper backend is selected (use Mainsail/Fluidd instead)
 
+### Utilities
+
+#### Bed Leveling (Marlin only)
+- **One-click bed probing** — sends G28 + G29, visualizes the result as a color-coded mesh grid (blue = low, green = zero, red = high)
+- **Auto-capture** — mesh is captured whenever G29 output appears, whether triggered from the web UI, terminal, printer LCD, or OctoPrint
+- **Mesh history** — up to 100 past meshes stored on flash with prev/next browsing
+- **Quality stats** — range, max deviation, standard deviation, and a Good/Fair/Poor verdict badge
+- **Screw adjustment calculator** — choose Tighten (CW) or Loosen (CCW) mode, get per-corner corrections in 1/4 + 1/8 turn increments
+- **Configurable** — bed size, screw spacing, screw pitch, and origin corner (FL/FR/BL/BR) persisted across reboots
+
 ### WiFi & Configuration
 - **Auto AP fallback** — if WiFi credentials are missing or connection fails, the board creates its own access point (`ESP32FDM-XXXX`) with a captive portal for setup
 - All settings configurable via web UI — no reflashing needed
@@ -87,7 +97,7 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **Temperature history graph** — 1 hour of data, auto-refreshing canvas chart
 - Print progress bar with layer count, elapsed time, and ETA
 - Live camera snapshot (auto-refreshing)
-- Responsive nav: Home, Camera, SD Card, Terminal (Marlin only), Settings
+- Responsive nav: Home, Cam, SD, Term (Marlin only), Utils (Marlin only), Logs, Settings
 
 ## Hardware
 
@@ -195,6 +205,11 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/sd/pause` | POST | Pause print |
 | `/sd/resume` | POST | Resume print |
 | `/sd/cancel` | POST | Cancel print |
+| `/utils` | GET | Utilities index page |
+| `/bedlevel` | GET | Bed leveling page |
+| `/bedlevel/probe` | POST | Start G28+G29 probing |
+| `/bedlevel/status` | GET | Probing state + mesh JSON |
+| `/bedlevel/config` | GET/POST | Bed config (size, screws, origin) |
 | `/api/status` | GET | JSON printer status |
 | `/api/temp_history` | GET | Temperature history (1h, 4s intervals) |
 | `/settings` | GET | Settings page |
@@ -229,6 +244,7 @@ main/
   sdcard.c/h           — SD card mount/unmount, file operations
   sdcard_httpd.c/h     — SD card web UI, backend-aware print/pause/resume/cancel
   cache.c/h            — LittleFS cache housekeeping (LRU eviction, mtime touch)
+  bedlevel.c/h         — Bed leveling: mesh probe, visualization, screw adjustment (Marlin only)
   obico_client.c/h     — Obico WebSocket, snapshot upload, Janus signaling
   rfc2217.c/h          — RFC 2217 Telnet COM-PORT-OPTION server (Marlin only)
   dns_server.c         — Captive portal DNS responder
