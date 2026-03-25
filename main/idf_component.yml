@@ -15,3 +15,5 @@ dependencies:
     version: "^1.2.0"
   espressif/mdns:
     version: "^1.0.0"
+  joltwallet/littlefs:
+    version: "^1.14.0"

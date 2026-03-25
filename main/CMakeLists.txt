@@ -12,6 +12,7 @@ set(SRCS
     "rfc2217.c"
     "terminal.c"
     "logbuf.c"
+    "cache.c"
     "dns_server.c"
     "mdns_service.c"
     "ota.c"

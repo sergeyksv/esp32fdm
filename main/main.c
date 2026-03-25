@@ -11,6 +11,7 @@
 #include "logbuf.h"
 #include "mdns_service.h"
 #include "ota.h"
+#include "esp_littlefs.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -84,6 +85,22 @@ void app_main(void)
 
     /* SD card — optional, non-fatal if no card inserted */
     sdcard_init();
+
+    /* LittleFS cache partition (~12MB) */
+    esp_vfs_littlefs_conf_t lfs_conf = {
+        .base_path = "/cache",
+        .partition_label = "cache",
+        .format_if_mount_failed = true,
+    };
+    ret = esp_vfs_littlefs_register(&lfs_conf);
+    if (ret == ESP_OK) {
+        size_t total = 0, used = 0;
+        esp_littlefs_info("cache", &total, &used);
+        ESP_LOGI(TAG, "LittleFS /cache: %u KB used / %u KB total",
+                 (unsigned)(used / 1024), (unsigned)(total / 1024));
+    } else {
+        ESP_LOGW(TAG, "LittleFS mount failed: %s", esp_err_to_name(ret));
+    }
 
     /* Terminal ring buffer (must init before HTTP server & USB RX) */
     terminal_init();

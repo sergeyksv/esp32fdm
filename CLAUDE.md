@@ -39,6 +39,7 @@ main/
   terminal.c/h          — Web GCode terminal (Marlin only)
   sdcard.c/h            — SD card mount/unmount
   sdcard_httpd.c/h      — SD card web UI, backend-aware print/pause/resume/cancel
+  cache.c/h             — LittleFS cache housekeeping (LRU eviction by mtime)
   obico_client.c/h      — Obico WebSocket, snapshot upload, Janus signaling
   rfc2217.c/h           — RFC 2217 Telnet server (Marlin only)
   layout.h              — Shared HTML layout, nav bar (hides Marlin-only items for Klipper)
@@ -51,6 +52,7 @@ main/
 - **Left USB-C:** ESP32-S3 native USB (GPIO19/20) — OTG Host to printer
 - **Camera:** OV2640 or OV3660 on DVP (GPIOs 4-18, no conflict with USB)
 - **PSRAM:** 8MB OPI — camera frame buffers
+- **Flash:** 16MB — 4MB app (dual OTA), ~12MB LittleFS cache partition
 
 ## Core Affinity
 
@@ -69,6 +71,7 @@ main/
 - Klipper SD print: uploads from local SD to Moonraker with size-based dedup, auto-deletes previous upload
 - Marlin host print uses line numbering + checksums; M110 N0 reset on finish to prevent resend loops
 - Terminal and RFC 2217 hidden from UI when Klipper backend is selected
+- GCode file info (layers, time, filament, thumbnail) cached in `/cache/gcode/` on LittleFS — keyed by filename + file size, LRU eviction at 50 entries
 
 ## OctoPrint Configuration
 

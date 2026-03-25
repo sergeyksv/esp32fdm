@@ -69,6 +69,7 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **On-board SD card** file management — upload, download, delete via web UI
 - **Marlin**: host-based GCode streaming from SD with line numbering, checksums, and resend handling
 - **Klipper**: uploads from SD to Moonraker with size-based dedup (skips if unchanged), auto-deletes previous upload to prevent storage bloat
+- **GCode scan cache** — file metadata (layers, time, filament, thumbnail) cached on flash so repeated prints load instantly instead of re-scanning
 - Pause, resume, and cancel work with both backends
 
 ### Web Terminal (Marlin only)
@@ -94,7 +95,7 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 
 Developed on the **Freenove ESP32-S3-WROOM**, but works with compatible clones that share the same pin layout (many generic ESP32-S3-CAM boards on AliExpress/Amazon are near-identical). Some clones may require holding a BOOT button during flashing. Required features:
 
-- **ESP32-S3** dual-core with **8MB PSRAM** (OPI)
+- **ESP32-S3** dual-core with **8MB PSRAM** (OPI) and **16MB flash**
 - **OV2640 or OV3660 camera** on DVP bus
 - **SD card slot** (1-bit SDMMC on GPIO 38/39/40)
 - **Two USB-C ports:**
@@ -227,6 +228,7 @@ main/
   terminal.c/h         — Web serial terminal with ring buffer (Marlin only)
   sdcard.c/h           — SD card mount/unmount, file operations
   sdcard_httpd.c/h     — SD card web UI, backend-aware print/pause/resume/cancel
+  cache.c/h            — LittleFS cache housekeeping (LRU eviction, mtime touch)
   obico_client.c/h     — Obico WebSocket, snapshot upload, Janus signaling
   rfc2217.c/h          — RFC 2217 Telnet COM-PORT-OPTION server (Marlin only)
   dns_server.c         — Captive portal DNS responder

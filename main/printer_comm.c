@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#include "cache.h"
 
 static const char *TAG = "printer_comm";
 
@@ -965,6 +968,117 @@ static void scan_gcode_file(FILE *f, gcode_scan_t *out)
              out->layer_height, out->first_layer_height);
 }
 
+/* ---- GCode scan cache (/cache/gcode/) ---- */
+
+#define GCODE_CACHE_DIR  "/cache/gcode"
+#define GCODE_CACHE_MAGIC 0x47434301  /* "GCC\x01" */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    long     file_size;       /* cache key */
+    int32_t  total_layers;
+    float    layer_height;
+    float    first_layer_height;
+    float    max_z;
+    int32_t  est_time_s;
+    float    filament_used_mm;
+    float    filament_used_g;
+    int32_t  thumb_w, thumb_h;
+    uint32_t thumb_len;       /* 0 = no thumbnail, else base64 bytes follow */
+} gcode_cache_hdr_t;
+
+/* Build cache path from source filename (basename only). */
+static void gcode_cache_path(const char *src_path, char *out, size_t out_sz)
+{
+    const char *base = strrchr(src_path, '/');
+    base = base ? base + 1 : src_path;
+    snprintf(out, out_sz, GCODE_CACHE_DIR "/%s.cache", base);
+}
+
+/* Try to load cached scan result. Returns true on hit. */
+static bool gcode_cache_load(const char *src_path, long file_size,
+                             gcode_file_info_t *out)
+{
+    char cpath[160];
+    gcode_cache_path(src_path, cpath, sizeof(cpath));
+
+    FILE *f = fopen(cpath, "rb");
+    if (!f) return false;
+
+    gcode_cache_hdr_t hdr;
+    bool ok = false;
+    if (fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+        hdr.magic == GCODE_CACHE_MAGIC &&
+        hdr.file_size == file_size) {
+        out->total_layers      = hdr.total_layers;
+        out->layer_height      = hdr.layer_height;
+        out->first_layer_height = hdr.first_layer_height;
+        out->max_z             = hdr.max_z;
+        out->est_time_s        = hdr.est_time_s;
+        out->filament_used_mm  = hdr.filament_used_mm;
+        out->filament_used_g   = hdr.filament_used_g;
+        out->thumb_w           = hdr.thumb_w;
+        out->thumb_h           = hdr.thumb_h;
+        out->thumbnail_base64  = NULL;
+        if (hdr.thumb_len > 0 && hdr.thumb_len < 200000) {
+            char *tb = malloc(hdr.thumb_len + 1);
+            if (tb && fread(tb, 1, hdr.thumb_len, f) == hdr.thumb_len) {
+                tb[hdr.thumb_len] = '\0';
+                out->thumbnail_base64 = tb;
+            } else {
+                free(tb);
+            }
+        }
+        ok = true;
+        ESP_LOGI(TAG, "GCode cache hit: %s", cpath);
+    }
+    fclose(f);
+    if (ok) cache_touch(cpath);
+    return ok;
+}
+
+#define GCODE_CACHE_MAX_ENTRIES 50
+
+/* Save scan result to cache. */
+static void gcode_cache_save(const char *src_path, long file_size,
+                             const gcode_file_info_t *info)
+{
+    /* Ensure cache directory exists */
+    mkdir(GCODE_CACHE_DIR, 0755);
+
+    char cpath[160];
+    gcode_cache_path(src_path, cpath, sizeof(cpath));
+
+    FILE *f = fopen(cpath, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "GCode cache write failed: %s", cpath);
+        return;
+    }
+
+    gcode_cache_hdr_t hdr = {
+        .magic              = GCODE_CACHE_MAGIC,
+        .file_size          = file_size,
+        .total_layers       = info->total_layers,
+        .layer_height       = info->layer_height,
+        .first_layer_height = info->first_layer_height,
+        .max_z              = info->max_z,
+        .est_time_s         = info->est_time_s,
+        .filament_used_mm   = info->filament_used_mm,
+        .filament_used_g    = info->filament_used_g,
+        .thumb_w            = info->thumb_w,
+        .thumb_h            = info->thumb_h,
+        .thumb_len          = info->thumbnail_base64 ? (uint32_t)strlen(info->thumbnail_base64) : 0,
+    };
+    fwrite(&hdr, sizeof(hdr), 1, f);
+    if (hdr.thumb_len > 0)
+        fwrite(info->thumbnail_base64, 1, hdr.thumb_len, f);
+    fclose(f);
+    ESP_LOGI(TAG, "GCode cache saved: %s (%u bytes)", cpath,
+             (unsigned)(sizeof(hdr) + hdr.thumb_len));
+
+    cache_evict_lru(GCODE_CACHE_DIR, GCODE_CACHE_MAX_ENTRIES);
+}
+
 /* ---- Public file info scan (head + tail for speed) ---- */
 
 void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
@@ -975,13 +1089,16 @@ void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
     out->filament_used_mm = -1;
     out->filament_used_g = -1;
 
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    long file_size = (long)st.st_size;
+
+    /* Check cache first */
+    if (gcode_cache_load(path, file_size, out))
+        return;
+
     FILE *f = fopen(path, "r");
     if (!f) return;
-
-    /* Get file size for tail scanning */
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    rewind(f);
 
     char buf[256];
     int32_t max_layer = -1;
@@ -1318,6 +1435,9 @@ void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
              (long)out->total_layers, out->max_z, (long)out->est_time_s,
              out->filament_used_mm, out->filament_used_g,
              out->thumb_w, out->thumb_h);
+
+    /* Save to cache for next time */
+    gcode_cache_save(path, file_size, out);
 }
 
 /** Query current position and save it, then park the head */
