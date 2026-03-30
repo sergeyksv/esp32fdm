@@ -24,7 +24,7 @@ static const char *TAG = "bedlevel";
 #define BL_CACHE_DIR   "/cache/beds"
 #define BL_CONFIG_FILE BL_CACHE_DIR "/config.json"
 #define BL_CACHE_MAX   100
-#define PROBE_TIMEOUT_MS 600000   /* 10 min — covers up to 10x10 mesh */
+#define PROBE_TIMEOUT_MS 1200000  /* 20 min — covers up to 10x10 mesh */
 
 /* ---- Data types ---- */
 
