@@ -144,25 +144,8 @@ void printer_config_render_backend(html_buf_t *p);
  */
 void printer_config_render_marlin(html_buf_t *p);
 
-/* ---- G-code file info extraction ---- */
-
-typedef struct {
-    int32_t total_layers;
-    float layer_height;
-    float first_layer_height;
-    float max_z;
-    int32_t est_time_s;        /* -1 if unknown */
-    float filament_used_mm;    /* total mm, -1 if unknown */
-    float filament_used_g;     /* total g, -1 if unknown */
-    char *thumbnail_base64;    /* malloc'd, caller frees (NULL if none) */
-    int thumb_w, thumb_h;      /* thumbnail dimensions */
-} gcode_file_info_t;
-
-/**
- * Scan a G-code file for metadata: layers, time, filament, thumbnail.
- * Scans head and tail of file for speed. Caller must free thumbnail_base64.
- */
-void gcode_scan_file_info(const char *path, gcode_file_info_t *out);
+/* ---- G-code file info extraction (see gcode_scan.h) ---- */
+#include "gcode_scan.h"
 
 /**
  * Start host-based GCode printing from a file on /sdcard.

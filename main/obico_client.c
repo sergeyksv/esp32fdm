@@ -12,7 +12,6 @@
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "nvs_flash.h"
@@ -173,28 +172,6 @@ static void load_server_url_from_nvs(void)
     nvs_close(nvs);
 }
 
-/* ---- SNTP ---- */
-
-static void init_sntp(void)
-{
-    ESP_LOGI(TAG, "Initializing SNTP");
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.google.com");
-    esp_sntp_init();
-
-    /* Wait up to 10s for time sync */
-    int retry = 0;
-    while (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < 20) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        retry++;
-    }
-    if (retry < 20) {
-        ESP_LOGI(TAG, "SNTP time synchronized");
-    } else {
-        ESP_LOGW(TAG, "SNTP sync timeout — timestamps may be wrong");
-    }
-}
 
 static double get_unix_timestamp(void)
 {
@@ -1354,9 +1331,6 @@ esp_err_t obico_set_janus_proxy(const char *host, uint16_t port)
 
 esp_err_t obico_client_init(void)
 {
-    /* Initialize SNTP for timestamps */
-    init_sntp();
-
     /* Load server URL from NVS (or Kconfig default) */
     load_server_url_from_nvs();
 

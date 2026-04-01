@@ -67,10 +67,11 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "<progress id='upload-prog' value='0' max='100' style='width:100%%;display:none;margin:4px 0'></progress>"
         "<span id='upload-status'></span>"
         "<h3>Files</h3>"
-        "<table><thead><tr><th>Name</th><th>Size</th><th></th></tr></thead>"
+        "<table><thead><tr><th>File</th><th></th></tr></thead>"
         "<tbody id='files'></tbody></table>"
         "<script>"
         "function fmt(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB'}"
+        "function fmtDate(t){if(!t)return'-';var d=new Date(t*1000),m=d.getMonth()+1,dy=d.getDate(),y=d.getFullYear(),h=d.getHours(),mi=d.getMinutes();return y+'-'+(m<10?'0':'')+m+'-'+(dy<10?'0':'')+dy+' '+(h<10?'0':'')+h+':'+(mi<10?'0':'')+mi}"
         "function fmtTime(s){if(s<0)return'Unknown';var h=Math.floor(s/3600),m=Math.floor((s%%3600)/60);return h>0?h+'h '+m+'m':m+'m'}"
         "function info(name){"
         "document.getElementById('info-name').textContent=name;"
@@ -98,13 +99,14 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "function closeInfo(){document.getElementById('modal-bg').classList.remove('show')}"
         "function load(){"
         "fetch('/sd/files').then(function(r){return r.json()}).then(function(f){"
+        "f.sort(function(a,b){return(b.mtime||0)-(a.mtime||0)});"
         "var h='';f.forEach(function(x){"
-        "h+='<tr><td>'+x.name+'</td><td style=\"color:#666;font-size:.9em\">'+fmt(x.size)+'</td><td>'"
+        "h+='<tr><td>'+x.name+'<br><span style=\"color:#888;font-size:.75em\">'+fmt(x.size)+' &mdash; '+fmtDate(x.mtime)+'</span></td><td>'"
         "+'<button onclick=\"info(\\''+x.name.replace(/'/g,\"\\\\'\")+'\\')\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Info</button> '"
         "+'<form method=POST action=/sd/print style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Print</button></form> '"
         "+'<form method=POST action=/sd/delete style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Del</button></form>'"
         "+'</td></tr>'});"
-        "document.getElementById('files').innerHTML=h||'<tr><td colspan=3>No files</td></tr>';});}"
+        "document.getElementById('files').innerHTML=h||'<tr><td colspan=2>No files</td></tr>';});}"
         "function upload(){"
         "var f=document.getElementById('file').files[0];if(!f)return;"
         "var x=new XMLHttpRequest();"
@@ -152,9 +154,9 @@ static esp_err_t sd_files_handler(httpd_req_t *req)
         if (stat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) continue;
 
-        char entry[320];
-        snprintf(entry, sizeof(entry), "%s{\"name\":\"%s\",\"size\":%ld}",
-                 first ? "" : ",", ent->d_name, (long)st.st_size);
+        char entry[360];
+        snprintf(entry, sizeof(entry), "%s{\"name\":\"%s\",\"size\":%ld,\"mtime\":%ld}",
+                 first ? "" : ",", ent->d_name, (long)st.st_size, (long)st.st_mtime);
         httpd_resp_sendstr_chunk(req, entry);
         first = false;
     }

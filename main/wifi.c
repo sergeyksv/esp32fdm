@@ -5,6 +5,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -187,6 +188,16 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Connected — IP: %s", s_ip_str);
         s_retry_num = 0;
+
+        /* Start SNTP time sync (non-blocking, runs in background) */
+        if (!esp_sntp_enabled()) {
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_init();
+            ESP_LOGI(TAG, "SNTP started");
+        }
+
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }

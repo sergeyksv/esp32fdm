@@ -7,6 +7,8 @@ set(SRCS
     "sdcard.c"
     "sdcard_httpd.c"
     "printer_comm.c"
+    "gcode_scan.c"
+    "host_print.c"
     "printer_comm_klipper.c"
     "obico_client.c"
     "rfc2217.c"
