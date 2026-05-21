@@ -40,7 +40,7 @@ static const char *TAG = "printer_comm";
 #define POLL_M114_INTERVAL_MS           30000
 #define POLL_M119_INTERVAL_MS           30000   /* Filament sensor check during host print */
 #define CMD_RESPONSE_TIMEOUT_MS         6000
-#define WAIT_SILENT_TIMEOUT_MS          120000  /* G28/G29: no interim feedback, needs long timeout */
+#define WAIT_SILENT_TIMEOUT_MS          240000  /* G28/G29: can be silent for minutes, needs long timeout */
 #define WAIT_TEMP_TIMEOUT_MS            30000   /* M109/M190/M116: first temp report can be delayed */
 #define HOST_STALL_PING_RETRIES         5       /* Echo-ping retries before giving up on a stalled cmd */
 #define RX_LINE_BUF_SIZE        256
@@ -493,6 +493,16 @@ static void process_line(const char *line)
         return;
     }
 
+    /* G29 bed leveling in progress — Marlin sends "measured_z:" for each probe
+     * point instead of "ok".  Back off longer than normal busy to span the
+     * gap between probes (~6-8 s).  The final "ok" after the mesh grid
+     * clears the cooldown and resumes polling. */
+    if (strstr(line, "measured_z:")) {
+        s_cmd_cooldown_until_us = esp_timer_get_time() + 10000000LL; /* 10 s */
+        s_pending_query = QUERY_NONE;
+        return;
+    }
+
     /* Marlin resend request: "Resend: N123" or "rs N123" */
     if (strncasecmp(line, "resend", 6) == 0 || strncmp(line, "rs ", 3) == 0) {
         const char *p = line;
@@ -559,8 +569,10 @@ static bool is_wait_cmd(const char *gcode, bool *is_silent, int *timeout_overrid
     if (*p == 'G') {
         int code = atoi(p + 1);
         if (code == 29) {
-            /* G29 produces probe output and temp auto-reports — not silent.
-             * 30s initial timeout, extended on each received line. */
+            /* G29 bed leveling: can be silent for minutes between temp
+             * stabilization and first probe point (homing in between).
+             * Treat as silent for long initial + extension timeout. */
+            if (is_silent) *is_silent = true;
             return true;
         }
         if (code == 28) {
@@ -704,12 +716,14 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                     if (wait) {
                         s_pending_query = qtype;
                     }
-                    deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
+                    int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
+                    deadline = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
                 }
                 /* Wait commands: printer sends temp reports ("T:... W:N") while
                  * waiting — extend deadline on any received line, not just "busy". */
                 else if (wait && s_pending_query != QUERY_NONE) {
-                    deadline = esp_timer_get_time() + CMD_RESPONSE_TIMEOUT_MS * 1000LL;
+                    int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
+                    deadline = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
                 }
             }
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
