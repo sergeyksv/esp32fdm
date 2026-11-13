@@ -1,0 +1,21 @@
+services:
+  fdmhub:
+    build: .
+    container_name: fdmhub
+    restart: unless-stopped
+    # Must be able to read telegram.env, which should be mode 600
+    user: "${FDMHUB_UID:-1000}"
+    read_only: true
+    ports:
+      - "8787:8787"
+    # The list of printers, so that boards that are off still show after a restart.
+    # ./data must be writable by FDMHUB_UID.
+    command: ["python", "/app/hub.py", "--env", "/config/telegram.env", "--state", "/data/printers.json"]
+    volumes:
+      - ./telegram.env:/config/telegram.env:ro
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"

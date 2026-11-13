@@ -3,6 +3,7 @@
 
 #include "camera.h"
 #include "printer_comm.h"
+#include "i18n.h"
 #include "layout.h"
 #include "url_util.h"
 
@@ -861,27 +862,31 @@ void obico_render_settings(html_buf_t *p)
     if (s_linked) {
         html_buf_printf(p,
             "<form id='f-obico' method='POST' action='/obico/unlink'></form>"
-            "<p>Status: <span style='color:#4CAF50;font-weight:bold'>Linked</span>"
-            " to %s</p>", s_server_url);
+            "<p>%s <span style='color:#4CAF50;font-weight:bold'>%s</span> ",
+            _("Status:"), _("Linked"));
+        html_buf_printf(p, _("to %s"), s_server_url);
+        html_buf_printf(p, "</p>");
     } else {
         html_buf_printf(p,
-            "<p>Status: <span style='color:#999'>Not linked</span></p>"
+            "<p>%s <span style='color:#999'>%s</span></p>"
             "<form id='f-obico-server' method='POST' action='/obico/server'>"
-            "<label>Server URL<br><input type='url' name='server_url' value='%s' "
+            "<label>%s<br><input type='url' name='server_url' value='%s' "
             "placeholder='https://app.obico.io' "
             "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
-            "<button type='submit' style='margin:8px 0'>Save</button>"
+            "<button type='submit' style='margin:8px 0'>%s</button>"
             "</form>"
             "<form id='f-obico' method='POST' action='/obico/link'>"
-            "<p>Enter the 6-digit code from <a href='%s' target='_blank'>Obico</a>:</p>"
+            "<p>%s <a href='%s' target='_blank'>Obico</a>:</p>"
             "<input type='text' name='code' placeholder='123456' maxlength='6' pattern='[0-9]{6}' required "
             "style='padding:8px;width:100%%;box-sizing:border-box;margin:8px 0'>"
             "</form>",
-            s_server_url, s_server_url);
+            _("Status:"), _("Not linked"), _("Server URL"), s_server_url, _("Save"),
+            _("Enter the 6-digit code from"), s_server_url);
     }
     html_buf_printf(p,
-        "<p class='hint'><a href='/obico/status'>Status</a> | "
-        "<a href='/obico/simulate'>Simulate</a></p>");
+        "<p class='hint'><a href='/obico/status'>%s</a> | "
+        "<a href='/obico/simulate'>%s</a></p>",
+        _("Status"), _("Simulate"));
 }
 
 static esp_err_t obico_link_get_handler(httpd_req_t *req)
@@ -924,15 +929,17 @@ static esp_err_t obico_link_post_handler(httpd_req_t *req)
 
     html_buf_t hb;
     html_buf_init(&hb);
-    layout_html_begin(&hb, err == ESP_OK ? "Linked" : "Link Failed", "/settings");
+    layout_html_begin(&hb, err == ESP_OK ? NT_("Linked") : NT_("Link Failed"), "/settings");
     if (err == ESP_OK) {
         html_buf_printf(&hb,
-            "<h2 style='color:#3c763d'>Linked successfully!</h2>"
-            "<p>This printer is now connected to Obico.</p>");
+            "<h2 style='color:#3c763d'>%s</h2>"
+            "<p>%s</p>",
+            _("Linked successfully!"), _("This printer is now connected to Obico."));
     } else {
         html_buf_printf(&hb,
-            "<h2 style='color:#a94442'>Linking failed</h2>"
-            "<p>Check the code and try again. <a href='/settings'>Back</a></p>");
+            "<h2 style='color:#a94442'>%s</h2>"
+            "<p>%s <a href='/settings'>%s</a></p>",
+            _("Linking failed"), _("Check the code and try again."), _("Back"));
     }
     layout_html_end(&hb);
 
@@ -1009,16 +1016,17 @@ static esp_err_t obico_simulate_handler(httpd_req_t *req)
     bool currently_on = printer_comm_is_simulating();
     printer_comm_set_simulate(!currently_on);
 
-    const char *state_str = !currently_on ? "ON &mdash; printing with fake data"
-                                          : "OFF &mdash; real printer state";
+    const char *state_str = !currently_on ? _("ON") : _("OFF");
+    const char *state_desc = !currently_on ? _("printing with fake data")
+                                           : _("real printer state");
     html_buf_t p;
     html_buf_init(&p);
-    layout_html_begin(&p, "Simulate", "/settings");
+    layout_html_begin(&p, NT_("Simulate"), "/settings");
     html_buf_printf(&p,
-        "<h2>Simulation: %s</h2>"
-        "<p><a href='/obico/simulate'>Toggle</a> | "
-        "<a href='/obico/status'>Status</a></p>",
-        state_str);
+        "<h2>%s %s &mdash; %s</h2>"
+        "<p><a href='/obico/simulate'>%s</a> | "
+        "<a href='/obico/status'>%s</a></p>",
+        _("Simulation:"), state_str, state_desc, _("Toggle"), _("Status"));
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");

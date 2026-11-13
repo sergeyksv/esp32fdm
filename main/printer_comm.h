@@ -33,6 +33,12 @@ typedef struct {
     bool host_printing;          /* true if ESP32 is streaming GCode from SD */
     int32_t current_layer;       /* current layer from ;LAYER:N comments */
     float probe_z_offset;        /* Z probe offset from M290 query (Marlin) */
+    bool preparing;              /* host print running, file scan not finished yet */
+    bool holding;                /* host print waiting for the user (M0/M1 in file) */
+    uint32_t hold_id;            /* identifies the current hold, valid while holding */
+    char hold_msg[64];           /* text from M0/M1, safe for JSON and HTML */
+    float z_shift;               /* manual Z shift sent in this print, mm */
+    float z_pending;             /* tapped, not sent to the printer yet, mm */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
 } printer_state_t;
 
@@ -154,6 +160,14 @@ void printer_config_render_marlin(html_buf_t *p);
 esp_err_t printer_comm_host_print_start(const char *filename);
 
 /**
+ * Start a host print of a built-in G-code script, as if it were a file named
+ * name: holds, /print, notifications and cancel all work the same.
+ * Takes ownership of script (malloc'd, NUL-terminated) whatever the result.
+ * Returns ESP_ERR_INVALID_STATE if another script is still being started.
+ */
+esp_err_t printer_comm_host_print_script(const char *name, char *script);
+
+/**
  * Pause host print (stops sending lines, heaters stay on).
  */
 esp_err_t printer_comm_host_print_pause(void);
@@ -167,6 +181,20 @@ esp_err_t printer_comm_host_print_resume(void);
  * Cancel host print (closes file, turns off heaters, disables motors).
  */
 esp_err_t printer_comm_host_print_cancel(void);
+
+/**
+ * Continue after a wait for the user.  Ignored unless hold_id is the current
+ * hold, so a repeated request cannot skip the next M0/M1 in the file.
+ */
+esp_err_t printer_comm_host_print_continue(uint32_t hold_id);
+
+/**
+ * Add a babystep to the current host print.  Does not block: taps accumulate
+ * and go to the printer as one M290 when it is ready.
+ * Returns ESP_ERR_INVALID_STATE if Z cannot be adjusted now, and
+ * ESP_ERR_INVALID_SIZE if the step would exceed the limit per print.
+ */
+esp_err_t printer_comm_host_print_zstep(float dz);
 
 /**
  * Returns true if a host print is currently active (printing or paused).

@@ -33,17 +33,19 @@ void ota_confirm_boot(void)
 
 typedef struct {
     httpd_req_t *req;
+    int lang;               /* Of the request: the errors go back to the page */
 } ota_upload_ctx_t;
 
 static void ota_upload_task(void *arg)
 {
     ota_upload_ctx_t *ctx = (ota_upload_ctx_t *)arg;
     httpd_req_t *req = ctx->req;
+    i18n_set_lang(ctx->lang);
     free(ctx);
 
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("No OTA partition"));
         goto done;
     }
 
@@ -51,14 +53,14 @@ static void ota_upload_task(void *arg)
     esp_err_t err = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("OTA begin failed"));
         goto done;
     }
 
     char *buf = malloc(OTA_BUF_SIZE);
     if (!buf) {
         esp_ota_abort(ota_handle);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("Out of memory."));
         goto done;
     }
 
@@ -91,7 +93,7 @@ static void ota_upload_task(void *arg)
                 free(buf);
                 esp_ota_abort(ota_handle);
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                    "Not a valid ESP32 application image");
+                                    _("Not a valid ESP32 application image"));
                 goto done;
             }
 
@@ -102,7 +104,7 @@ static void ota_upload_task(void *arg)
                 free(buf);
                 esp_ota_abort(ota_handle);
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                    "Wrong firmware — project name does not match");
+                                    _("Wrong firmware — project name does not match"));
                 goto done;
             }
 
@@ -125,7 +127,7 @@ static void ota_upload_task(void *arg)
 
     if (error) {
         esp_ota_abort(ota_handle);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("OTA write failed"));
         goto done;
     }
 
@@ -133,14 +135,14 @@ static void ota_upload_task(void *arg)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s (image validation error?)", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "Firmware validation failed — bad image?");
+                            _("Firmware validation failed — bad image?"));
         goto done;
     }
 
     err = esp_ota_set_boot_partition(update);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Set boot partition failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("Set boot partition failed"));
         goto done;
     }
 
@@ -163,13 +165,13 @@ done:
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     if (req->content_len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No firmware data");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, _("No firmware data"));
         return ESP_FAIL;
     }
 
     /* Sanity check: firmware should be at least 256 bytes and under 2MB */
     if (req->content_len < 256 || req->content_len > 0x200000) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid firmware size");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, _("Invalid firmware size"));
         return ESP_FAIL;
     }
 
@@ -185,6 +187,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     ctx->req = async_req;
+    ctx->lang = i18n_lang();
 
     if (xTaskCreatePinnedToCore(ota_upload_task, "ota_up", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
@@ -216,13 +219,14 @@ void ota_render_settings(html_buf_t *p)
     const esp_app_desc_t *app = esp_app_get_description();
 
     html_buf_printf(p,
-        "<hr><div class='sh'><h2>Firmware Update</h2></div>"
-        "<p class='hint'>Running: <b>v%s</b> on <b>%s</b>"
-        " &middot; Built %s %s</p>"
+        i18n_page(
+        "<hr><div class='sh'><h2>" N_("Firmware Update") "</h2></div>"
+        "<p class='hint'>" N_("Running:") " <b>v%s</b> " N_("on partition") " <b>%s</b>"
+        " &middot; " N_("Built") " %s %s</p>"
         "<form id='ota-form'>"
         "<input type='file' id='ota-file' accept='.bin' "
         "style='margin:8px 0;display:block'>"
-        "<button type='submit' id='ota-btn'>Upload &amp; Flash</button>"
+        "<button type='submit' id='ota-btn'>" N_("Upload &amp; Flash") "</button>"
         "</form>"
         "<progress id='ota-prog' max='100' value='0' "
         "style='width:100%%;display:none;margin:8px 0'></progress>"
@@ -231,8 +235,8 @@ void ota_render_settings(html_buf_t *p)
         "document.getElementById('ota-form').onsubmit=function(e){"
         "e.preventDefault();"
         "var f=document.getElementById('ota-file').files[0];"
-        "if(!f){alert('Select a firmware .bin file');return;}"
-        "if(!confirm('Flash firmware '+f.name+' ('+Math.round(f.size/1024)+' KB)?'))return;"
+        "if(!f){alert('" N_("Select a firmware .bin file") "');return;}"
+        "if(!confirm('" N_("Flash firmware") " '+f.name+' ('+Math.round(f.size/1024)+' KB)?'))return;"
         "var xhr=new XMLHttpRequest();"
         "var prog=document.getElementById('ota-prog');"
         "var stat=document.getElementById('ota-status');"
@@ -240,17 +244,17 @@ void ota_render_settings(html_buf_t *p)
         "btn.disabled=true;prog.style.display='block';"
         "xhr.upload.onprogress=function(ev){"
         "if(ev.lengthComputable){prog.value=Math.round(ev.loaded/ev.total*100);"
-        "stat.textContent='Uploading: '+Math.round(ev.loaded/1024)+'/'+Math.round(ev.total/1024)+' KB';}};"
+        "stat.textContent='" N_("Uploading:") " '+Math.round(ev.loaded/1024)+'/'+Math.round(ev.total/1024)+' KB';}};"
         "xhr.onload=function(){"
-        "if(xhr.status==200){stat.textContent='Firmware flashed! Rebooting...';"
+        "if(xhr.status==200){stat.textContent='" N_("Firmware flashed! Rebooting...") "';"
         "stat.style.color='#2e7d32';"
         "setTimeout(function(){location.reload()},8000);}"
-        "else{stat.textContent='Error: '+xhr.responseText;stat.style.color='#c62828';btn.disabled=false;}};"
-        "xhr.onerror=function(){stat.textContent='Upload failed';stat.style.color='#c62828';btn.disabled=false;};"
+        "else{stat.textContent='" N_("Error:") " '+xhr.responseText;stat.style.color='#c62828';btn.disabled=false;}};"
+        "xhr.onerror=function(){stat.textContent='" N_("Upload failed") "';stat.style.color='#c62828';btn.disabled=false;};"
         "xhr.open('POST','/ota/upload');"
         "xhr.setRequestHeader('Content-Type','application/octet-stream');"
         "xhr.send(f);};"
-        "</script>",
+        "</script>"),
         FW_VERSION, running ? running->label : "?",
         app ? app->date : "?", app ? app->time : "?");
 }

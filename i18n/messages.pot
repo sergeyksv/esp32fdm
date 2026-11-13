@@ -1,0 +1,1143 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: main/bedlevel.c:396
+msgid "Probing already in progress"
+msgstr ""
+
+#: main/bedlevel.c:402
+msgid "Cannot probe while printing"
+msgstr ""
+
+#: main/bedlevel.c:409
+msgid "Failed to start probe task"
+msgstr ""
+
+#: main/bedlevel.c:433
+msgid "G28 failed: %s"
+msgstr ""
+
+#: main/bedlevel.c:434
+msgid "G29 failed: %s"
+msgstr ""
+
+#: main/bedlevel.c:435
+msgid "No mesh found in G29 output"
+msgstr ""
+
+#: main/bedlevel.c:563 main/bedlevel.c:765 main/httpd.c:767
+msgid "Bed Leveling"
+msgstr ""
+
+#: main/bedlevel.c:565
+msgid "Probe Bed"
+msgstr ""
+
+#: main/bedlevel.c:572
+msgid "Prev"
+msgstr ""
+
+#: main/bedlevel.c:574
+msgid "Next"
+msgstr ""
+
+#: main/bedlevel.c:578
+msgid "Screw Adjustment"
+msgstr ""
+
+#: main/bedlevel.c:580
+msgid "Tighten (CW)"
+msgstr ""
+
+#: main/bedlevel.c:581
+msgid "Loosen (CCW)"
+msgstr ""
+
+#: main/bedlevel.c:587
+msgid "Bed Configuration"
+msgstr ""
+
+#: main/bedlevel.c:588
+msgid "Bed width (mm):"
+msgstr ""
+
+#: main/bedlevel.c:590
+msgid "Bed height (mm):"
+msgstr ""
+
+#: main/bedlevel.c:592
+msgid "Screw spacing (mm):"
+msgstr ""
+
+#: main/bedlevel.c:594
+msgid "Screw pitch (mm/rot):"
+msgstr ""
+
+#: main/bedlevel.c:596
+msgid "Origin (0,0) corner:"
+msgstr ""
+
+#: main/bedlevel.c:598 main/bedlevel.c:704
+msgid "Front-Left"
+msgstr ""
+
+#: main/bedlevel.c:599 main/bedlevel.c:704
+msgid "Front-Right"
+msgstr ""
+
+#: main/bedlevel.c:600 main/bedlevel.c:704
+msgid "Back-Left"
+msgstr ""
+
+#: main/bedlevel.c:601 main/bedlevel.c:704
+msgid "Back-Right"
+msgstr ""
+
+#: main/bedlevel.c:603
+msgid "Save Config"
+msgstr ""
+
+#: main/bedlevel.c:620 main/bedlevel.c:694
+msgid "No mesh data"
+msgstr ""
+
+#: main/bedlevel.c:632
+msgid "Good"
+msgstr ""
+
+#: main/bedlevel.c:632
+msgid "Fair"
+msgstr ""
+
+#: main/bedlevel.c:632
+msgid "Poor"
+msgstr ""
+
+#: main/bedlevel.c:635
+msgid "Range:"
+msgstr ""
+
+#: main/bedlevel.c:635 main/bedlevel.c:636 main/bedlevel.c:637 main/sdcard_httpd.c:86
+msgid "mm"
+msgstr ""
+
+#: main/bedlevel.c:636
+msgid "Max dev:"
+msgstr ""
+
+#: main/bedlevel.c:637
+msgid "Std dev:"
+msgstr ""
+
+#: main/bedlevel.c:657 main/sdcard_httpd.c:103
+msgid "Starting..."
+msgstr ""
+
+#: main/bedlevel.c:665 main/bedlevel.c:752
+msgid "Homing..."
+msgstr ""
+
+#: main/bedlevel.c:665 main/bedlevel.c:752
+msgid "Probing..."
+msgstr ""
+
+#: main/bedlevel.c:670 main/sdcard_httpd.c:115
+msgid "Done"
+msgstr ""
+
+#: main/bedlevel.c:671 main/ota.c:252 main/sdcard_httpd.c:115 main/terminal.c:154
+msgid "Error:"
+msgstr ""
+
+#: main/bedlevel.c:671 main/sdcard_httpd.c:72 main/sdcard_httpd.c:85 main/sdcard_httpd.c:86
+msgid "Unknown"
+msgstr ""
+
+#: main/bedlevel.c:710
+msgid "Screw"
+msgstr ""
+
+#: main/bedlevel.c:710
+msgid "Avg Z"
+msgstr ""
+
+#: main/bedlevel.c:710
+msgid "Correction"
+msgstr ""
+
+#: main/bedlevel.c:715
+msgid "CW"
+msgstr ""
+
+#: main/bedlevel.c:715
+msgid "CCW"
+msgstr ""
+
+#: main/bedlevel.c:717
+msgid "OK (reference)"
+msgstr ""
+
+#: main/bedlevel.c:722
+msgid "turns"
+msgstr ""
+
+#: main/bedlevel.c:722
+msgid "turn"
+msgstr ""
+
+#: main/bedlevel.c:744 main/httpd.c:1007
+msgid "Saved!"
+msgstr ""
+
+#: main/cold_pull.c:98 main/cold_pull.c:99 main/httpd.c:772
+msgid "Cold Pull"
+msgstr ""
+
+#: main/cold_pull.c:100
+msgid "Cleans the nozzle: filament is melted and pushed through, cooled to just above solid, and pulled out by hand, taking the dirt with it. Load the filament first. The printer homes, lifts the nozzle to Z%d and purges %d mm. Each time it needs you it stops, beeps and sends a notification; continue on the <a href='/print'>print page</a>."
+msgstr ""
+
+#: main/cold_pull.c:110
+msgid "Plastic"
+msgstr ""
+
+#: main/cold_pull.c:125
+msgid "Melt at"
+msgstr ""
+
+#: main/cold_pull.c:125
+msgid "Pull at"
+msgstr ""
+
+#: main/cold_pull.c:126
+msgid "Pulls"
+msgstr ""
+
+#: main/cold_pull.c:127
+msgid "If the plug snaps, pull a few degrees hotter; if it stretches into a thread, cooler."
+msgstr ""
+
+#: main/cold_pull.c:128
+msgid "Start"
+msgstr ""
+
+#: main/cold_pull.c:131
+msgid "The printer must be connected and idle"
+msgstr ""
+
+#: main/cold_pull.c:174 main/obico_client.c:942
+msgid "Back"
+msgstr ""
+
+#: main/cold_pull.c:182
+msgid "Empty form."
+msgstr ""
+
+#: main/cold_pull.c:190
+msgid "Missing or bad field."
+msgstr ""
+
+#: main/cold_pull.c:195
+msgid "Melt 180-300 C, pull 50-200 C and at least 50 C below melt, 1-5 pulls."
+msgstr ""
+
+#: main/cold_pull.c:201
+msgid "The printer must be connected and idle."
+msgstr ""
+
+#: main/cold_pull.c:205 main/ota.c:63
+msgid "Out of memory."
+msgstr ""
+
+#: main/cold_pull.c:208
+msgid "Script too long."
+msgstr ""
+
+#: main/cold_pull.c:217
+msgid "Could not start, try again."
+msgstr ""
+
+#: main/httpd.c:404
+msgid "ESP32 FDM Dashboard"
+msgstr ""
+
+#: main/httpd.c:421
+msgid "Z offset (baby stepping)"
+msgstr ""
+
+#: main/httpd.c:431
+msgid "Save all settings to EEPROM (M500)"
+msgstr ""
+
+#: main/httpd.c:431 main/httpd.c:643 main/httpd.c:655 main/hub_client.c:322
+msgid "Save"
+msgstr ""
+
+#: main/httpd.c:433
+msgid "closer to the bed"
+msgstr ""
+
+#: main/httpd.c:433
+msgid "farther from the bed"
+msgstr ""
+
+#: main/httpd.c:433
+msgid "Save writes to EEPROM (M500)"
+msgstr ""
+
+#: main/httpd.c:438
+msgid "Temperatures"
+msgstr ""
+
+#: main/httpd.c:439 main/httpd.c:599 main/layout.c:94 main/print_page.c:133
+msgid "Nozzle"
+msgstr ""
+
+#: main/httpd.c:440 main/httpd.c:449 main/httpd.c:503
+msgid "Off"
+msgstr ""
+
+#: main/httpd.c:446 main/httpd.c:455
+msgid "Set"
+msgstr ""
+
+#: main/httpd.c:448 main/httpd.c:599 main/layout.c:95 main/print_page.c:134
+msgid "Bed"
+msgstr ""
+
+#: main/httpd.c:460
+msgid "Move"
+msgstr ""
+
+#: main/httpd.c:461
+msgid "Step (mm)"
+msgstr ""
+
+#: main/httpd.c:467
+msgid "Axes"
+msgstr ""
+
+#: main/httpd.c:475
+msgid "Extruder"
+msgstr ""
+
+#: main/httpd.c:476
+msgid "Retract"
+msgstr ""
+
+#: main/httpd.c:477
+msgid "Extrude"
+msgstr ""
+
+#: main/httpd.c:478
+msgid "Normal"
+msgstr ""
+
+#: main/httpd.c:479
+msgid "Slow"
+msgstr ""
+
+#: main/httpd.c:481
+msgid "Normal: 300 mm/min. Slow: 60 mm/min (for measuring filament length)."
+msgstr ""
+
+#: main/httpd.c:482
+msgid "Homing"
+msgstr ""
+
+#: main/httpd.c:483 main/logbuf.c:225
+msgid "All"
+msgstr ""
+
+#: main/httpd.c:491
+msgid "Speed / Flow / Fan"
+msgstr ""
+
+#: main/httpd.c:492
+msgid "Speed"
+msgstr ""
+
+#: main/httpd.c:497
+msgid "Flow"
+msgstr ""
+
+#: main/httpd.c:502
+msgid "Fan"
+msgstr ""
+
+#: main/httpd.c:513 main/httpd.c:791
+msgid "Camera"
+msgstr ""
+
+#: main/httpd.c:585 main/sdcard_httpd.c:72 main/sdcard_httpd.c:72
+msgid "min"
+msgstr ""
+
+#: main/httpd.c:585
+msgid "s"
+msgstr ""
+
+#: main/httpd.c:599
+msgid "Nozzle target"
+msgstr ""
+
+#: main/httpd.c:599
+msgid "Bed target"
+msgstr ""
+
+#: main/httpd.c:626 main/layout.c:84
+msgid "Settings"
+msgstr ""
+
+#: main/httpd.c:634 main/logbuf.c:226
+msgid "Printer"
+msgstr ""
+
+#: main/httpd.c:635 main/httpd.c:719
+msgid "Save &amp; Reboot"
+msgstr ""
+
+#: main/httpd.c:654
+msgid "Video"
+msgstr ""
+
+#: main/httpd.c:657
+msgid "Rotate 180°"
+msgstr ""
+
+#: main/httpd.c:660
+msgid "safe"
+msgstr ""
+
+#: main/httpd.c:663
+msgid "fast"
+msgstr ""
+
+#: main/httpd.c:665
+msgid "Reboot to apply"
+msgstr ""
+
+#: main/httpd.c:666
+msgid "WebRTC streaming"
+msgstr ""
+
+#: main/httpd.c:667
+msgid "Host"
+msgstr ""
+
+#: main/httpd.c:669
+msgid "Port"
+msgstr ""
+
+#: main/httpd.c:671
+msgid "Leave host empty to disable Janus proxy."
+msgstr ""
+
+#: main/httpd.c:686
+msgid "Unlink from Obico?"
+msgstr ""
+
+#: main/httpd.c:686
+msgid "Unlink"
+msgstr ""
+
+#: main/httpd.c:691
+msgid "Link"
+msgstr ""
+
+#: main/httpd.c:702
+msgid "External Endpoints"
+msgstr ""
+
+#: main/httpd.c:704 main/httpd.c:801
+msgid "MJPEG Stream"
+msgstr ""
+
+#: main/httpd.c:705
+msgid "Snapshot"
+msgstr ""
+
+#: main/httpd.c:718
+msgid "Device"
+msgstr ""
+
+#: main/httpd.c:721
+msgid "Hostname"
+msgstr ""
+
+#: main/httpd.c:724
+msgid "Letters, digits, hyphens. Must start with a letter."
+msgstr ""
+
+#: main/httpd.c:727
+msgid "Visible on router and as"
+msgstr ""
+
+#: main/httpd.c:727
+msgid "via mDNS."
+msgstr ""
+
+#: main/httpd.c:741
+msgid "Reset WiFi credentials and reboot?"
+msgstr ""
+
+#: main/httpd.c:741
+msgid "Reset WiFi"
+msgstr ""
+
+#: main/httpd.c:745
+msgid "Connected to:"
+msgstr ""
+
+#: main/httpd.c:762 main/httpd.c:767
+msgid "Utilities"
+msgstr ""
+
+#: main/httpd.c:768
+msgid "Probe bed mesh, visualize, and calculate screw adjustments"
+msgstr ""
+
+#: main/httpd.c:772
+msgid "Clean the nozzle by pulling out cooled filament"
+msgstr ""
+
+#: main/httpd.c:804
+msgid "Image Settings"
+msgstr ""
+
+#: main/httpd.c:805
+msgid "Brightness"
+msgstr ""
+
+#: main/httpd.c:808
+msgid "Contrast"
+msgstr ""
+
+#: main/httpd.c:811
+msgid "Saturation"
+msgstr ""
+
+#: main/httpd.c:814
+msgid "AE Level"
+msgstr ""
+
+#: main/httpd.c:910
+msgid "Device name saved. Rebooting..."
+msgstr ""
+
+#: main/httpd.c:925
+msgid "WiFi credentials erased. Rebooting..."
+msgstr ""
+
+#: main/httpd.c:951 main/httpd.c:959
+msgid "WiFi Setup"
+msgstr ""
+
+#: main/httpd.c:963
+msgid "Password"
+msgstr ""
+
+#: main/httpd.c:965
+msgid "Connect"
+msgstr ""
+
+#: main/httpd.c:1007
+msgid "Rebooting and connecting to WiFi..."
+msgstr ""
+
+#: main/hub_client.c:321
+msgid "Notifications"
+msgstr ""
+
+#: main/hub_client.c:324
+msgid "Hub URL"
+msgstr ""
+
+#: main/hub_client.c:328
+msgid "Address of the notification hub. Leave empty to turn notifications off."
+msgstr ""
+
+#: main/hub_client.c:329
+msgid "Send test"
+msgstr ""
+
+#: main/hub_client.c:332 main/print_page.c:137
+msgid "Sending..."
+msgstr ""
+
+#: main/hub_client.c:335
+msgid "Delivered"
+msgstr ""
+
+#: main/hub_client.c:336
+msgid "Failed, see /logs"
+msgstr ""
+
+#: main/hub_client.c:337
+msgid "Save the hub URL first"
+msgstr ""
+
+#: main/hub_client.c:338 main/hub_client.c:339 main/hub_client.c:341
+msgid "No answer"
+msgstr ""
+
+#: main/hub_client.c:374
+msgid "URL must start with http://"
+msgstr ""
+
+#: main/hub_client.c:378
+msgid "Could not save"
+msgstr ""
+
+#: main/layout.c:71
+msgid "Menu"
+msgstr ""
+
+#: main/layout.c:74 main/layout.c:75
+msgid "Home"
+msgstr ""
+
+#: main/layout.c:76
+msgid "Cam"
+msgstr ""
+
+#: main/layout.c:77
+msgid "SD"
+msgstr ""
+
+#: main/layout.c:79
+msgid "Term"
+msgstr ""
+
+#: main/layout.c:80
+msgid "Utils"
+msgstr ""
+
+#: main/layout.c:83 main/logbuf.c:264
+msgid "Logs"
+msgstr ""
+
+#: main/layout.c:100 main/print_page.c:138
+msgid "Pause"
+msgstr ""
+
+#: main/layout.c:101 main/print_page.c:137
+msgid "Continue"
+msgstr ""
+
+#: main/layout.c:101
+msgid "Resume"
+msgstr ""
+
+#: main/layout.c:102
+msgid "Stop print?"
+msgstr ""
+
+#: main/layout.c:102 main/print_page.c:139
+msgid "Stop"
+msgstr ""
+
+#: main/layout.c:103
+msgid "WAITING"
+msgstr ""
+
+#: main/layout.c:103
+msgid "PAUSED"
+msgstr ""
+
+#: main/layout.c:103
+msgid "PREPARING"
+msgstr ""
+
+#: main/layout.c:103
+msgid "PRINTING"
+msgstr ""
+
+#: main/layout.c:104
+msgid "Control"
+msgstr ""
+
+#: main/layout.c:106
+msgid "Layer"
+msgstr ""
+
+#: main/layout.c:108
+msgid "Error"
+msgstr ""
+
+#: main/layout.c:108
+msgid "Ready"
+msgstr ""
+
+#: main/layout.c:108
+msgid "Disconnected"
+msgstr ""
+
+#: main/logbuf.c:227
+msgid "System"
+msgstr ""
+
+#: main/logbuf.c:228
+msgid "Heap"
+msgstr ""
+
+#: main/logbuf.c:267
+msgid "Filter:"
+msgstr ""
+
+#: main/logbuf.c:278
+msgid "Clear all logs?"
+msgstr ""
+
+#: main/logbuf.c:278
+msgid "Clear"
+msgstr ""
+
+#: main/obico_client.c:866 main/obico_client.c:883
+msgid "Status:"
+msgstr ""
+
+#: main/obico_client.c:866 main/obico_client.c:932
+msgid "Linked"
+msgstr ""
+
+#: main/obico_client.c:867
+msgid "to %s"
+msgstr ""
+
+#: main/obico_client.c:883
+msgid "Not linked"
+msgstr ""
+
+#: main/obico_client.c:883
+msgid "Server URL"
+msgstr ""
+
+#: main/obico_client.c:884
+msgid "Enter the 6-digit code from"
+msgstr ""
+
+#: main/obico_client.c:889 main/obico_client.c:1029
+msgid "Status"
+msgstr ""
+
+#: main/obico_client.c:889 main/obico_client.c:1024
+msgid "Simulate"
+msgstr ""
+
+#: main/obico_client.c:932
+msgid "Link Failed"
+msgstr ""
+
+#: main/obico_client.c:937
+msgid "Linked successfully!"
+msgstr ""
+
+#: main/obico_client.c:937
+msgid "This printer is now connected to Obico."
+msgstr ""
+
+#: main/obico_client.c:942
+msgid "Linking failed"
+msgstr ""
+
+#: main/obico_client.c:942
+msgid "Check the code and try again."
+msgstr ""
+
+#: main/obico_client.c:1019
+msgid "ON"
+msgstr ""
+
+#: main/obico_client.c:1019
+msgid "OFF"
+msgstr ""
+
+#: main/obico_client.c:1020
+msgid "printing with fake data"
+msgstr ""
+
+#: main/obico_client.c:1021
+msgid "real printer state"
+msgstr ""
+
+#: main/obico_client.c:1029
+msgid "Simulation:"
+msgstr ""
+
+#: main/obico_client.c:1029
+msgid "Toggle"
+msgstr ""
+
+#: main/ota.c:48
+msgid "No OTA partition"
+msgstr ""
+
+#: main/ota.c:56
+msgid "OTA begin failed"
+msgstr ""
+
+#: main/ota.c:96
+msgid "Not a valid ESP32 application image"
+msgstr ""
+
+#: main/ota.c:107
+msgid "Wrong firmware — project name does not match"
+msgstr ""
+
+#: main/ota.c:130
+msgid "OTA write failed"
+msgstr ""
+
+#: main/ota.c:138
+msgid "Firmware validation failed — bad image?"
+msgstr ""
+
+#: main/ota.c:145
+msgid "Set boot partition failed"
+msgstr ""
+
+#: main/ota.c:168
+msgid "No firmware data"
+msgstr ""
+
+#: main/ota.c:174
+msgid "Invalid firmware size"
+msgstr ""
+
+#: main/ota.c:223
+msgid "Firmware Update"
+msgstr ""
+
+#: main/ota.c:224
+msgid "Running:"
+msgstr ""
+
+#: main/ota.c:224
+msgid "on partition"
+msgstr ""
+
+#: main/ota.c:225
+msgid "Built"
+msgstr ""
+
+#: main/ota.c:229
+msgid "Upload &amp; Flash"
+msgstr ""
+
+#: main/ota.c:238
+msgid "Select a firmware .bin file"
+msgstr ""
+
+#: main/ota.c:239
+msgid "Flash firmware"
+msgstr ""
+
+#: main/ota.c:247
+msgid "Uploading:"
+msgstr ""
+
+#: main/ota.c:249
+msgid "Firmware flashed! Rebooting..."
+msgstr ""
+
+#: main/ota.c:253
+msgid "Upload failed"
+msgstr ""
+
+#: main/print_page.c:34 main/print_page.c:115 main/print_page.c:124 main/sdcard_httpd.c:103
+msgid "Print"
+msgstr ""
+
+#: main/print_page.c:67
+msgid "Connecting..."
+msgstr ""
+
+#: main/print_page.c:83
+msgid "Print again"
+msgstr ""
+
+#: main/print_page.c:84
+msgid "All files"
+msgstr ""
+
+#: main/print_page.c:85
+msgid "Dashboard"
+msgstr ""
+
+#: main/print_page.c:100
+msgid "Z shift:"
+msgstr ""
+
+#: main/print_page.c:101
+msgid "Sending to printer, applied"
+msgstr ""
+
+#: main/print_page.c:104
+msgid "Limit is 1 mm per print"
+msgstr ""
+
+#: main/print_page.c:104
+msgid "Not sent, try again"
+msgstr ""
+
+#: main/print_page.c:109
+msgid "Stop the print and turn off the heaters?"
+msgstr ""
+
+#: main/print_page.c:114
+msgid "Not on the SD card"
+msgstr ""
+
+#: main/print_page.c:115
+msgid "Is the bed clear?"
+msgstr ""
+
+#: main/print_page.c:117
+msgid "Not started"
+msgstr ""
+
+#: main/print_page.c:126
+msgid "Waiting for you"
+msgstr ""
+
+#: main/print_page.c:126
+msgid "Preparing..."
+msgstr ""
+
+#: main/print_page.c:126
+msgid "Printing"
+msgstr ""
+
+#: main/print_page.c:126
+msgid "Paused"
+msgstr ""
+
+#: main/print_page.c:127
+msgid "Printer not connected"
+msgstr ""
+
+#: main/print_page.c:127
+msgid "No print running"
+msgstr ""
+
+#: main/print_page.c:129
+msgid "Notification was not delivered"
+msgstr ""
+
+#: main/print_page.c:131
+msgid "layer"
+msgstr ""
+
+#: main/print_page.c:138
+msgid "Pausing..."
+msgstr ""
+
+#: main/print_page.c:139
+msgid "Stopping..."
+msgstr ""
+
+#: main/print_page.c:143
+msgid "No connection to the printer"
+msgstr ""
+
+#: main/print_page.c:330
+msgid "Marlin only"
+msgstr ""
+
+#: main/print_page.c:336
+msgid "Not in the recent files"
+msgstr ""
+
+#: main/print_page.c:337
+msgid "The file is not on the SD card"
+msgstr ""
+
+#: main/print_page.c:342
+msgid "The printer is not idle"
+msgstr ""
+
+#: main/print_page.c:345
+msgid "Not started, try again"
+msgstr ""
+
+#: main/printer_comm.c:1257
+msgid "USB serial"
+msgstr ""
+
+#: main/printer_comm.c:1261
+msgid "Moonraker Host/IP:"
+msgstr ""
+
+#: main/printer_comm.c:1262
+msgid "Moonraker Port:"
+msgstr ""
+
+#: main/printer_comm.c:1264
+msgid "Test Moonraker connection"
+msgstr ""
+
+#: main/printer_comm.c:1279
+msgid "Pause Command"
+msgstr ""
+
+#: main/printer_comm.c:1280
+msgid "Pause SD print (can resume)"
+msgstr ""
+
+#: main/printer_comm.c:1281
+msgid "Abort print (if M25 crashes firmware)"
+msgstr ""
+
+#: main/printer_comm.c:1284
+msgid "Filament Sensor"
+msgstr ""
+
+#: main/printer_comm.c:1285
+msgid "Poll filament sensor (M119) during host print"
+msgstr ""
+
+#: main/printer_comm.c:1285
+msgid "auto-pause on runout"
+msgstr ""
+
+#: main/printer_comm.c:1290
+msgid "Some printers hold USB responses until the next command is sent. Adding commands here sends a harmless M118 ping after them to flush the response."
+msgstr ""
+
+#: main/printer_comm.c:1292
+msgid "Typical candidates:"
+msgstr ""
+
+#: main/printer_comm.c:1293
+msgid "e.g."
+msgstr ""
+
+#: main/printer_comm.c:1355
+msgid "Saved"
+msgstr ""
+
+#: main/printer_comm.c:1358
+msgid "Configuration saved!"
+msgstr ""
+
+#: main/printer_comm.c:1359
+msgid "Rebooting in 3 seconds..."
+msgstr ""
+
+#: main/sdcard_httpd.c:53
+msgid "Size"
+msgstr ""
+
+#: main/sdcard_httpd.c:54
+msgid "Layers"
+msgstr ""
+
+#: main/sdcard_httpd.c:55
+msgid "Layer height"
+msgstr ""
+
+#: main/sdcard_httpd.c:56
+msgid "Object height"
+msgstr ""
+
+#: main/sdcard_httpd.c:57
+msgid "Estimated time"
+msgstr ""
+
+#: main/sdcard_httpd.c:58
+msgid "Filament"
+msgstr ""
+
+#: main/sdcard_httpd.c:61 main/sdcard_httpd.c:63
+msgid "Upload"
+msgstr ""
+
+#: main/sdcard_httpd.c:66
+msgid "Files"
+msgstr ""
+
+#: main/sdcard_httpd.c:67
+msgid "File"
+msgstr ""
+
+#: main/sdcard_httpd.c:72
+msgid "h"
+msgstr ""
+
+#: main/sdcard_httpd.c:75
+msgid "Loading..."
+msgstr ""
+
+#: main/sdcard_httpd.c:90
+msgid "m"
+msgstr ""
+
+#: main/sdcard_httpd.c:90
+msgid "g"
+msgstr ""
+
+#: main/sdcard_httpd.c:94
+msgid "No preview"
+msgstr ""
+
+#: main/sdcard_httpd.c:95
+msgid "Could not load the file info"
+msgstr ""
+
+#: main/sdcard_httpd.c:102
+msgid "Info"
+msgstr ""
+
+#: main/sdcard_httpd.c:104
+msgid "Delete"
+msgstr ""
+
+#: main/sdcard_httpd.c:106
+msgid "No files"
+msgstr ""
+
+#: main/sdcard_httpd.c:125
+msgid "SD Card"
+msgstr ""
+
+#: main/terminal.c:112
+msgid "Terminal locked during print"
+msgstr ""
+
+#: main/terminal.c:114
+msgid "GCode command (e.g. M105)"
+msgstr ""
+
+#: main/terminal.c:116
+msgid "Send"
+msgstr ""
+
+#: main/terminal.c:118 main/terminal.c:145
+msgid "Pause Polling"
+msgstr ""
+
+#: main/terminal.c:145
+msgid "Resume Polling"
+msgstr ""
+
+#: main/terminal.c:169
+msgid "Terminal"
+msgstr ""
+
+#: main/terminal.c:175
+msgid "Terminal is not available with Klipper backend."
+msgstr ""
+
+#: main/terminal.c:176
+msgid "Use Mainsail or Fluidd for GCode terminal access."
+msgstr ""
+
+#: main/terminal.c:222
+msgid "Printing in progress"
+msgstr ""
+
+#: main/terminal.c:226
+msgid "Send failed"
+msgstr ""

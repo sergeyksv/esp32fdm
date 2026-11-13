@@ -3,6 +3,7 @@
 #include "printer_comm.h"
 #include "cache.h"
 #include "layout.h"
+#include "i18n.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -54,7 +55,11 @@ typedef enum {
 static bl_state_t s_state = BL_IDLE;
 static bl_mesh_t  s_current_mesh;
 static bl_config_t s_config = { .bed_w = 220, .bed_h = 220, .screw_spacing = 180, .screw_pitch = 1.0f };
-static char s_error_msg[64];
+/* Why the last probe failed.  The text is made in the status reply, in the
+ * language of that request: the probe task has no request language. */
+typedef enum { BL_ERR_NONE, BL_ERR_G28, BL_ERR_G29, BL_ERR_NO_MESH } bl_err_t;
+static bl_err_t s_error = BL_ERR_NONE;
+static esp_err_t s_error_code = ESP_OK;
 
 /* ---- Config persistence ---- */
 
@@ -309,8 +314,9 @@ static void probe_task(void *arg)
     ESP_LOGI(TAG, "Probe: homing (G28)...");
     esp_err_t err = printer_comm_send_gcode_sync("G28", PROBE_TIMEOUT_MS);
     if (err != ESP_OK) {
-        snprintf(s_error_msg, sizeof(s_error_msg), "G28 failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", s_error_msg);
+        s_error = BL_ERR_G28;
+        s_error_code = err;
+        ESP_LOGW(TAG, "G28 failed: %s", esp_err_to_name(err));
         s_state = BL_ERROR;
         goto cleanup;
     }
@@ -321,8 +327,9 @@ static void probe_task(void *arg)
     err = printer_comm_send_gcode_sync("G29", PROBE_TIMEOUT_MS);
 
     if (err != ESP_OK) {
-        snprintf(s_error_msg, sizeof(s_error_msg), "G29 failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", s_error_msg);
+        s_error = BL_ERR_G29;
+        s_error_code = err;
+        ESP_LOGW(TAG, "G29 failed: %s", esp_err_to_name(err));
         s_state = BL_ERROR;
         goto cleanup;
     }
@@ -342,8 +349,8 @@ static void probe_task(void *arg)
     }
 
     if (!found) {
-        snprintf(s_error_msg, sizeof(s_error_msg), "No mesh found in G29 output");
-        ESP_LOGW(TAG, "%s", s_error_msg);
+        s_error = BL_ERR_NO_MESH;
+        ESP_LOGW(TAG, "No mesh found in G29 output");
         s_state = BL_ERROR;
     } else {
         s_state = BL_DONE;
@@ -374,26 +381,32 @@ static void mesh_to_json(const bl_mesh_t *mesh, html_buf_t *p)
 
 /* ---- HTTP handlers ---- */
 
+/* {"ok":false,"err":msg}: msg is shown on the page as is */
+static esp_err_t probe_refuse(httpd_req_t *req, const char *msg)
+{
+    char buf[192];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"err\":\"%s\"}", msg);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
 static esp_err_t bedlevel_probe_handler(httpd_req_t *req)
 {
     if (s_state == BL_HOMING || s_state == BL_PROBING) {
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Probing already in progress\"}");
+        return probe_refuse(req, _("Probing already in progress"));
     }
 
     printer_state_t st;
     printer_comm_get_state(&st);
     if (st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED) {
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Cannot probe while printing\"}");
+        return probe_refuse(req, _("Cannot probe while printing"));
     }
 
     s_state = BL_IDLE;
-    s_error_msg[0] = '\0';
+    s_error = BL_ERR_NONE;
 
     if (xTaskCreatePinnedToCore(probe_task, "bl_probe", 4096, NULL, 5, NULL, 0) != pdPASS) {
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Failed to start probe task\"}");
+        return probe_refuse(req, _("Failed to start probe task"));
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -414,8 +427,14 @@ static esp_err_t bedlevel_status_handler(httpd_req_t *req)
     html_buf_t p;
     html_buf_init(&p);
     html_buf_printf(&p, "{\"state\":\"%s\"", state_str);
-    if (s_state == BL_ERROR && s_error_msg[0]) {
-        html_buf_printf(&p, ",\"err\":\"%s\"", s_error_msg);
+    if (s_state == BL_ERROR && s_error != BL_ERR_NONE) {
+        html_buf_printf(&p, ",\"err\":\"");
+        switch (s_error) {
+        case BL_ERR_G28: html_buf_printf(&p, _("G28 failed: %s"), esp_err_to_name(s_error_code)); break;
+        case BL_ERR_G29: html_buf_printf(&p, _("G29 failed: %s"), esp_err_to_name(s_error_code)); break;
+        default:         html_buf_printf(&p, "%s", _("No mesh found in G29 output")); break;
+        }
+        html_buf_printf(&p, "\"");
     }
     if (s_state == BL_DONE && s_current_mesh.grid_x > 0) {
         html_buf_printf(&p, ",\"mesh\":");
@@ -519,13 +538,8 @@ static esp_err_t bedlevel_config_post_handler(httpd_req_t *req)
 
 /* ---- Page handler ---- */
 
-static esp_err_t bedlevel_page_handler(httpd_req_t *req)
-{
-    html_buf_t p;
-    html_buf_init(&p);
-    layout_html_begin(&p, "Bed Leveling", "/bedlevel");
-
-    html_buf_printf(&p,
+/* A template for i18n_page(): not a printf format, % is written once */
+static const char BL_PAGE[] =
         "<style>"
         ".mesh-grid{display:inline-grid;gap:2px;margin:12px 0}"
         ".mesh-cell{width:48px;height:48px;display:flex;align-items:center;justify-content:center;"
@@ -546,52 +560,50 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         ".cfg-row label{display:inline-block;width:140px}"
         "</style>"
 
-        "<h2>Bed Leveling</h2>"
+        "<h2>" N_("Bed Leveling") "</h2>"
 
-        "<button id='probe-btn' onclick='probe()'>Probe Bed (G28 + G29)</button>"
+        "<button id='probe-btn' onclick='probe()'>" N_("Probe Bed") " (G28 + G29)</button>"
         " <span id='probe-status'></span>"
 
         "<div id='mesh-stats'></div>"
         "<div id='mesh-box'></div>"
 
         "<div class='hist-nav'>"
-        "<button onclick='histPrev()'>&#9664; Prev</button>"
+        "<button onclick='histPrev()'>&#9664; " N_("Prev") "</button>"
         "<span id='hist-label'>-</span>"
-        "<button onclick='histNext()'>Next &#9654;</button>"
+        "<button onclick='histNext()'>" N_("Next") " &#9654;</button>"
         "</div>"
 
         "<details>"
-        "<summary>Screw Adjustment</summary>"
+        "<summary>" N_("Screw Adjustment") "</summary>"
         "<div style='margin:8px 0'>"
-        "<button onclick='calcScrews(\"tighten\")'>Tighten (CW)</button>"
-        " <button onclick='calcScrews(\"loosen\")'>Loosen (CCW)</button>"
+        "<button onclick='calcScrews(\"tighten\")'>" N_("Tighten (CW)") "</button>"
+        " <button onclick='calcScrews(\"loosen\")'>" N_("Loosen (CCW)") "</button>"
         "</div>"
         "<div id='screw-result'></div>"
         "</details>"
 
         "<details>"
-        "<summary>Bed Configuration</summary>"
-        "<div class='cfg-row'><label>Bed width (mm):</label>"
+        "<summary>" N_("Bed Configuration") "</summary>"
+        "<div class='cfg-row'><label>" N_("Bed width (mm):") "</label>"
         "<input type='number' id='cfg-bw' step='1'></div>"
-        "<div class='cfg-row'><label>Bed height (mm):</label>"
+        "<div class='cfg-row'><label>" N_("Bed height (mm):") "</label>"
         "<input type='number' id='cfg-bh' step='1'></div>"
-        "<div class='cfg-row'><label>Screw spacing (mm):</label>"
+        "<div class='cfg-row'><label>" N_("Screw spacing (mm):") "</label>"
         "<input type='number' id='cfg-ss' step='1'></div>"
-        "<div class='cfg-row'><label>Screw pitch (mm/rot):</label>"
+        "<div class='cfg-row'><label>" N_("Screw pitch (mm/rot):") "</label>"
         "<input type='number' id='cfg-sp' step='0.01' value='1.0'></div>"
-        "<div class='cfg-row'><label>Origin (0,0) corner:</label>"
+        "<div class='cfg-row'><label>" N_("Origin (0,0) corner:") "</label>"
         "<select id='cfg-or'>"
-        "<option value='0'>Front-Left</option>"
-        "<option value='1'>Front-Right</option>"
-        "<option value='2'>Back-Left</option>"
-        "<option value='3'>Back-Right</option>"
+        "<option value='0'>" N_("Front-Left") "</option>"
+        "<option value='1'>" N_("Front-Right") "</option>"
+        "<option value='2'>" N_("Back-Left") "</option>"
+        "<option value='3'>" N_("Back-Right") "</option>"
         "</select></div>"
-        "<button onclick='saveCfg()' style='margin-top:8px'>Save Config</button>"
+        "<button onclick='saveCfg()' style='margin-top:8px'>" N_("Save Config") "</button>"
         " <span id='cfg-status'></span>"
         "</details>"
-    );
 
-    html_buf_printf(&p,
         "<script>"
         "var meshList=[],meshIdx=-1,curMesh=null,cfg={};"
 
@@ -601,11 +613,11 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "var n=z/am;"
         "var h=n<=0?120+(-n)*120:120-n*120;"
         "var s=Math.min(100,Math.abs(n)*150+30);"
-        "return 'hsl('+h+','+s+'%%,42%%)'}"
+        "return 'hsl('+h+','+s+'%,42%)'}"
 
         /* Render mesh grid + stats */
         "function renderMesh(m){"
-        "if(!m||!m.gx){document.getElementById('mesh-box').innerHTML='<p class=\"hint\">No mesh data</p>';return}"
+        "if(!m||!m.gx){document.getElementById('mesh-box').innerHTML='<p class=\"hint\">" N_("No mesh data") "</p>';return}"
         "var g=m.gx,r=m.gy,d=m.d;"
 
         /* Stats */
@@ -617,17 +629,18 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "for(var y=0;y<r;y++)for(var x=0;x<g;x++){var v=d[y][x]-avg;sum2+=v*v}"
         "var sd=Math.sqrt(sum2/cnt);"
         "var badge=range<0.3?'good':range<0.6?'fair':'poor';"
+        "var bname={good:'" N_("Good") "',fair:'" N_("Fair") "',poor:'" N_("Poor") "'};"
         "document.getElementById('mesh-stats').innerHTML="
         "'<div class=\"stats\">"
-        "<span>Range: '+range.toFixed(3)+' mm</span>"
-        "<span>Max dev: '+maxDev.toFixed(3)+' mm</span>"
-        "<span>Std dev: '+sd.toFixed(3)+' mm</span>"
-        "<span class=\"badge-'+badge+'\">'+badge.charAt(0).toUpperCase()+badge.slice(1)+'</span>"
+        "<span>" N_("Range:") " '+range.toFixed(3)+' " N_("mm") "</span>"
+        "<span>" N_("Max dev:") " '+maxDev.toFixed(3)+' " N_("mm") "</span>"
+        "<span>" N_("Std dev:") " '+sd.toFixed(3)+' " N_("mm") "</span>"
+        "<span class=\"badge-'+badge+'\">'+bname[badge]+'</span>"
         "</div>';"
 
         /* Grid */
-        /* Render grid oriented so back=top, front=bottom, left=left, right=right. "
-        "   Origin config tells us where mesh[0][0] is physically. */
+        /* Render grid oriented so back=top, front=bottom, left=left, right=right.
+           Origin config tells us where mesh[0][0] is physically. */
         "var o=cfg.origin||0;"
         "var flipY=(o<2);var flipX=(o===1||o===3);"
         "var h='<div class=\"mesh-grid\" style=\"grid-template-columns:repeat('+g+',48px)\">';"
@@ -641,7 +654,7 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "var pollId=0;"
         "function probe(){"
         "document.getElementById('probe-btn').disabled=true;"
-        "document.getElementById('probe-status').textContent='Starting...';"
+        "document.getElementById('probe-status').textContent='" N_("Starting...") "';"
         "fetch('/bedlevel/probe',{method:'POST'}).then(r=>r.json()).then(function(j){"
         "if(!j.ok){document.getElementById('probe-status').textContent=j.err;document.getElementById('probe-btn').disabled=false;return}"
         "pollId=setInterval(pollStatus,2000)})}"
@@ -649,12 +662,13 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "function pollStatus(){"
         "fetch('/bedlevel/status').then(r=>r.json()).then(function(j){"
         "var st=j.state;"
-        "document.getElementById('probe-status').textContent=st==='homing'?'Homing...':st==='probing'?'Probing...':st;"
+        "document.getElementById('probe-status').textContent=st==='homing'?'" N_("Homing...") "':st==='probing'?'" N_("Probing...") "':st;"
         "if(st==='done'||st==='error'){"
         "clearInterval(pollId);"
         "document.getElementById('probe-btn').disabled=false;"
         "if(st==='done'&&j.mesh){curMesh=j.mesh;renderMesh(curMesh);loadMeshList()}"
-        "if(st==='error')document.getElementById('probe-status').textContent='Error: '+(j.err||'unknown')}})}"
+        "if(st==='done')document.getElementById('probe-status').textContent='" N_("Done") "';"
+        "if(st==='error')document.getElementById('probe-status').textContent='" N_("Error:") " '+(j.err||'" N_("Unknown") "')}})}"
 
         /* History */
         "function loadMeshList(){"
@@ -677,7 +691,7 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
 
         /* Screw adjustment */
         "function calcScrews(mode){"
-        "if(!curMesh||!curMesh.gx){document.getElementById('screw-result').innerHTML='<p>No mesh data</p>';return}"
+        "if(!curMesh||!curMesh.gx){document.getElementById('screw-result').innerHTML='<p>" N_("No mesh data") "</p>';return}"
         "var m=curMesh,gx=m.gx,gy=m.gy,d=m.d;"
         "var mx=Math.floor(gx/2),my=Math.floor(gy/2);"
         "var o=cfg.origin||0;var sFlipY=(o>=2);var sFlipX=(o===1||o===3);"
@@ -687,25 +701,25 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "var qi=(py>=my?2:0)+(px>=mx?1:0);"
         "avg[qi]+=d[y][x];cnt[qi]++}"
         "for(var i=0;i<4;i++)if(cnt[i])avg[i]/=cnt[i];"
-        "var labels=['Front-Left','Front-Right','Back-Left','Back-Right'];"
+        "var labels=['" N_("Front-Left") "','" N_("Front-Right") "','" N_("Back-Left") "','" N_("Back-Right") "'];"
         "var ref;"
         "if(mode==='tighten'){"
         "ref=Math.min.apply(null,avg);"
         "}else{"
         "ref=Math.max.apply(null,avg)}"
-        "var h='<table class=\"screw-tbl\"><tr><th>Screw</th><th>Avg Z</th><th>Correction</th></tr>';"
+        "var h='<table class=\"screw-tbl\"><tr><th>" N_("Screw") "</th><th>" N_("Avg Z") "</th><th>" N_("Correction") "</th></tr>';"
         "var pitch=cfg.screw_pitch||1;"
         "for(var i=0;i<4;i++){"
         "var delta=mode==='tighten'?(avg[i]-ref):(ref-avg[i]);"
         "var turns=Math.round(delta/pitch*8)/8;"
-        "var dir=mode==='tighten'?'CW':'CCW';"
+        "var dir=mode==='tighten'?'" N_("CW") "':'" N_("CCW") "';"
         "h+='<tr><td>'+labels[i]+'</td><td>'+avg[i].toFixed(3)+'</td><td>';"
-        "if(Math.abs(turns)<0.06)h+='OK (reference)';"
+        "if(Math.abs(turns)<0.06)h+='" N_("OK (reference)") "';"
         "else{var q=Math.floor(turns*4)/4;var e=turns-q;"
         "var s='';if(q>=0.25)s+=Math.round(q*4)+'/4';"
         "if(e>=0.1){if(s)s+=' + ';s+='1/8'}"
         "if(!s)s='1/8';"
-        "h+=s+' turn'+((turns>0.25)?'s':'')+' '+dir}"
+        "h+=s+' '+(turns>0.25?'" N_("turns") "':'" N_("turn") "')+' '+dir}"
         "h+='</td></tr>'}"
         "h+='</table>';"
         "document.getElementById('screw-result').innerHTML=h}"
@@ -727,7 +741,7 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "screw_pitch:+document.getElementById('cfg-sp').value,"
         "origin:+document.getElementById('cfg-or').value};"
         "fetch('/bedlevel/config',{method:'POST',body:JSON.stringify(c)}).then(r=>r.json()).then(function(j){"
-        "if(j.ok){cfg=c;document.getElementById('cfg-status').textContent='Saved!';"
+        "if(j.ok){cfg=c;document.getElementById('cfg-status').textContent='" N_("Saved!") "';"
         "setTimeout(function(){document.getElementById('cfg-status').textContent=''},2000)}})}"
 
         /* Init: load config, check if probe in progress, load mesh list */
@@ -735,16 +749,21 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         "fetch('/bedlevel/status').then(r=>r.json()).then(function(j){"
         "if(j.state==='homing'||j.state==='probing'){"
         "document.getElementById('probe-btn').disabled=true;"
-        "document.getElementById('probe-status').textContent=j.state==='homing'?'Homing...':'Probing...';"
+        "document.getElementById('probe-status').textContent=j.state==='homing'?'" N_("Homing...") "':'" N_("Probing...") "';"
         "pollId=setInterval(pollStatus,2000)}"
         "else if(j.state==='done'&&j.mesh){curMesh=j.mesh;renderMesh(curMesh)}});"
         "fetch('/bedlevel/meshlist').then(r=>r.json()).then(function(l){"
         "meshList=l;meshIdx=0;updateHistLabel();"
         "if(l.length>0&&!curMesh)loadMeshAt(0);"
         "else if(!curMesh)renderMesh(null)});"
-        "</script>"
-    );
+        "</script>";
 
+static esp_err_t bedlevel_page_handler(httpd_req_t *req)
+{
+    html_buf_t p;
+    html_buf_init(&p);
+    layout_html_begin(&p, NT_("Bed Leveling"), "/bedlevel");
+    html_buf_printf(&p, "%s", i18n_page(BL_PAGE));
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");

@@ -26,9 +26,17 @@ The ESP32-S3's dual cores, 8MB PSRAM, and native USB OTG make it powerful enough
 |---|---|
 | ![Dashboard](docs/screenshots/dashboard.png) | ![SD Print](docs/screenshots/sd-print.png) |
 
-| GCode Terminal | Obico Integration |
+| Phone Page: Waiting for You | Printer Tiles (Hub) |
 |---|---|
-| ![Terminal](docs/screenshots/terminal.png) | ![Obico](docs/screenshots/obico.png) |
+| ![Print page](docs/screenshots/print-phone.png) | ![Printer tiles](docs/screenshots/hub-tiles.png) |
+
+| Cold Pull | GCode Terminal |
+|---|---|
+| ![Cold pull](docs/screenshots/cold-pull.png) | ![Terminal](docs/screenshots/terminal.png) |
+
+| Obico Integration |
+|---|
+| ![Obico](docs/screenshots/obico.png) |
 
 ## Web Installer
 
@@ -71,6 +79,14 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **Klipper**: uploads from SD to Moonraker with size-based dedup (skips if unchanged), auto-deletes previous upload to prevent storage bloat
 - **GCode scan cache** — file metadata (layers, time, filament, thumbnail) cached on flash so repeated prints load instantly instead of re-scanning
 - Pause, resume, and cancel work with both backends
+- **Print again** — the phone page lists the last 5 files printed from SD; a tap (after "Is the bed clear?") starts one again
+
+### Waiting for the User (Marlin only)
+- A `; @pause <text>` comment or `M0`/`M1` in a file printed from SD stops the print **without parking**: the nozzle stays where it is, the heaters stay on
+- Use it in a start file, e.g. to tune the first layer by eye on a slow test line: the comment form is harmless on printers that do not run through the bridge
+- `/print` is a page made for a phone: the stop message, **Continue**, and Z buttons (±0.01/±0.05 mm, sent as `M290` babysteps, limited to 1 mm per print)
+- The printer beeps, and the [notification hub](#notification-hub) sends a Telegram message with a link to `/print`
+- If nobody continues within 30 minutes (`HOLD_TIMEOUT_MIN`), the print is cancelled and the heaters are turned off
 
 ### Web Terminal (Marlin only)
 - **Browser-based GCode terminal** — send commands and see raw printer responses
@@ -87,6 +103,20 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **Screw adjustment calculator** — choose Tighten (CW) or Loosen (CCW) mode, get per-corner corrections in 1/4 + 1/8 turn increments
 - **Configurable** — bed size, screw spacing, screw pitch, and origin corner (FL/FR/BL/BR) persisted across reboots
 
+#### Cold Pull (Marlin only)
+- **Nozzle cleaning** — pick a plastic (PLA, PETG, ABS, Nylon; temperatures editable) and the number of pulls
+- The board runs a built-in script as a host print, so no SD card is needed: home, lift to Z50, melt and purge 30 mm, cool with the fan, then **hold the pull temperature** until you come
+- It stops with a beep and a notification each time you need to pull or reload the filament, and you continue on `/print`
+
+### Notifications & Printer Dashboard
+- Boards send events to a small **[hub](hub/README.md)** on your LAN, which forwards them to **Telegram**: the bot token lives in one place, each board only needs the hub address
+- Each board also reports its status every 10 s, and the hub shows a **tile per printer** for a phone: waiting for you (orange, first), printing (filled to the percentage), idle, error, printer not connected, board offline. A tap opens that board's `/print`
+
+### Languages
+- The web UI is translated **gettext style**: the English text in the code is the key, `i18n/<lang>.po` holds the translations (edit with any PO editor, e.g. Poedit)
+- The language follows the browser, and a link in the footer switches it (kept in a cookie)
+- Shipped: English, Russian. See [Translations](#translations) to add one
+
 ### WiFi & Configuration
 - **Auto AP fallback** — if WiFi credentials are missing or connection fails, the board creates its own access point (`ESP32FDM-XXXX`) with a captive portal for setup
 - All settings configurable via web UI — no reflashing needed
@@ -97,7 +127,11 @@ Requires Chrome or Edge (Web Serial API). Connect the board via the **right USB-
 - **Temperature history graph** — 1 hour of data, auto-refreshing canvas chart
 - Print progress bar with layer count, elapsed time, and ETA
 - Live camera snapshot (auto-refreshing)
-- Responsive nav: Home, Cam, SD, Term (Marlin only), Utils (Marlin only), Logs, Settings
+- Responsive nav: Cam, SD, Term (Marlin only), Utils (Marlin only), Logs, Settings; on a phone it folds into a menu button
+
+### Diagnostics
+- **Logs page** with filters (printer, system, heap)
+- The log lives in PSRAM that survives a **panic, watchdog or software reset**: after a crash the lines before it are still there, behind a `==== reboot #N: reason=... ====` marker (a power loss clears it)
 
 ## Hardware
 
@@ -146,6 +180,7 @@ After connecting to WiFi, open `http://<esp32-ip>/settings` to configure:
 - **Camera** — rotation, stream/snapshot URLs
 - **Printer** — backend (Marlin/Klipper), Moonraker host:port, pause command (M25 vs M524, Marlin only)
 - **Obico** — link device with 6-digit code
+- **Notifications** — hub URL, and a button to send a test message
 - **WiFi** — reset credentials (triggers AP mode on reboot)
 
 ### Menuconfig
@@ -162,6 +197,7 @@ Additional compile-time options under `ESP32 FDM Bridge Configuration`:
 | WebSocket Status Interval | 30s | Status push frequency |
 | Janus Proxy Host/Port | disabled | Sidecar for WebRTC streaming |
 | RFC 2217 Port | 2217 | Telnet serial bridge port |
+| Hold Timeout | 30 min | Cancel a print waiting for the user (`; @pause`, `M0`/`M1`) after this time |
 
 ## OctoPrint Setup
 
@@ -187,6 +223,29 @@ Connection panel:
 
 For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine on the same network. See `janus_proxy/` for details.
 
+## Notification Hub
+
+`hub/` is a small Python service (standard library only) for a machine on the same LAN: a home server, a NAS, a Raspberry Pi.
+
+1. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and get the chat id
+2. Put both in `telegram.env` and start the hub with Docker Compose or systemd — see [hub/README.md](hub/README.md)
+3. On each board: **Settings → Notifications → Hub URL**, e.g. `http://192.168.1.10:8787`, then **Send test**
+4. Open `http://<hub>:8787/` on your phone for the printer tiles, and add it to the home screen
+
+The hub has no authentication and is meant for a trusted local network: **never expose its port to the internet**.
+
+## Translations
+
+```bash
+python3 tools/i18n.py init et Eesti     # start a new language: i18n/et.po
+python3 tools/i18n.py update            # after changing text in the code
+python3 tools/i18n.py stats             # how much of each language is translated
+```
+
+Translate the entries in `i18n/<lang>.po` and build: the build turns the `.po` files into tables. Untranslated text shows in English. The build fails on a translation whose `%d`/`%s` differ from the English, or that adds `"`, `<`, `>`, `&` or `\`; an apostrophe becomes `’` automatically.
+
+In the code, mark text with `_("...")`, or with `N_("...")` inside a page template that goes through `i18n_page()` — see `main/i18n.h`.
+
 ## HTTP API
 
 | Endpoint | Method | Description |
@@ -210,11 +269,21 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/bedlevel/probe` | POST | Start G28+G29 probing |
 | `/bedlevel/status` | GET | Probing state + mesh JSON |
 | `/bedlevel/config` | GET/POST | Bed config (size, screws, origin) |
+| `/utils/coldpull` | GET/POST | Cold pull page / start it |
+| `/print` | GET | Phone page for the current print |
+| `/print/continue` | POST | Continue after a stop (`id=<hold id>`) |
+| `/print/z` | POST | Babystep Z during a print (`d=±0.01` or `±0.05`) |
+| `/print/recent` | GET | JSON list of recent SD files |
+| `/print/start` | POST | Print a recent file again (`name=<file>`) |
 | `/api/status` | GET | JSON printer status |
 | `/api/temp_history` | GET | Temperature history (1h, 4s intervals) |
 | `/settings` | GET | Settings page |
 | `/printer/config` | GET/POST | Printer backend config |
 | `/obico/link` | GET/POST | Obico device linking |
+| `/hub/config` | POST | Set the notification hub URL |
+| `/hub/test` | POST | Send a test notification |
+| `/logs` | GET | Log page (`?filter=printer\|system\|heap`) |
+| `/ota/upload` | POST | Firmware update (raw `.bin` body) |
 
 ## Architecture
 
@@ -248,8 +317,19 @@ main/
   obico_client.c/h     — Obico WebSocket, snapshot upload, Janus signaling
   rfc2217.c/h          — RFC 2217 Telnet COM-PORT-OPTION server (Marlin only)
   dns_server.c         — Captive portal DNS responder
-  layout.h             — Shared HTML layout, nav bar (adapts to backend)
+  layout.h/c           — Shared HTML layout, nav bar (adapts to backend and screen width)
+  host_print.c         — Host printing from SD or a built-in script, stops for the user
+  gcode_wait.h         — `M0`/`M1` and `; @pause` parsing
+  print_page.c/h       — /print phone page, recent files
+  cold_pull.c/h        — Cold pull script and page
+  hub_client.c/h       — Events and status to the notification hub
+  logbuf.c/h           — Log ring in PSRAM that survives resets
+  i18n.c/h             — Translations (gettext style)
   Kconfig.projbuild    — Menuconfig options
+
+hub/                   — Notification hub: Telegram, printer tiles (Python, Docker)
+i18n/                  — Translations: <lang>.po, messages.pot
+tools/i18n.py          — Extracts marked text, updates .po files, builds the tables
 
 janus_proxy/           — Python sidecar for WebRTC streaming via Obico
   proxy.py             — Main orchestrator

@@ -1,0 +1,14 @@
+[Unit]
+Description=ESP32 FDM notification hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Change these paths and the user to match the installation
+User=fdmhub
+ExecStart=/usr/bin/python3 /opt/esp32fdm/hub/hub.py --env /opt/esp32fdm/telegram.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

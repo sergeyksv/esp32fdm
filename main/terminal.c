@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "printer_comm.h"
+#include "i18n.h"
 #include "layout.h"
 #include "url_util.h"
 
@@ -101,18 +102,78 @@ static esp_err_t terminal_send_cmd(const char *cmd)
 
 /* ---- HTTP handlers ---- */
 
+/* A template for i18n_page(): not a printf format, % is written once */
+static const char TERM_PAGE[] =
+    "<pre id='out' style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
+    "height:400px;overflow-y:auto;font-size:13px;border-radius:4px;"
+    "white-space:pre-wrap;word-wrap:break-word'></pre>"
+    "<div id='lock' style='display:none;padding:8px;background:#fff3e0;"
+    "color:#e65100;border-radius:4px;margin:8px 0;text-align:center'>"
+    N_("Terminal locked during print") "</div>"
+    "<form id='frm' style='display:flex;gap:8px;margin-top:8px' onsubmit='return send()'>"
+    "<input id='inp' type='text' placeholder='" N_("GCode command (e.g. M105)") "'"
+    " style='flex:1;padding:8px;font-family:monospace;font-size:14px' autocomplete='off'>"
+    "<button type='submit' style='padding:8px 20px'>" N_("Send") "</button>"
+    "<button type='button' id='pbtn' onclick='togglePoll()'"
+    " style='padding:8px 12px;white-space:nowrap'>" N_("Pause Polling") "</button>"
+    "</form>"
+
+    "<script>"
+    "var out=document.getElementById('out'),"
+    "inp=document.getElementById('inp'),"
+    "frm=document.getElementById('frm'),"
+    "lck=document.getElementById('lock'),"
+    "pbtn=document.getElementById('pbtn'),"
+    "seq=0,locked=false,pollOff=false;"
+
+    "function poll(){"
+    "fetch('/terminal/poll?seq='+seq).then(function(r){return r.json()}).then(function(j){"
+    "if(j.data){out.textContent+=j.data;out.scrollTop=out.scrollHeight}"
+    "seq=j.seq"
+    "}).catch(function(){})}"
+
+    "function chk(){"
+    "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
+    "locked=s.state=='printing'||s.state=='paused';"
+    "inp.disabled=locked;lck.style.display=locked?'':'none'"
+    "}).catch(function(){})}"
+
+    "function togglePoll(){"
+    "pollOff=!pollOff;"
+    "fetch('/terminal/polling',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+    "body:'suppress='+(pollOff?'1':'0')});"
+    "pbtn.textContent=pollOff?'" N_("Resume Polling") "':'" N_("Pause Polling") "';"
+    "pbtn.style.background=pollOff?'#e65100':'';"
+    "pbtn.style.color=pollOff?'#fff':''}"
+
+    "function send(){"
+    "if(locked)return false;"
+    "var c=inp.value.trim();if(!c)return false;"
+    "fetch('/terminal/send',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+    "body:'cmd='+encodeURIComponent(c)}).then(function(r){"
+    "if(!r.ok)r.text().then(function(t){out.textContent+='[" N_("Error:") " '+t+']\\n';out.scrollTop=out.scrollHeight})"
+    "});inp.value='';return false}"
+
+    "poll();setInterval(poll,500);"
+    "chk();setInterval(chk,3000);"
+    "inp.focus();"
+    "window.addEventListener('beforeunload',function(){"
+    "if(pollOff)navigator.sendBeacon('/terminal/polling','suppress=0')});"
+    "</script>";
+
 static esp_err_t terminal_page_handler(httpd_req_t *req)
 {
     html_buf_t p;
     html_buf_init(&p);
 
-    layout_html_begin(&p, "Terminal", "/terminal");
+    layout_html_begin(&p, NT_("Terminal"), "/terminal");
 
     if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
         html_buf_printf(&p,
             "<p style='padding:20px;background:#fff3e0;color:#e65100;border-radius:4px;text-align:center'>"
-            "Terminal is not available with Klipper backend.<br>"
-            "Use Mainsail or Fluidd for GCode terminal access.</p>");
+            "%s<br>%s</p>",
+            _("Terminal is not available with Klipper backend."),
+            _("Use Mainsail or Fluidd for GCode terminal access."));
         layout_html_end(&p);
         httpd_resp_set_type(req, "text/html");
         esp_err_t ret = httpd_resp_send(req, p.data, p.len);
@@ -120,65 +181,7 @@ static esp_err_t terminal_page_handler(httpd_req_t *req)
         return ret;
     }
 
-    html_buf_printf(&p,
-        "<pre id='out' style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
-        "height:400px;overflow-y:auto;font-size:13px;border-radius:4px;"
-        "white-space:pre-wrap;word-wrap:break-word'></pre>"
-        "<div id='lock' style='display:none;padding:8px;background:#fff3e0;"
-        "color:#e65100;border-radius:4px;margin:8px 0;text-align:center'>"
-        "Terminal locked during print</div>"
-        "<form id='frm' style='display:flex;gap:8px;margin-top:8px' onsubmit='return send()'>"
-        "<input id='inp' type='text' placeholder='GCode command (e.g. M105)'"
-        " style='flex:1;padding:8px;font-family:monospace;font-size:14px' autocomplete='off'>"
-        "<button type='submit' style='padding:8px 20px'>Send</button>"
-        "<button type='button' id='pbtn' onclick='togglePoll()'"
-        " style='padding:8px 12px;white-space:nowrap'>Pause Polling</button>"
-        "</form>");
-
-    html_buf_printf(&p,
-        "<script>"
-        "var out=document.getElementById('out'),"
-        "inp=document.getElementById('inp'),"
-        "frm=document.getElementById('frm'),"
-        "lck=document.getElementById('lock'),"
-        "pbtn=document.getElementById('pbtn'),"
-        "seq=0,locked=false,pollOff=false;"
-
-        "function poll(){"
-        "fetch('/terminal/poll?seq='+seq).then(function(r){return r.json()}).then(function(j){"
-        "if(j.data){out.textContent+=j.data;out.scrollTop=out.scrollHeight}"
-        "seq=j.seq"
-        "}).catch(function(){})}"
-
-        "function chk(){"
-        "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
-        "locked=s.state=='printing'||s.state=='paused';"
-        "inp.disabled=locked;lck.style.display=locked?'':'none'"
-        "}).catch(function(){})}"
-
-        "function togglePoll(){"
-        "pollOff=!pollOff;"
-        "fetch('/terminal/polling',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-        "body:'suppress='+(pollOff?'1':'0')});"
-        "pbtn.textContent=pollOff?'Resume Polling':'Pause Polling';"
-        "pbtn.style.background=pollOff?'#e65100':'';"
-        "pbtn.style.color=pollOff?'#fff':''}"
-
-        "function send(){"
-        "if(locked)return false;"
-        "var c=inp.value.trim();if(!c)return false;"
-        "fetch('/terminal/send',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-        "body:'cmd='+encodeURIComponent(c)}).then(function(r){"
-        "if(!r.ok)r.text().then(function(t){out.textContent+='[Error: '+t+']\\n';out.scrollTop=out.scrollHeight})"
-        "});inp.value='';return false}"
-
-        "poll();setInterval(poll,500);"
-        "chk();setInterval(chk,3000);"
-        "inp.focus();"
-        "window.addEventListener('beforeunload',function(){"
-        "if(pollOff)navigator.sendBeacon('/terminal/polling','suppress=0')});"
-        "</script>");
-
+    html_buf_printf(&p, "%s", i18n_page(TERM_PAGE));
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
@@ -216,11 +219,11 @@ static esp_err_t terminal_send_handler(httpd_req_t *req)
     esp_err_t err = terminal_send_cmd(cmd);
     if (err == ESP_ERR_INVALID_STATE) {
         httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_sendstr(req, "Printing in progress");
+        httpd_resp_sendstr(req, _("Printing in progress"));
         return ESP_OK;
     }
     if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Send failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, _("Send failed"));
         return ESP_FAIL;
     }
 

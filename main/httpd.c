@@ -26,6 +26,9 @@
 #include "url_util.h"
 #include "logbuf.h"
 #include "ota.h"
+#include "hub_client.h"
+#include "print_page.h"
+#include "cold_pull.h"
 
 static const char *TAG = "httpd";
 
@@ -212,11 +215,13 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         s_baby_z_seeded = true;
     }
 
-    char json[448];
+    char json[768];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
-        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s}",
+        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,"
+        "\"name\":\"%s\",\"preparing\":%s,\"hold\":%s,\"hold_id\":%lu,\"hold_msg\":\"%s\","
+        "\"z_shift\":%.2f,\"z_pending\":%.2f,\"notify\":\"%s\"}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -227,7 +232,15 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         (long)(layer >= 0 ? layer : 0),
         (long)(total_layers >= 0 ? total_layers : 0),
         st.z, s_baby_z,
-        usb ? "true" : "false");
+        usb ? "true" : "false",
+        wifi_get_hostname(),
+        st.preparing ? "true" : "false",
+        st.holding ? "true" : "false",
+        (unsigned long)st.hold_id,
+        st.hold_msg,
+        st.z_shift,
+        st.z_pending,
+        hub_client_notify_status());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -376,6 +389,11 @@ static esp_err_t api_command_handler(httpd_req_t *req)
     return httpd_resp_send(req, "OK", 2);
 }
 
+void httpd_note_babystep(float dz)
+{
+    s_baby_z += dz;
+}
+
 /* ---- / root handler — dashboard ---- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -383,7 +401,7 @@ static esp_err_t root_handler(httpd_req_t *req)
     html_buf_t p;
     html_buf_init(&p);
 
-    layout_html_begin(&p, "ESP32 FDM Dashboard", "/");
+    layout_html_begin(&p, NT_("ESP32 FDM Dashboard"), "/");
 
     html_buf_printf(&p,
         "<style>"
@@ -399,50 +417,54 @@ static esp_err_t root_handler(httpd_req_t *req)
 
     /* Controls panel */
     html_buf_printf(&p,
-        "<details class='ctrl'><summary>Z Offset (Baby Stepping)</summary><div class='cg'>"
+        i18n_page(
+        "<details class='ctrl'><summary>" N_("Z offset (baby stepping)") "</summary><div class='cg'>"
         "<div class='bg'>"
         "<button onclick=\"zb(-0.05)\">\xe2\x96\xbc 0.05</button>"
         "<button onclick=\"zb(-0.01)\">\xe2\x96\xbc 0.01</button>"
-        "<span class='val' id='zof'>%.2f</span>",
+        "<span class='val' id='zof'>%.2f</span>"),
         s_baby_z);
     html_buf_printf(&p,
+        i18n_page(
         "<button onclick=\"zb(0.01)\">\xe2\x96\xb2 0.01</button>"
         "<button onclick=\"zb(0.05)\">\xe2\x96\xb2 0.05</button>"
-        "<button onclick=\"gc('M500')\" style='margin-left:8px' title='Save all settings to EEPROM (M500)'>Save</button>"
+        "<button onclick=\"gc('M500')\" style='margin-left:8px' title='" N_("Save all settings to EEPROM (M500)") "'>" N_("Save") "</button>"
         "</div>"
-        "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc closer to bed &middot; \xe2\x96\xb2 farther from bed &middot; Save writes to EEPROM (M500)</p>"
-        "</div></details>");
+        "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc " N_("closer to the bed") " &middot; \xe2\x96\xb2 " N_("farther from the bed") " &middot; " N_("Save writes to EEPROM (M500)") "</p>"
+        "</div></details>"));
 
     html_buf_printf(&p,
-        "<details class='ctrl'><summary>Temperatures</summary><div class='cg'>"
-        "<label>Hotend</label><div class='bg'>"
-        "<button onclick=\"gc('M104 S0')\">Off</button>"
+        i18n_page(
+        "<details class='ctrl'><summary>" N_("Temperatures") "</summary><div class='cg'>"
+        "<label>" N_("Nozzle") "</label><div class='bg'>"
+        "<button onclick=\"gc('M104 S0')\">" N_("Off") "</button>"
         "<button onclick=\"gc('M104 S190')\">190</button>"
         "<button onclick=\"gc('M104 S200')\">200</button>"
         "<button onclick=\"gc('M104 S210')\">210</button>"
         "<button onclick=\"gc('M104 S220')\">220</button>"
         "<input type='number' id='ht' placeholder='&deg;C' min='0' max='300'>"
-        "<button onclick=\"gc('M104 S'+document.getElementById('ht').value)\">Set</button>"
+        "<button onclick=\"gc('M104 S'+document.getElementById('ht').value)\">" N_("Set") "</button>"
         "</div>"
-        "<label>Bed</label><div class='bg'>"
-        "<button onclick=\"gc('M140 S0')\">Off</button>"
+        "<label>" N_("Bed") "</label><div class='bg'>"
+        "<button onclick=\"gc('M140 S0')\">" N_("Off") "</button>"
         "<button onclick=\"gc('M140 S50')\">50</button>"
         "<button onclick=\"gc('M140 S55')\">55</button>"
         "<button onclick=\"gc('M140 S60')\">60</button>"
         "<button onclick=\"gc('M140 S70')\">70</button>"
         "<input type='number' id='bt' placeholder='&deg;C' min='0' max='120'>"
-        "<button onclick=\"gc('M140 S'+document.getElementById('bt').value)\">Set</button>"
-        "</div></div></details>");
+        "<button onclick=\"gc('M140 S'+document.getElementById('bt').value)\">" N_("Set") "</button>"
+        "</div></div></details>"));
 
     html_buf_printf(&p,
-        "<details class='ctrl'><summary>Move / Jog</summary><div class='cg'>"
-        "<label>Step (mm)</label><div class='bg'>"
+        i18n_page(
+        "<details class='ctrl'><summary>" N_("Move") "</summary><div class='cg'>"
+        "<label>" N_("Step (mm)") "</label><div class='bg'>"
         "<button id='s01' onclick=\"setStep(0.1)\" style='font-weight:bold'>0.1</button>"
         "<button id='s1' onclick=\"setStep(1)\">1</button>"
         "<button id='s10' onclick=\"setStep(10)\">10</button>"
         "<button id='s100' onclick=\"setStep(100)\">100</button>"
         "</div>"
-        "<label>Axes</label><div class='bg'>"
+        "<label>" N_("Axes") "</label><div class='bg'>"
         "<button id='xm' onclick=\"jog('X',-1)\">X-</button>"
         "<button id='xp' onclick=\"jog('X',1)\">X+</button>"
         "<button id='ym' onclick=\"jog('Y',-1)\">Y-</button>"
@@ -450,45 +472,47 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<button id='zm' onclick=\"jog('Z',-1)\">Z-</button>"
         "<button id='zp' onclick=\"jog('Z',1)\">Z+</button>"
         "</div>"
-        "<label>Extruder</label><div class='bg'>"
-        "<button id='er' onclick=\"extrude(-1)\">Retract</button>"
-        "<button id='ee' onclick=\"extrude(1)\">Extrude</button>"
-        "<button id='esn' onclick=\"setESpd(0)\" style='font-weight:bold'>Normal</button>"
-        "<button id='ess' onclick=\"setESpd(1)\">Slow</button>"
+        "<label>" N_("Extruder") "</label><div class='bg'>"
+        "<button id='er' onclick=\"extrude(-1)\">" N_("Retract") "</button>"
+        "<button id='ee' onclick=\"extrude(1)\">" N_("Extrude") "</button>"
+        "<button id='esn' onclick=\"setESpd(0)\" style='font-weight:bold'>" N_("Normal") "</button>"
+        "<button id='ess' onclick=\"setESpd(1)\">" N_("Slow") "</button>"
         "</div>"
-        "<p class='hint' style='margin:2px 0 0'>Normal: 300mm/min. Slow: 60mm/min (for measuring filament length).</p>"
-        "<label>Home</label><div class='bg'>"
-        "<button id='ha' onclick=\"gc('G28')\">All</button>"
+        "<p class='hint' style='margin:2px 0 0'>" N_("Normal: 300 mm/min. Slow: 60 mm/min (for measuring filament length).") "</p>"
+        "<label>" N_("Homing") "</label><div class='bg'>"
+        "<button id='ha' onclick=\"gc('G28')\">" N_("All") "</button>"
         "<button id='hx' onclick=\"gc('G28 X')\">X</button>"
         "<button id='hy' onclick=\"gc('G28 Y')\">Y</button>"
         "<button id='hz' onclick=\"gc('G28 Z')\">Z</button>"
-        "</div></div></details>");
+        "</div></div></details>"));
 
     html_buf_printf(&p,
-        "<details class='ctrl'><summary>Speed / Flow / Fan</summary><div class='cg'>"
-        "<label>Speed</label><div class='bg'>"
+        i18n_page(
+        "<details class='ctrl'><summary>" N_("Speed / Flow / Fan") "</summary><div class='cg'>"
+        "<label>" N_("Speed") "</label><div class='bg'>"
         "<button onclick=\"adj('spd',-10)\">-10%%</button>"
         "<span class='val' id='spd'>100%%</span>"
         "<button onclick=\"adj('spd',10)\">+10%%</button>"
         "</div>"
-        "<label>Flow</label><div class='bg'>"
+        "<label>" N_("Flow") "</label><div class='bg'>"
         "<button onclick=\"adj('flw',-5)\">-5%%</button>"
         "<span class='val' id='flw'>100%%</span>"
         "<button onclick=\"adj('flw',5)\">+5%%</button>"
         "</div>"
-        "<label>Fan</label><div class='bg'>"
-        "<button onclick=\"gc('M106 S0')\">Off</button>"
+        "<label>" N_("Fan") "</label><div class='bg'>"
+        "<button onclick=\"gc('M106 S0')\">" N_("Off") "</button>"
         "<button onclick=\"gc('M106 S64')\">25%%</button>"
         "<button onclick=\"gc('M106 S128')\">50%%</button>"
         "<button onclick=\"gc('M106 S191')\">75%%</button>"
         "<button onclick=\"gc('M106 S255')\">100%%</button>"
-        "</div></div></details>");
+        "</div></div></details>"));
 
     html_buf_printf(&p,
+        i18n_page(
         "<div style='text-align:center;margin:12px 0'>"
-        "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
+        "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='" N_("Camera") "'>"
         "</div>"
-        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>");
+        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>"));
 
     html_buf_printf(&p,
         "<script>"
@@ -499,7 +523,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "var zoff=%.2f;"
         "function zb(d){zoff=Math.round((zoff+d)*100)/100;gc('M290 Z'+d);document.getElementById('zof').textContent=zoff.toFixed(2)}",
         s_baby_z);
-    html_buf_printf(&p,
+    html_buf_printf(&p, i18n_page(
         /* Step selector for jog */
         "var step=0.1;"
         "function setStep(v){step=v;['s01','s1','s10','s100'].forEach(function(id){document.getElementById(id).style.fontWeight='normal'});"
@@ -558,7 +582,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "if(xsteps<1)xsteps=1;"
         "for(var i=0;i<=xsteps;i++){"
         "var x=r+w*i/xsteps,sec=dur*i/xsteps;"
-        "cx.fillText('-'+(dur-sec>=60?Math.round((dur-sec)/60)+'m':Math.round(dur-sec)+'s'),x-8,H-4);}"
+        "cx.fillText('-'+(dur-sec>=60?Math.round((dur-sec)/60)+'" N_("min") "':Math.round(dur-sec)+'" N_("s") "'),x-8,H-4);}"
         /* draw lines: [he_act=red, he_tgt=red dash, bed_act=blue, bed_tgt=blue dash] */
         "var colors=['#ff4444','#ff4444','#4488ff','#4488ff'];"
         "var dashes=[[],[5,4],[],[5,4]];"
@@ -572,17 +596,17 @@ static esp_err_t root_handler(httpd_req_t *req)
         "cx.stroke();cx.setLineDash([]);}"
         /* legend */
         "var lx=r+6,ly=t+10;"
-        "var lbl=['HE','HE tgt','Bed','Bed tgt'];"
+        "var lbl=['" N_("Nozzle") "','" N_("Nozzle target") "','" N_("Bed") "','" N_("Bed target") "'];"
         "for(var i=0;i<4;i++){"
         "cx.strokeStyle=colors[i];cx.lineWidth=i%%2?1:1.5;cx.setLineDash(dashes[i]);"
         "cx.beginPath();cx.moveTo(lx,ly);cx.lineTo(lx+16,ly);cx.stroke();cx.setLineDash([]);"
-        "cx.fillStyle=colors[i];cx.fillText(lbl[i],lx+19,ly+3);lx+=60;}"
+        "cx.fillStyle=colors[i];cx.fillText(lbl[i],lx+19,ly+3);lx+=cx.measureText(lbl[i]).width+30;}"
         "}"
         "function fetchTemp(){"
         "fetch('/api/temp_history').then(function(r){return r.json()}).then(function(j){"
         "drawChart(j.samples)}).catch(function(){})}"
         "fetchTemp();setInterval(fetchTemp,15000);"
-        "</script>");
+        "</script>"));
 
     layout_html_end(&p);
 
@@ -599,22 +623,24 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     html_buf_t p;
     html_buf_init(&p);
 
-    layout_html_begin(&p, "Settings", "/settings");
+    layout_html_begin(&p, NT_("Settings"), "/settings");
 
     const char *ip = wifi_get_ip_str();
     bool is_marlin = (printer_comm_get_backend() == PRINTER_BACKEND_MARLIN);
 
     /* 1. Printer (backend selection) */
     html_buf_printf(&p,
-        "<div class='sh' style='margin-top:16px'><h2>Printer</h2>"
-        "<button type='submit' form='f-printer'>Save &amp; Reboot</button></div>");
+        i18n_page(
+        "<div class='sh' style='margin-top:16px'><h2>" N_("Printer") "</h2>"
+        "<button type='submit' form='f-printer'>" N_("Save &amp; Reboot") "</button></div>"));
     printer_config_render_backend(&p);
 
     /* 2. Marlin (conditionally visible) */
     if (is_marlin) {
         html_buf_printf(&p,
+            i18n_page(
             "<hr><div class='sh'><h2>Marlin</h2>"
-            "<button type='submit' form='f-marlin'>Save</button></div>");
+            "<button type='submit' form='f-marlin'>" N_("Save") "</button></div>"));
         printer_config_render_marlin(&p);
     }
 
@@ -624,25 +650,26 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     const char *jh = obico_get_janus_host();
     uint16_t jp = obico_get_janus_port();
     html_buf_printf(&p,
-        "<hr><div class='sh'><h2>Video</h2>"
-        "<button type='submit' form='f-video'>Save</button></div>"
+        i18n_page(
+        "<hr><div class='sh'><h2>" N_("Video") "</h2>"
+        "<button type='submit' form='f-video'>" N_("Save") "</button></div>"
         "<form id='f-video' method='POST' action='/video/config'>"
-        "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label>"
+        "<label><input type='checkbox' name='rotate180' value='1'%s> " N_("Rotate 180°") "</label>"
         "<div style='margin:8px 0'><label>XCLK: "
         "<select name='xclk'>"
-        "<option value='10'%s>10 MHz (safe)</option>"
+        "<option value='10'%s>10 MHz (" N_("safe") ")</option>"
         "<option value='12'%s>12 MHz</option>"
         "<option value='16'%s>16 MHz</option>"
-        "<option value='20'%s>20 MHz (fast)</option>"
+        "<option value='20'%s>20 MHz (" N_("fast") ")</option>"
         "</select></label>"
-        " <span class='hint'>Reboot to apply</span></div>"
-        "<p style='margin:12px 0 4px;font-weight:bold'>Janus Proxy (WebRTC streaming)</p>"
-        "<label>Host<br><input type='text' name='janus_host' value='%s' placeholder='192.168.1.x' "
+        " <span class='hint'>" N_("Reboot to apply") "</span></div>"
+        "<p style='margin:12px 0 4px;font-weight:bold'>Janus Proxy (" N_("WebRTC streaming") ")</p>"
+        "<label>" N_("Host") "<br><input type='text' name='janus_host' value='%s' placeholder='192.168.1.x' "
         "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
-        "<label>Port<br><input type='number' name='janus_port' value='%u' min='1' max='65535' "
+        "<label>" N_("Port") "<br><input type='number' name='janus_port' value='%u' min='1' max='65535' "
         "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
-        "<p class='hint'>Leave host empty to disable Janus proxy.</p>"
-        "</form>",
+        "<p class='hint'>" N_("Leave host empty to disable Janus proxy.") "</p>"
+        "</form>"),
         rot ? " checked" : "",
         xclk == 10 ? " selected" : "",
         xclk == 12 ? " selected" : "",
@@ -653,22 +680,29 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     /* 4. Obico */
     if (obico_is_linked()) {
         html_buf_printf(&p,
+            i18n_page(
             "<hr><div class='sh'><h2>Obico</h2>"
             "<button type='submit' form='f-obico' class='btn-red' "
-            "onclick=\"return confirm('Unlink from Obico?')\">Unlink</button></div>");
+            "onclick=\"return confirm('" N_("Unlink from Obico?") "')\">" N_("Unlink") "</button></div>"));
     } else {
         html_buf_printf(&p,
+            i18n_page(
             "<hr><div class='sh'><h2>Obico</h2>"
-            "<button type='submit' form='f-obico' class='btn-green'>Link</button></div>");
+            "<button type='submit' form='f-obico' class='btn-green'>" N_("Link") "</button></div>"));
     }
     obico_render_settings(&p);
 
+    if (is_marlin) {
+        hub_client_render_settings(&p);
+    }
+
     /* 5. External Endpoints (read-only) */
     html_buf_printf(&p,
-        "<hr><h2>External Endpoints</h2>"
+        i18n_page(
+        "<hr><h2>" N_("External Endpoints") "</h2>"
         "<p class='hint'>"
-        "MJPEG Stream: <a href='/stream'>http://%s/stream</a><br>"
-        "Snapshot: <a href='/capture'>http://%s/capture</a>",
+        N_("MJPEG Stream") ": <a href='/stream'>http://%s/stream</a><br>"
+        N_("Snapshot") ": <a href='/capture'>http://%s/capture</a>"),
         ip, ip);
     if (is_marlin) {
         html_buf_printf(&p,
@@ -680,17 +714,18 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     /* 6. Device */
     const char *hostname = wifi_get_hostname();
     html_buf_printf(&p,
-        "<hr><div class='sh'><h2>Device</h2>"
-        "<button type='submit' form='f-device'>Save &amp; Reboot</button></div>"
+        i18n_page(
+        "<hr><div class='sh'><h2>" N_("Device") "</h2>"
+        "<button type='submit' form='f-device'>" N_("Save &amp; Reboot") "</button></div>"
         "<form id='f-device' method='POST' action='/device/config'>"
-        "<label>Hostname<br>"
+        "<label>" N_("Hostname") "<br>"
         "<input type='text' name='hostname' value='%s' maxlength='31' "
         "pattern='[a-zA-Z][a-zA-Z0-9-]*' "
-        "title='Letters, digits, hyphens. Must start with a letter.' "
+        "title='" N_("Letters, digits, hyphens. Must start with a letter.") "' "
         "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'>"
         "</label>"
-        "<p class='hint'>Visible on router and as <b>%s.local</b> via mDNS.</p>"
-        "</form>",
+        "<p class='hint'>" N_("Visible on router and as") " <b>%s.local</b> " N_("via mDNS.") "</p>"
+        "</form>"),
         hostname, hostname);
 
     /* 7. Firmware Update (OTA) */
@@ -699,14 +734,15 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     /* 8. WiFi */
     char ssid[33] = {0};
     html_buf_printf(&p,
+        i18n_page(
         "<hr><div class='sh'><h2>WiFi</h2>"
         "<form id='f-wifi' method='POST' action='/wifi/reset'>"
         "<button type='submit' class='btn-red' "
-        "onclick=\"return confirm('Reset WiFi credentials and reboot?')\">Reset WiFi</button>"
-        "</form></div>");
+        "onclick=\"return confirm('" N_("Reset WiFi credentials and reboot?") "')\">" N_("Reset WiFi") "</button>"
+        "</form></div>"));
     if (wifi_get_ssid(ssid, sizeof(ssid))) {
         html_buf_printf(&p,
-            "<p>Connected to: <b>%s</b></p>", ssid);
+            "<p>%s <b>%s</b></p>", _("Connected to:"), ssid);
     }
 
     layout_html_end(&p);
@@ -723,13 +759,19 @@ static esp_err_t utils_page_handler(httpd_req_t *req)
 {
     html_buf_t p;
     html_buf_init(&p);
-    layout_html_begin(&p, "Utilities", "/utils");
+    layout_html_begin(&p, NT_("Utilities"), "/utils");
     html_buf_printf(&p,
-        "<h2>Utilities</h2>"
+        "<h2>%s</h2>"
         "<table>"
-        "<tr><td><a href='/bedlevel'><b>Bed Leveling</b></a></td>"
-        "<td>Probe bed mesh, visualize, and calculate screw adjustments</td></tr>"
-        "</table>");
+        "<tr><td><a href='/bedlevel'><b>%s</b></a></td><td>%s</td></tr>",
+        _("Utilities"), _("Bed Leveling"),
+        _("Probe bed mesh, visualize, and calculate screw adjustments"));
+    if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER) {
+        html_buf_printf(&p,
+            "<tr><td><a href='/utils/coldpull'><b>%s</b></a></td><td>%s</td></tr>",
+            _("Cold Pull"), _("Clean the nozzle by pulling out cooled filament"));
+    }
+    html_buf_printf(&p, "</table>");
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
@@ -746,29 +788,30 @@ static esp_err_t camera_page_handler(httpd_req_t *req)
     html_buf_t p;
     html_buf_init(&p);
 
-    layout_html_begin(&p, "Camera", "/camera");
+    layout_html_begin(&p, NT_("Camera"), "/camera");
     html_buf_printf(&p,
+        i18n_page(
         "<style>"
         ".cam-ctl{margin:12px 0;font-size:14px}"
-        ".cam-ctl label{display:inline-block;width:90px}"
+        ".cam-ctl label{display:inline-block;width:110px}"
         ".cam-ctl input[type=range]{width:140px;vertical-align:middle}"
         ".cam-ctl .val{display:inline-block;width:24px;text-align:center}"
         "</style>"
         "<div style='text-align:center'>"
-        "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='MJPEG Stream'>"
+        "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='" N_("MJPEG Stream") "'>"
         "</div>"
         "<details open>"
-        "<summary>Image Settings</summary>"
-        "<div class='cam-ctl'><label>Brightness</label>"
+        "<summary>" N_("Image Settings") "</summary>"
+        "<div class='cam-ctl'><label>" N_("Brightness") "</label>"
         "<input type='range' min='-2' max='2' value='%d' id='s-br' oninput='camUpd(this,\"vbr\")'>"
         "<span class='val' id='vbr'>%d</span></div>"
-        "<div class='cam-ctl'><label>Contrast</label>"
+        "<div class='cam-ctl'><label>" N_("Contrast") "</label>"
         "<input type='range' min='-2' max='2' value='%d' id='s-co' oninput='camUpd(this,\"vco\")'>"
         "<span class='val' id='vco'>%d</span></div>"
-        "<div class='cam-ctl'><label>Saturation</label>"
+        "<div class='cam-ctl'><label>" N_("Saturation") "</label>"
         "<input type='range' min='-2' max='2' value='%d' id='s-sa' oninput='camUpd(this,\"vsa\")'>"
         "<span class='val' id='vsa'>%d</span></div>"
-        "<div class='cam-ctl'><label>AE Level</label>"
+        "<div class='cam-ctl'><label>" N_("AE Level") "</label>"
         "<input type='range' min='-2' max='2' value='%d' id='s-ae' oninput='camUpd(this,\"vae\")'>"
         "<span class='val' id='vae'>%d</span></div>"
         "</details>"
@@ -781,7 +824,7 @@ static esp_err_t camera_page_handler(httpd_req_t *req)
         "+'&contrast='+document.getElementById('s-co').value"
         "+'&saturation='+document.getElementById('s-sa').value"
         "+'&ae_level='+document.getElementById('s-ae').value})}"
-        "</script>",
+        "</script>"),
         bright, bright, contrast, contrast, sat, sat, ae, ae);
     layout_html_end(&p);
 
@@ -863,8 +906,8 @@ static esp_err_t device_config_post_handler(httpd_req_t *req)
 
     if (hostname[0]) {
         wifi_set_hostname(hostname);
-        httpd_resp_set_type(req, "text/html");
-        httpd_resp_sendstr(req, "Device name saved. Rebooting...");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, _("Device name saved. Rebooting..."));
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
@@ -878,8 +921,8 @@ static esp_err_t device_config_post_handler(httpd_req_t *req)
 
 static esp_err_t wifi_reset_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, "WiFi credentials erased. Rebooting...");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_sendstr(req, _("WiFi credentials erased. Rebooting..."));
     vTaskDelay(pdMS_TO_TICKS(1000));
     wifi_reset_credentials();
     return ESP_OK;  /* unreachable */
@@ -900,10 +943,12 @@ static bool parse_form_field(const char *body, const char *name,
     return true;
 }
 
+/* A page template for i18n_page(), sent as is: % is single */
 static const char CAPTIVE_HTML[] =
     "<!DOCTYPE html><html><head>"
+    "<meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>ESP32 FDM WiFi Setup</title>"
+    "<title>ESP32 FDM " N_("WiFi Setup") "</title>"
     "<style>"
     "body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
     "input{width:100%;padding:8px;margin:4px 0 12px;box-sizing:border-box;font-size:16px}"
@@ -911,19 +956,19 @@ static const char CAPTIVE_HTML[] =
     "border:none;border-radius:4px;cursor:pointer}"
     "label{font-weight:bold}"
     "</style></head><body>"
-    "<h2>WiFi Setup</h2>"
+    "<h2>" N_("WiFi Setup") "</h2>"
     "<form method=\"POST\" action=\"/\">"
     "<label>SSID</label>"
     "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" autocomplete=\"off\">"
-    "<label>Password</label>"
+    "<label>" N_("Password") "</label>"
     "<input type=\"password\" name=\"password\" maxlength=\"64\">"
-    "<button type=\"submit\">Connect</button>"
+    "<button type=\"submit\">" N_("Connect") "</button>"
     "</form></body></html>";
 
 static esp_err_t captive_root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, CAPTIVE_HTML, sizeof(CAPTIVE_HTML) - 1);
+    return httpd_resp_sendstr(req, i18n_page(CAPTIVE_HTML));
 }
 
 static esp_err_t captive_root_post_handler(httpd_req_t *req)
@@ -956,10 +1001,11 @@ static esp_err_t captive_root_post_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "WiFi credentials saved for \"%s\" — rebooting", ssid);
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req,
-        "<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;margin-top:60px\">"
-        "<h2>Saved!</h2><p>Rebooting and connecting to WiFi...</p>"
-        "</body></html>");
+    httpd_resp_sendstr(req, i18n_page(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
+        "<body style=\"font-family:sans-serif;text-align:center;margin-top:60px\">"
+        "<h2>" N_("Saved!") "</h2><p>" N_("Rebooting and connecting to WiFi...") "</p>"
+        "</body></html>"));
 
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
@@ -1017,7 +1063,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 56;
+    config.max_uri_handlers = 64;
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1138,11 +1184,14 @@ esp_err_t httpd_start_server(void)
     terminal_register_httpd(server);
     if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER) {
         bedlevel_register_httpd(server);
+        cold_pull_register_httpd(server);
     }
     logbuf_register_httpd(server);
     obico_register_httpd(server);
     printer_config_register_httpd(server);
     ota_register_httpd(server);
+    print_page_register_httpd(server);
+    hub_client_register_httpd(server);
 
     ESP_LOGI(TAG, "HTTP server started on port 80 (stream at /stream)");
 

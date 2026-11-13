@@ -564,6 +564,12 @@ static bool is_wait_cmd(const char *gcode, bool *is_silent, int *timeout_overrid
     }
     if (*p == 'M') {
         int code = atoi(p + 1);
+        if (code == 400) {
+            /* M400 waits for every queued move, e.g. a slow purge, and the
+             * Kobra 2 sends no "busy:" while it does: silent like G28 */
+            if (is_silent) *is_silent = true;
+            return true;
+        }
         return (code == 109 || code == 190 || code == 116);
     }
     if (*p == 'G') {
@@ -591,10 +597,9 @@ static bool is_wait_cmd(const char *gcode, bool *is_silent, int *timeout_overrid
                 if (!pm) pm = strchr(p, 'p');
                 if (s) dwell_ms = atoi(s + 1) * 1000;
                 else if (pm) dwell_ms = atoi(pm + 1);
-                /* 20% margin (min 3s) for command processing overhead */
-                int margin = dwell_ms / 5;
-                if (margin < 3000) margin = 3000;
-                *timeout_override_ms = dwell_ms + margin;
+                /* Marlin finishes all queued moves before the dwell starts and
+                 * stays silent throughout, so the wait is open-ended like G28. */
+                *timeout_override_ms = dwell_ms + WAIT_SILENT_TIMEOUT_MS;
             }
             return true;
         }
@@ -782,12 +787,16 @@ static void printer_comm_task(void *arg)
             /* Host print commands */
             if (cmd.type == PCMD_HOST_START) {
                 hp_cmd_start(cmd.gcode); continue;
+            } else if (cmd.type == PCMD_HOST_SCRIPT) {
+                hp_cmd_start_script(cmd.gcode); continue;
             } else if (cmd.type == PCMD_HOST_PAUSE) {
                 hp_cmd_pause(); continue;
             } else if (cmd.type == PCMD_HOST_RESUME) {
                 hp_cmd_resume(); continue;
             } else if (cmd.type == PCMD_HOST_CANCEL) {
                 hp_cmd_cancel(); continue;
+            } else if (cmd.type == PCMD_HOST_CONTINUE) {
+                hp_cmd_continue((uint32_t)strtoul(cmd.gcode, NULL, 10)); continue;
             }
 
             /* Route pause/resume/cancel to host print if active */
@@ -1142,9 +1151,12 @@ esp_err_t printer_comm_init(void)
 /* ---- Host print public API ---- */
 
 esp_err_t printer_comm_host_print_start(const char *filename) { return hp_start(filename); }
+esp_err_t printer_comm_host_print_script(const char *name, char *script) { return hp_start_script(name, script); }
 esp_err_t printer_comm_host_print_pause(void)  { return hp_pause(); }
 esp_err_t printer_comm_host_print_resume(void) { return hp_resume(); }
 esp_err_t printer_comm_host_print_cancel(void) { return hp_cancel(); }
+esp_err_t printer_comm_host_print_continue(uint32_t hold_id) { return hp_continue(hold_id); }
+esp_err_t printer_comm_host_print_zstep(float dz) { return hp_zstep(dz); }
 bool printer_comm_is_host_printing(void) { return hp_is_active(); }
 
 void printer_comm_set_polling_suppressed(bool suppress)
@@ -1245,17 +1257,18 @@ void printer_config_render_backend(html_buf_t *p)
     const char *checked_klipper = (s_backend == PRINTER_BACKEND_KLIPPER) ? "checked" : "";
 
     html_buf_printf(p,
+        i18n_page(
         "<form id='f-printer' method='POST' action='/printer/config'>"
         "<div style='margin:10px 0'>"
-        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='marlin' %s> Marlin (USB serial)</label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='marlin' %s> Marlin (" N_("USB serial") ")</label>"
         "<label style='display:block;margin:8px 0 4px'><input type='radio' name='backend' value='klipper' %s> Klipper (Moonraker HTTP)</label>"
         "</div>"
         "<div style='margin-left:20px'>"
-        "<label style='display:block;margin:8px 0 4px'>Moonraker Host/IP:<input type='text' name='mr_host' value='%s' maxlength='63' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
-        "<label style='display:block;margin:8px 0 4px'>Moonraker Port:<input type='number' name='mr_port' value='%u' min='1' max='65535' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
+        "<label style='display:block;margin:8px 0 4px'>" N_("Moonraker Host/IP:") "<input type='text' name='mr_host' value='%s' maxlength='63' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
+        "<label style='display:block;margin:8px 0 4px'>" N_("Moonraker Port:") "<input type='number' name='mr_port' value='%u' min='1' max='65535' style='width:100%%;box-sizing:border-box;padding:6px'></label>"
         "</div>"
-        "<p class='hint'><a href='/printer/config/test'>Test Moonraker connection</a></p>"
-        "</form>",
+        "<p class='hint'><a href='/printer/config/test'>" N_("Test Moonraker connection") "</a></p>"
+        "</form>"),
         checked_marlin, checked_klipper, s_mr_host, s_mr_port);
 }
 
@@ -1266,25 +1279,27 @@ void printer_config_render_marlin(html_buf_t *p)
     const char *checked_fil  = s_filament_check ? "checked" : "";
 
     html_buf_printf(p,
+        i18n_page(
         "<form id='f-marlin' method='POST' action='/printer/config/marlin'>"
         "<div style='margin:10px 0'>"
-        "<label style='display:block;margin:8px 0 4px'><b>Pause Command</b></label>"
-        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 &mdash; Pause SD print (can resume)</label>"
-        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 &mdash; Abort print (if M25 crashes firmware)</label>"
+        "<label style='display:block;margin:8px 0 4px'><b>" N_("Pause Command") "</b></label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m25' %s> M25 &mdash; " N_("Pause SD print (can resume)") "</label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='radio' name='pause_cmd' value='m524' %s> M524 &mdash; " N_("Abort print (if M25 crashes firmware)") "</label>"
         "</div>"
         "<div style='margin:10px 0'>"
-        "<label style='display:block;margin:8px 0 4px'><b>Filament Sensor</b></label>"
-        "<label style='display:block;margin:8px 0 4px'><input type='checkbox' name='filament_chk' value='1' %s> Poll filament sensor (M119) during host print &mdash; auto-pause on runout</label>"
+        "<label style='display:block;margin:8px 0 4px'><b>" N_("Filament Sensor") "</b></label>"
+        "<label style='display:block;margin:8px 0 4px'><input type='checkbox' name='filament_chk' value='1' %s> " N_("Poll filament sensor (M119) during host print") " &mdash; " N_("auto-pause on runout") "</label>"
         "</div>"
         "<div style='margin:10px 0'>"
         "<label style='display:block;margin:8px 0 4px'><b>CDC Echo Ping</b></label>"
-        "<p style='margin:4px 0;font-size:13px;color:#666'>Some printers hold USB responses until the next command is sent. "
-        "Adding commands here sends a harmless M118 ping after them to flush the response. "
-        "Typical candidates: <b>M119, G92</b></p>"
-        "<input type='text' name='echo_ping' value='%s' placeholder='e.g. M119, G92'"
+        "<p style='margin:4px 0;font-size:13px;color:#666'>"
+        N_("Some printers hold USB responses until the next command is sent. "
+           "Adding commands here sends a harmless M118 ping after them to flush the response.")
+        " " N_("Typical candidates:") " <b>M119, G92</b></p>"
+        "<input type='text' name='echo_ping' value='%s' placeholder='" N_("e.g.") " M119, G92'"
         " style='width:100%%;padding:6px;font-family:monospace'>"
         "</div>"
-        "</form>",
+        "</form>"),
         checked_m25, checked_m524, checked_fil, s_echo_ping_cmds);
 }
 
@@ -1343,11 +1358,12 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
 
     html_buf_t pg;
     html_buf_init(&pg);
-    layout_html_begin(&pg, "Saved", "/settings");
+    layout_html_begin(&pg, NT_("Saved"), "/settings");
     html_buf_printf(&pg,
-        "<h2>Configuration saved!</h2>"
-        "<p>Rebooting in 3 seconds...</p>"
-        "<script>setTimeout(function(){location.href='/settings'},5000)</script>");
+        i18n_page(
+        "<h2>" N_("Configuration saved!") "</h2>"
+        "<p>" N_("Rebooting in 3 seconds...") "</p>"
+        "<script>setTimeout(function(){location.href='/settings'},5000)</script>"));
     layout_html_end(&pg);
 
     httpd_resp_set_type(req, "text/html");

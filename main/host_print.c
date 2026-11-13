@@ -1,8 +1,13 @@
 #include "marlin_proto.h"
 #include "gcode_scan.h"
+#include "gcode_wait.h"
+#include "httpd.h"
+#include "hub_client.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/task.h"
+#include "sdkconfig.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -22,14 +27,29 @@ static const char *TAG = "host_print";
 #define PARK_Z_LIFT  5.0f    /* mm to lift Z on pause */
 #define PARK_RETRACT 2.0f    /* mm filament retract on pause */
 
+/* Wait for user (M0/M1 in the file) */
+#define HOLD_SEND_ATTEMPTS    15     /* M400 can outlast several busy: cooldowns */
+#define Z_SHIFT_LIMIT_CU      100    /* 1 mm: total manual Z shift allowed per print */
+
 /* ---- Host print state ---- */
 
 typedef struct {
     /* State */
     bool printing, paused;
 
+    /* Waiting for the user: paused == true, but the head is not parked */
+    bool holding;
+    uint32_t hold_id;
+    int64_t hold_since_us;
+
+    /* Manual Z, in hundredths of a mm so that taps add up exactly.
+     * Both are guarded by g_state_mutex: taps arrive from HTTP handlers. */
+    int z_shift_cu;     /* Sent to the printer */
+    int z_pending_cu;   /* Tapped, waiting for the printer to be ready */
+
     /* File I/O */
     FILE *file;
+    char *script;       /* Built-in script the file reads from (fmemopen), or NULL */
     char filename[64];
     int32_t lines_sent, total_lines;
 
@@ -113,7 +133,7 @@ static bool is_long_running_cmd(const char *gcode)
     }
     if (*p == 'M' || *p == 'm') {
         int code = atoi(p + 1);
-        return (code == 109 || code == 190 || code == 116);
+        return (code == 109 || code == 190 || code == 116 || code == 400);
     }
     return false;
 }
@@ -256,6 +276,79 @@ static void host_print_unpark(void)
     marlin_send_cmd("M83", QUERY_CMD);            /* Extruder relative (most slicers use this) */
 }
 
+/* Identifies the current print, guarded by g_state_mutex.  A scan that finishes
+ * after its print ended must not touch the state of the next one. */
+static uint32_t s_scan_gen;
+
+/** Send a setup command for a hold, waiting out busy: cooldowns.
+ *  marlin_send_cmd() returns true on "busy:" without a real "ok", and drops
+ *  commands during the cooldown that follows, so success needs both checks.
+ *  Only idempotent commands may use this, since they can be sent repeatedly. */
+static bool hold_send(const char *gcode)
+{
+    for (int i = 0; i < HOLD_SEND_ATTEMPTS; i++) {
+        while (esp_timer_get_time() < s_cmd_cooldown_until_us) {
+            if (!marlin_is_connected()) return false;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (marlin_send_cmd(gcode, QUERY_CMD) &&
+            esp_timer_get_time() >= s_cmd_cooldown_until_us) {
+            return true;
+        }
+        if (!marlin_is_connected()) return false;
+    }
+    ESP_LOGW(TAG, "Hold: no confirmation for %s", gcode);
+    return false;
+}
+
+/** Clear hold state.  Caller restores the stepper timeout. */
+static void hold_clear(void)
+{
+    s_hp.holding = false;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.holding = false;
+    g_state.hold_msg[0] = '\0';
+    xSemaphoreGive(g_state_mutex);
+}
+
+/** Stop streaming and wait for the user, with the head left where it is. */
+static void hold_begin(const char *msg)
+{
+    static uint32_t s_hold_counter;
+
+    s_hp.paused = true;
+    s_hp.pause_elapsed_us += esp_timer_get_time() - s_hp.start_us;
+
+    ESP_LOGI(TAG, "Waiting for user: %s", msg);
+
+    /* No M84 S<timeout>: on the Kobra 2 build it makes Marlin drop every
+     * babystep (M290 and the printer's own Z buttons) until the next G28,
+     * and that printer never idles its steppers anyway. M76 is not sent:
+     * the printer's own UI must stay in its printing mode so that Z can be
+     * adjusted there. */
+
+    char lcd_msg[80];
+    snprintf(lcd_msg, sizeof(lcd_msg), "M117 %s", msg);
+    hold_send(lcd_msg);
+
+    hold_send("M400");                 /* The head has stopped from here on */
+    hold_send("M300 S1000 P500");      /* Ignored if the printer has no beeper */
+
+    s_hp.holding = true;
+    s_hp.hold_id = ++s_hold_counter;
+    s_hp.hold_since_us = esp_timer_get_time();
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.opstate = PRINTER_PAUSED;
+    g_state.holding = true;
+    g_state.hold_id = s_hp.hold_id;
+    strncpy(g_state.hold_msg, msg, sizeof(g_state.hold_msg) - 1);
+    g_state.hold_msg[sizeof(g_state.hold_msg) - 1] = '\0';
+    xSemaphoreGive(g_state_mutex);
+
+    hub_client_send_event(HUB_EVENT_HOLD, msg, s_hp.filename);
+}
+
 /** Finish host print (complete or cancel) */
 static void host_print_finish(bool cancelled)
 {
@@ -263,8 +356,13 @@ static void host_print_finish(bool cancelled)
         fclose(s_hp.file);
         s_hp.file = NULL;
     }
+    free(s_hp.script);
+    s_hp.script = NULL;
 
     bool connected = usb_serial_is_connected();
+
+    if (s_hp.holding)
+        hold_clear();
 
     if (connected) {
         /* Reset Marlin's line counter so it stops expecting numbered lines.
@@ -318,36 +416,88 @@ static void host_print_finish(bool cancelled)
     g_state.host_printing = false;
     g_state.current_layer = 0;
     g_state.filename[0] = '\0';
+    s_hp.z_shift_cu = 0;
+    s_hp.z_pending_cu = 0;
+    g_state.z_shift = 0.0f;
+    g_state.z_pending = 0.0f;
+    g_state.preparing = false;
+    s_scan_gen++;
     xSemaphoreGive(g_state_mutex);
 }
 
-/** Start host print from within the task context */
-void hp_cmd_start(const char *filename)
-{
-    if (s_hp.printing) {
-        ESP_LOGW(TAG, "Host print already active");
-        return;
-    }
+/* ---- Whole-file scan, next to the running print ---- */
 
+typedef struct {
     char path[128];
-    snprintf(path, sizeof(path), "/sdcard/%s", filename);
+    uint32_t gen;
+} scan_job_t;
 
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        ESP_LOGE(TAG, "Failed to open %s", path);
-        return;
+static void scan_task(void *arg)
+{
+    scan_job_t *job = (scan_job_t *)arg;
+    gcode_scan_t scan;
+    bool ok = false;
+
+    /* A handle of its own: the print is reading from the other one */
+    FILE *f = fopen(job->path, "r");
+    if (f) {
+        gcode_scan_file(f, &scan);
+        fclose(f);
+        ok = true;
+    } else {
+        ESP_LOGE(TAG, "Scan could not open %s", job->path);
     }
 
-    gcode_scan_t scan;
-    gcode_scan_file(f, &scan);
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (job->gen == s_scan_gen) {
+        if (ok) {
+            s_hp.total_lines = scan.total_lines;
+            g_state.object_height = scan.max_z;
+            g_state.total_layers = scan.total_layers;
+            g_state.layer_height = scan.layer_height;
+            g_state.first_layer_height = scan.first_layer_height;
+        }
+        g_state.preparing = false;
+    }
+    xSemaphoreGive(g_state_mutex);
 
-    ESP_LOGI(TAG, "Host print starting: %s (%ld lines)", filename, (long)scan.total_lines);
+    free(job);
+    vTaskDelete(NULL);
+}
+
+static void scan_start(const char *path, uint32_t gen)
+{
+    scan_job_t *job = malloc(sizeof(*job));
+    if (job) {
+        strlcpy(job->path, path, sizeof(job->path));
+        job->gen = gen;
+        /* Lowest priority: the print must not wait for this */
+        if (xTaskCreatePinnedToCore(scan_task, "gcode_scan", 6144, job, 1, NULL, 0) == pdPASS) {
+            return;
+        }
+        free(job);
+    }
+
+    /* The print still runs, only without progress and layer counts */
+    ESP_LOGE(TAG, "Could not start the file scan");
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.preparing = false;
+    xSemaphoreGive(g_state_mutex);
+}
+
+/** Start streaming from an open file.  script, if set, is the buffer the file
+ *  reads from and is owned by the print from here on. */
+static void start_common(FILE *f, char *script, const char *filename, const char *scan_path)
+{
+    ESP_LOGI(TAG, "Host print starting: %s", filename);
 
     s_hp.file = f;
+    s_hp.script = script;
     s_hp.printing = true;
     s_hp.paused = false;
+    s_hp.holding = false;
     s_hp.lines_sent = 0;
-    s_hp.total_lines = scan.total_lines;
+    s_hp.total_lines = 0;       /* Unknown until the scan finishes */
     s_hp.layer = 0;
     s_hp.has_layer_comments = false;
     s_hp.start_us = esp_timer_get_time();
@@ -386,13 +536,95 @@ void hp_cmd_start(const char *filename)
     g_state.print_time_left_s = -1;
     g_state.host_printing = true;
     g_state.current_layer = 0;
-    g_state.object_height = scan.max_z;
-    g_state.total_layers = scan.total_layers;
-    g_state.layer_height = scan.layer_height;
-    g_state.first_layer_height = scan.first_layer_height;
+    g_state.holding = false;
+    g_state.hold_msg[0] = '\0';
+    s_hp.z_shift_cu = 0;
+    s_hp.z_pending_cu = 0;
+    g_state.z_shift = 0.0f;
+    g_state.z_pending = 0.0f;
+    g_state.preparing = true;
+    uint32_t scan_gen = ++s_scan_gen;
+    g_state.object_height = 0.0f;
+    g_state.total_layers = -1;
+    g_state.layer_height = 0.0f;
+    g_state.first_layer_height = 0.0f;
     strncpy(g_state.filename, filename, sizeof(g_state.filename) - 1);
     g_state.filename[sizeof(g_state.filename) - 1] = '\0';
     xSemaphoreGive(g_state_mutex);
+
+    if (scan_path) {
+        scan_start(scan_path, scan_gen);
+        return;
+    }
+
+    /* A built-in script is a few hundred bytes: scan it here, on a handle of
+     * its own, so that no task can outlive the buffer */
+    gcode_scan_t scan;
+    FILE *sf = fmemopen(script, strlen(script), "r");
+    if (sf) gcode_scan_file(sf, &scan);
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (sf) {
+        s_hp.total_lines = scan.total_lines;
+        g_state.object_height = scan.max_z;
+        g_state.total_layers = scan.total_layers;
+        g_state.layer_height = scan.layer_height;
+        g_state.first_layer_height = scan.first_layer_height;
+    }
+    g_state.preparing = false;
+    xSemaphoreGive(g_state_mutex);
+    if (sf) fclose(sf);
+}
+
+/** Start host print from within the task context */
+void hp_cmd_start(const char *filename)
+{
+    if (s_hp.printing) {
+        ESP_LOGW(TAG, "Host print already active");
+        return;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), "/sdcard/%s", filename);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open %s", path);
+        return;
+    }
+    start_common(f, NULL, filename, path);
+}
+
+/* A built-in script handed over by hp_start_script(), waiting for the comm task */
+static char *s_script_pending;
+static portMUX_TYPE s_script_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static char *take_pending_script(void)
+{
+    taskENTER_CRITICAL(&s_script_lock);
+    char *script = s_script_pending;
+    s_script_pending = NULL;
+    taskEXIT_CRITICAL(&s_script_lock);
+    return script;
+}
+
+/** Start host print of a built-in script, as if it were a file */
+void hp_cmd_start_script(const char *name)
+{
+    char *script = take_pending_script();
+    if (!script) return;
+    if (s_hp.printing) {
+        ESP_LOGW(TAG, "Host print already active -- %s not started", name);
+        free(script);
+        return;
+    }
+
+    FILE *f = fmemopen(script, strlen(script), "r");
+    if (!f) {
+        ESP_LOGE(TAG, "fmemopen failed for %s", name);
+        free(script);
+        return;
+    }
+    start_common(f, script, name, NULL);
 }
 
 /** Pause host print: park head, stop timer */
@@ -413,14 +645,66 @@ void hp_cmd_pause(void)
 void hp_cmd_resume(void)
 {
     if (!s_hp.printing || !s_hp.paused) return;
-    marlin_send_cmd("M75", QUERY_CMD);  /* Resume Marlin print timer */
-    host_print_unpark();
+    if (s_hp.holding) {
+        /* The head never moved, so there is nothing to restore */
+        hold_send("M117");
+        hold_clear();
+    } else {
+        marlin_send_cmd("M75", QUERY_CMD);  /* Resume Marlin print timer */
+        host_print_unpark();
+    }
     s_hp.paused = false;
     s_hp.start_us = esp_timer_get_time();
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.opstate = PRINTER_PRINTING;
     xSemaphoreGive(g_state_mutex);
     ESP_LOGI(TAG, "Host print resumed (head restored)");
+}
+
+/** Continue after a specific hold.  A stale or repeated request names an
+ *  older hold and is ignored, so it cannot skip the next stop in the file. */
+void hp_cmd_continue(uint32_t hold_id)
+{
+    if (!s_hp.holding || s_hp.hold_id != hold_id) {
+        ESP_LOGI(TAG, "Ignoring continue for hold %lu", (unsigned long)hold_id);
+        return;
+    }
+    hp_cmd_resume();
+}
+
+/** Send accumulated Z taps as one M290 if the printer can take it.  Not while
+ *  parked: the unpark move returns to a Z saved without this shift. */
+static void z_flush(void)
+{
+    if (!s_hp.printing || (s_hp.paused && !s_hp.holding)) return;
+    if (!marlin_is_connected() || esp_timer_get_time() < s_cmd_cooldown_until_us) return;
+
+    /* Sending drains RX, which would consume the late "ok" of a deferred line
+     * and desynchronise Marlin's line counter.  The same rule as for polling. */
+    if (s_hp.has_pending) return;
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    int cu = s_hp.z_pending_cu;
+    xSemaphoreGive(g_state_mutex);
+    if (cu == 0) return;
+
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "M290 Z%.2f", cu / 100.0f);
+    if (!marlin_send_cmd(cmd, QUERY_CMD)) {
+        /* Dropped before sending: try again later */
+        if (!marlin_is_connected() || esp_timer_get_time() < s_cmd_cooldown_until_us) return;
+        /* Sent, but no reply.  It may have moved the nozzle, and sending it
+         * again could double the step, so it counts as applied. */
+        ESP_LOGW(TAG, "No reply to %s, not resending", cmd);
+    }
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    s_hp.z_pending_cu -= cu;
+    s_hp.z_shift_cu += cu;
+    g_state.z_pending = s_hp.z_pending_cu / 100.0f;
+    g_state.z_shift = s_hp.z_shift_cu / 100.0f;
+    xSemaphoreGive(g_state_mutex);
+    httpd_note_babystep(cu / 100.0f);
 }
 
 /** Cancel host print */
@@ -433,6 +717,18 @@ void hp_cmd_cancel(void)
 
 void hp_tick(void)
 {
+    if (s_hp.holding &&
+        esp_timer_get_time() - s_hp.hold_since_us >
+            CONFIG_HOLD_TIMEOUT_MIN * 60 * 1000000LL) {
+        ESP_LOGW(TAG, "Nobody continued within %d min -- cancelling print",
+                 CONFIG_HOLD_TIMEOUT_MIN);
+        hub_client_send_event(HUB_EVENT_HOLD_TIMEOUT, "", s_hp.filename);
+        host_print_finish(true);
+        return;
+    }
+
+    z_flush();
+
     if (!s_hp.printing || s_hp.paused) return;
 
     /* Explicit USB disconnect handling: don't advance file position,
@@ -444,6 +740,10 @@ void hp_tick(void)
 
     while (lines_this_batch < 4 && s_hp.file) {
         if (esp_timer_get_time() < s_cmd_cooldown_until_us) break;
+
+        /* Before every line, not every batch: with a full planner, a batch can
+         * take over a second, and Z is tuned by eye while it prints. */
+        z_flush();
 
         /* Use pending line from previous failed send, or read new */
         if (s_hp.has_pending) {
@@ -493,6 +793,14 @@ void hp_tick(void)
                 s_hp.has_layer_comments = true;
             }
 
+            /* A stop written as a comment */
+            char pause_msg[sizeof(g_state.hold_msg)];
+            if (gcode_parse_pause_comment(line, pause_msg, sizeof(pause_msg))) {
+                s_hp.lines_sent++;
+                hold_begin(pause_msg);
+                return;
+            }
+
             /* Skip empty lines and comments */
             if (ln == 0 || line[0] == ';') {
                 s_hp.lines_sent++;
@@ -526,6 +834,15 @@ void hp_tick(void)
                 ESP_LOGW(TAG, "Skipping non-GCode line: %s", line);
                 s_hp.lines_sent++;
                 continue;
+            }
+
+            /* M0/M1 stay on this side: whether a printer really waits on them
+             * depends on its firmware, and it may wait for its own button. */
+            char wait_msg[sizeof(g_state.hold_msg)];
+            if (gcode_parse_user_wait(line, wait_msg, sizeof(wait_msg))) {
+                s_hp.lines_sent++;
+                hold_begin(wait_msg);
+                return;
             }
         }
 
@@ -658,6 +975,27 @@ esp_err_t hp_start(const char *filename)
     return printer_comm_send_cmd(&cmd);
 }
 
+esp_err_t hp_start_script(const char *name, char *script)
+{
+    bool queued = false;
+    taskENTER_CRITICAL(&s_script_lock);
+    if (!s_script_pending) {
+        s_script_pending = script;
+        queued = true;
+    }
+    taskEXIT_CRITICAL(&s_script_lock);
+    if (!queued) {
+        free(script);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    printer_cmd_t cmd = { .type = PCMD_HOST_SCRIPT };
+    strlcpy(cmd.gcode, name, sizeof(cmd.gcode));
+    esp_err_t err = printer_comm_send_cmd(&cmd);
+    if (err != ESP_OK) free(take_pending_script());
+    return err;
+}
+
 esp_err_t hp_pause(void)
 {
     printer_cmd_t cmd = { .type = PCMD_HOST_PAUSE };
@@ -668,6 +1006,33 @@ esp_err_t hp_resume(void)
 {
     printer_cmd_t cmd = { .type = PCMD_HOST_RESUME };
     return printer_comm_send_cmd(&cmd);
+}
+
+esp_err_t hp_continue(uint32_t hold_id)
+{
+    printer_cmd_t cmd = { .type = PCMD_HOST_CONTINUE };
+    snprintf(cmd.gcode, sizeof(cmd.gcode), "%lu", (unsigned long)hold_id);
+    return printer_comm_send_cmd(&cmd);
+}
+
+/* Called from HTTP handlers.  Taps skip the command queue, because it fills up
+ * while the comm task is blocked on a long command such as G28 or M109. */
+esp_err_t hp_zstep(float dz)
+{
+    if (!s_hp.printing || (s_hp.paused && !s_hp.holding)) return ESP_ERR_INVALID_STATE;
+
+    int cu = (int)lroundf(dz * 100.0f);
+    esp_err_t err = ESP_OK;
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (abs(s_hp.z_shift_cu + s_hp.z_pending_cu + cu) > Z_SHIFT_LIMIT_CU) {
+        err = ESP_ERR_INVALID_SIZE;
+    } else {
+        s_hp.z_pending_cu += cu;
+        g_state.z_pending = s_hp.z_pending_cu / 100.0f;
+    }
+    xSemaphoreGive(g_state_mutex);
+    return err;
 }
 
 esp_err_t hp_cancel(void)

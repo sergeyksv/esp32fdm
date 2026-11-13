@@ -39,6 +39,8 @@ typedef enum {
 #define PCMD_HOST_PAUSE  101
 #define PCMD_HOST_RESUME 102
 #define PCMD_HOST_CANCEL 103
+#define PCMD_HOST_CONTINUE 104  /* gcode field holds the hold id */
+#define PCMD_HOST_SCRIPT 105    /* gcode field holds the name; the script waits in host_print.c */
 
 /* Host print command timeout: must be longer than the M113 keepalive
  * interval (2s) so Marlin has a chance to send "busy: processing"
@@ -95,9 +97,11 @@ bool hp_is_paused(void);
 
 /** Command handlers (called from printer_comm_task queue dispatch) */
 void hp_cmd_start(const char *filename);
+void hp_cmd_start_script(const char *name);
 void hp_cmd_pause(void);
 void hp_cmd_resume(void);
 void hp_cmd_cancel(void);
+void hp_cmd_continue(uint32_t hold_id);
 
 /** Run one iteration of the host print streaming loop.
  *  Sends up to 4 GCode lines per call. */
@@ -112,9 +116,12 @@ void hp_fill_state(printer_state_t *out);
 
 /** Public API pass-throughs */
 esp_err_t hp_start(const char *filename);
+esp_err_t hp_start_script(const char *name, char *script);
 esp_err_t hp_pause(void);
 esp_err_t hp_resume(void);
 esp_err_t hp_cancel(void);
+esp_err_t hp_continue(uint32_t hold_id);
+esp_err_t hp_zstep(float dz);
 
 #ifdef __cplusplus
 }

@@ -4,6 +4,8 @@
 #include "printer_comm.h"
 #include "printer_comm_klipper.h"
 #include "layout.h"
+#include "i18n.h"
+#include "print_page.h"
 #include "url_util.h"
 
 #include "esp_log.h"
@@ -28,22 +30,17 @@ static const char *TAG = "sdcard_httpd";
 
 /* ---- GET /sd — HTML file manager ---- */
 
-static esp_err_t sd_page_handler(httpd_req_t *req)
-{
-    html_buf_t p;
-    html_buf_init(&p);
-
-    layout_html_begin(&p, "SD Card", "/sd");
-    html_buf_printf(&p,
+/* A template for i18n_page(): not a printf format, % is written once */
+static const char SD_PAGE[] =
         "<style>"
-        "#modal-bg{display:none;position:fixed;top:0;left:0;width:100%%;height:100%%;background:rgba(0,0,0,0.5);z-index:100;align-items:center;justify-content:center}"
+        "#modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:100;align-items:center;justify-content:center}"
         "#modal-bg.show{display:flex}"
-        "#modal{background:#fff;border-radius:8px;padding:20px;max-width:420px;width:90%%;max-height:80vh;overflow-y:auto;position:relative}"
+        "#modal{background:#fff;border-radius:8px;padding:20px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto;position:relative}"
         "#modal h3{margin:0 0 12px}"
         "#modal .close{position:absolute;top:8px;right:12px;font-size:1.4em;cursor:pointer;background:none;border:none;color:#666}"
         "#modal .thumb{text-align:center;margin:8px 0}"
-        "#modal .thumb img{max-width:100%%;max-height:200px;border-radius:4px}"
-        "#modal table{width:100%%}"
+        "#modal .thumb img{max-width:100%;max-height:200px;border-radius:4px}"
+        "#modal table{width:100%}"
         "#modal td{padding:4px 8px}"
         "#modal td:first-child{color:#666;white-space:nowrap}"
         "</style>"
@@ -53,29 +50,29 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "<h3 id='info-name'></h3>"
         "<div class='thumb' id='info-thumb'></div>"
         "<table>"
-        "<tr><td>Size</td><td id='info-size'></td></tr>"
-        "<tr><td>Layers</td><td id='info-layers'></td></tr>"
-        "<tr><td>Layer Height</td><td id='info-lh'></td></tr>"
-        "<tr><td>Object Height</td><td id='info-oh'></td></tr>"
-        "<tr><td>Est. Time</td><td id='info-time'></td></tr>"
-        "<tr><td>Filament</td><td id='info-fil'></td></tr>"
+        "<tr><td>" N_("Size") "</td><td id='info-size'></td></tr>"
+        "<tr><td>" N_("Layers") "</td><td id='info-layers'></td></tr>"
+        "<tr><td>" N_("Layer height") "</td><td id='info-lh'></td></tr>"
+        "<tr><td>" N_("Object height") "</td><td id='info-oh'></td></tr>"
+        "<tr><td>" N_("Estimated time") "</td><td id='info-time'></td></tr>"
+        "<tr><td>" N_("Filament") "</td><td id='info-fil'></td></tr>"
         "</table>"
         "</div></div>"
-        "<h3>Upload</h3>"
+        "<h3>" N_("Upload") "</h3>"
         "<input type='file' id='file' accept='.gcode,.g,.gc'>"
-        "<button onclick='upload()'>Upload</button>"
-        "<progress id='upload-prog' value='0' max='100' style='width:100%%;display:none;margin:4px 0'></progress>"
+        "<button onclick='upload()'>" N_("Upload") "</button>"
+        "<progress id='upload-prog' value='0' max='100' style='width:100%;display:none;margin:4px 0'></progress>"
         "<span id='upload-status'></span>"
-        "<h3>Files</h3>"
-        "<table><thead><tr><th>File</th><th></th></tr></thead>"
+        "<h3>" N_("Files") "</h3>"
+        "<table><thead><tr><th>" N_("File") "</th><th></th></tr></thead>"
         "<tbody id='files'></tbody></table>"
         "<script>"
         "function fmt(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB'}"
         "function fmtDate(t){if(!t)return'-';var d=new Date(t*1000),m=d.getMonth()+1,dy=d.getDate(),y=d.getFullYear(),h=d.getHours(),mi=d.getMinutes();return y+'-'+(m<10?'0':'')+m+'-'+(dy<10?'0':'')+dy+' '+(h<10?'0':'')+h+':'+(mi<10?'0':'')+mi}"
-        "function fmtTime(s){if(s<0)return'Unknown';var h=Math.floor(s/3600),m=Math.floor((s%%3600)/60);return h>0?h+'h '+m+'m':m+'m'}"
+        "function fmtTime(s){if(s<0)return'" N_("Unknown") "';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'" N_("h") " '+m+'" N_("min") "':m+'" N_("min") "'}"
         "function info(name){"
         "document.getElementById('info-name').textContent=name;"
-        "document.getElementById('info-thumb').innerHTML='Loading...';"
+        "document.getElementById('info-thumb').innerHTML='" N_("Loading...") "';"
         "document.getElementById('info-size').textContent='...';"
         "document.getElementById('info-layers').textContent='...';"
         "document.getElementById('info-lh').textContent='...';"
@@ -85,28 +82,29 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "document.getElementById('modal-bg').classList.add('show');"
         "fetch('/sd/info?filename='+encodeURIComponent(name)).then(function(r){return r.json()}).then(function(d){"
         "document.getElementById('info-size').textContent=fmt(d.size);"
-        "document.getElementById('info-layers').textContent=d.layers>0?d.layers:'Unknown';"
-        "document.getElementById('info-lh').textContent=d.layerHeight>0?d.layerHeight.toFixed(2)+' mm':'Unknown';"
-        "document.getElementById('info-oh').textContent=d.objectHeight>0?d.objectHeight.toFixed(1)+' mm':'Unknown';"
+        "document.getElementById('info-layers').textContent=d.layers>0?d.layers:'" N_("Unknown") "';"
+        "document.getElementById('info-lh').textContent=d.layerHeight>0?d.layerHeight.toFixed(2)+' " N_("mm") "':'" N_("Unknown") "';"
+        "document.getElementById('info-oh').textContent=d.objectHeight>0?d.objectHeight.toFixed(1)+' " N_("mm") "':'" N_("Unknown") "';"
         "document.getElementById('info-time').textContent=fmtTime(d.estTime);"
         "var fil='';"
-        "if(d.filamentMm>0){fil=(d.filamentMm/1000).toFixed(2)+'m';if(d.filamentG>0)fil+=' / '+d.filamentG.toFixed(1)+'g'}"
-        "else fil='Unknown';"
+        "if(d.filamentMm>0){fil=(d.filamentMm/1000).toFixed(2)+' " N_("m") "';if(d.filamentG>0)fil+=' / '+d.filamentG.toFixed(1)+' " N_("g") "'}"
+        "else fil='" N_("Unknown") "';"
         "document.getElementById('info-fil').textContent=fil;"
         "if(d.thumbnail)document.getElementById('info-thumb').innerHTML='<img src=\"'+d.thumbnail+'\">';"
-        "else document.getElementById('info-thumb').innerHTML='<em>No preview</em>';"
-        "}).catch(function(){document.getElementById('info-thumb').innerHTML='<em>Error loading info</em>'})}"
+        "else document.getElementById('info-thumb').innerHTML='<em>" N_("No preview") "</em>';"
+        "}).catch(function(){document.getElementById('info-thumb').innerHTML='<em>" N_("Could not load the file info") "</em>'})}"
         "function closeInfo(){document.getElementById('modal-bg').classList.remove('show')}"
         "function load(){"
         "fetch('/sd/files').then(function(r){return r.json()}).then(function(f){"
         "f.sort(function(a,b){return(b.mtime||0)-(a.mtime||0)});"
         "var h='';f.forEach(function(x){"
         "h+='<tr><td>'+x.name+'<br><span style=\"color:#888;font-size:.75em\">'+fmt(x.size)+' &mdash; '+fmtDate(x.mtime)+'</span></td><td>'"
-        "+'<button onclick=\"info(\\''+x.name.replace(/'/g,\"\\\\'\")+'\\')\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Info</button> '"
-        "+'<form method=POST action=/sd/print style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Print</button></form> '"
-        "+'<form method=POST action=/sd/delete style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Del</button></form>'"
+        "+'<button onclick=\"info(\\''+x.name.replace(/'/g,\"\\\\'\")+'\\')\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Info") "</button> '"
+        "+'<form method=POST action=/sd/print style=display:inline onsubmit=\"var b=this.querySelector(\\'button\\');b.disabled=true;b.textContent=\\'" N_("Starting...") "\\'\"><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Print") "</button></form> '"
+        "+'<form method=POST action=/sd/delete style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Delete") "</button></form>'"
         "+'</td></tr>'});"
-        "document.getElementById('files').innerHTML=h||'<tr><td colspan=2>No files</td></tr>';});}"
+        "document.getElementById('files').innerHTML=h||'<tr><td colspan=2>" N_("No files") "</td></tr>';});}"
+        "window.addEventListener('pageshow',function(e){if(e.persisted)load()});"
         "function upload(){"
         "var f=document.getElementById('file').files[0];if(!f)return;"
         "var x=new XMLHttpRequest();"
@@ -114,10 +112,18 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "var p=document.getElementById('upload-prog');p.style.display='block';p.value=Math.round(e.loaded/e.total*100);"
         "document.getElementById('upload-status').textContent=fmt(e.loaded)+'/'+fmt(e.total);}};"
         "x.onload=function(){document.getElementById('upload-prog').style.display='none';"
-        "document.getElementById('upload-status').textContent=x.status==200?'Done':'Error: '+x.responseText;load();};"
+        "document.getElementById('upload-status').textContent=x.status==200?'" N_("Done") "':'" N_("Error:") " '+x.responseText;load();};"
         "x.open('POST','/sd/upload');x.setRequestHeader('X-Filename',f.name);x.send(f);}"
         "load();"
-        "</script>");
+        "</script>";
+
+static esp_err_t sd_page_handler(httpd_req_t *req)
+{
+    html_buf_t p;
+    html_buf_init(&p);
+
+    layout_html_begin(&p, NT_("SD Card"), "/sd");
+    html_buf_printf(&p, "%s", i18n_page(SD_PAGE));
     layout_html_end(&p);
 
     httpd_resp_set_type(req, "text/html");
@@ -460,6 +466,7 @@ static void sd_print_task(void *arg)
         err = klipper_backend_print_file(ctx->filename);
     } else {
         err = printer_comm_host_print_start(ctx->filename);
+        if (err == ESP_OK) print_page_note_started(ctx->filename);
     }
 
     if (err != ESP_OK) {

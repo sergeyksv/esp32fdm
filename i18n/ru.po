@@ -1,0 +1,1145 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: ru\n"
+"X-Native-Name: Русский\n"
+
+#: main/bedlevel.c:396
+msgid "Probing already in progress"
+msgstr "Карта стола уже снимается"
+
+#: main/bedlevel.c:402
+msgid "Cannot probe while printing"
+msgstr "Нельзя снимать карту во время печати"
+
+#: main/bedlevel.c:409
+msgid "Failed to start probe task"
+msgstr "Не удалось запустить снятие карты"
+
+#: main/bedlevel.c:433
+msgid "G28 failed: %s"
+msgstr "Ошибка G28: %s"
+
+#: main/bedlevel.c:434
+msgid "G29 failed: %s"
+msgstr "Ошибка G29: %s"
+
+#: main/bedlevel.c:435
+msgid "No mesh found in G29 output"
+msgstr "В ответе на G29 нет карты стола"
+
+#: main/bedlevel.c:563 main/bedlevel.c:765 main/httpd.c:767
+msgid "Bed Leveling"
+msgstr "Выравнивание стола"
+
+#: main/bedlevel.c:565
+msgid "Probe Bed"
+msgstr "Снять карту стола"
+
+#: main/bedlevel.c:572
+msgid "Prev"
+msgstr "Пред."
+
+#: main/bedlevel.c:574
+msgid "Next"
+msgstr "След."
+
+#: main/bedlevel.c:578
+msgid "Screw Adjustment"
+msgstr "Регулировка винтов"
+
+#: main/bedlevel.c:580
+msgid "Tighten (CW)"
+msgstr "Затягивать (по часовой)"
+
+#: main/bedlevel.c:581
+msgid "Loosen (CCW)"
+msgstr "Ослаблять (против часовой)"
+
+#: main/bedlevel.c:587
+msgid "Bed Configuration"
+msgstr "Параметры стола"
+
+#: main/bedlevel.c:588
+msgid "Bed width (mm):"
+msgstr "Ширина стола (мм):"
+
+#: main/bedlevel.c:590
+msgid "Bed height (mm):"
+msgstr "Глубина стола (мм):"
+
+#: main/bedlevel.c:592
+msgid "Screw spacing (mm):"
+msgstr "Расстояние между винтами (мм):"
+
+#: main/bedlevel.c:594
+msgid "Screw pitch (mm/rot):"
+msgstr "Шаг резьбы винта (мм/об):"
+
+#: main/bedlevel.c:596
+msgid "Origin (0,0) corner:"
+msgstr "Угол начала (0,0):"
+
+#: main/bedlevel.c:598 main/bedlevel.c:704
+msgid "Front-Left"
+msgstr "Передний левый"
+
+#: main/bedlevel.c:599 main/bedlevel.c:704
+msgid "Front-Right"
+msgstr "Передний правый"
+
+#: main/bedlevel.c:600 main/bedlevel.c:704
+msgid "Back-Left"
+msgstr "Задний левый"
+
+#: main/bedlevel.c:601 main/bedlevel.c:704
+msgid "Back-Right"
+msgstr "Задний правый"
+
+#: main/bedlevel.c:603
+msgid "Save Config"
+msgstr "Сохранить параметры"
+
+#: main/bedlevel.c:620 main/bedlevel.c:694
+msgid "No mesh data"
+msgstr "Нет карты стола"
+
+#: main/bedlevel.c:632
+msgid "Good"
+msgstr "Хорошо"
+
+#: main/bedlevel.c:632
+msgid "Fair"
+msgstr "Средне"
+
+#: main/bedlevel.c:632
+msgid "Poor"
+msgstr "Плохо"
+
+#: main/bedlevel.c:635
+msgid "Range:"
+msgstr "Разброс:"
+
+#: main/bedlevel.c:635 main/bedlevel.c:636 main/bedlevel.c:637 main/sdcard_httpd.c:86
+msgid "mm"
+msgstr "мм"
+
+#: main/bedlevel.c:636
+msgid "Max dev:"
+msgstr "Макс. отклонение:"
+
+#: main/bedlevel.c:637
+msgid "Std dev:"
+msgstr "СКО:"
+
+#: main/bedlevel.c:657 main/sdcard_httpd.c:103
+msgid "Starting..."
+msgstr "Запуск..."
+
+#: main/bedlevel.c:665 main/bedlevel.c:752
+msgid "Homing..."
+msgstr "Хоминг..."
+
+#: main/bedlevel.c:665 main/bedlevel.c:752
+msgid "Probing..."
+msgstr "Снятие карты..."
+
+#: main/bedlevel.c:670 main/sdcard_httpd.c:115
+msgid "Done"
+msgstr "Готово"
+
+#: main/bedlevel.c:671 main/ota.c:252 main/sdcard_httpd.c:115 main/terminal.c:154
+msgid "Error:"
+msgstr "Ошибка:"
+
+#: main/bedlevel.c:671 main/sdcard_httpd.c:72 main/sdcard_httpd.c:85 main/sdcard_httpd.c:86
+msgid "Unknown"
+msgstr "Неизвестно"
+
+#: main/bedlevel.c:710
+msgid "Screw"
+msgstr "Винт"
+
+#: main/bedlevel.c:710
+msgid "Avg Z"
+msgstr "Средняя Z"
+
+#: main/bedlevel.c:710
+msgid "Correction"
+msgstr "Поправка"
+
+#: main/bedlevel.c:715
+msgid "CW"
+msgstr "по часовой стрелке"
+
+#: main/bedlevel.c:715
+msgid "CCW"
+msgstr "против часовой стрелки"
+
+#: main/bedlevel.c:717
+msgid "OK (reference)"
+msgstr "OK (опорный)"
+
+#: main/bedlevel.c:722
+msgid "turns"
+msgstr "оборота"
+
+#: main/bedlevel.c:722
+msgid "turn"
+msgstr "оборота"
+
+#: main/bedlevel.c:744 main/httpd.c:1007
+msgid "Saved!"
+msgstr "Сохранено!"
+
+#: main/cold_pull.c:98 main/cold_pull.c:99 main/httpd.c:772
+msgid "Cold Pull"
+msgstr "Холодная протяжка"
+
+#: main/cold_pull.c:100
+msgid "Cleans the nozzle: filament is melted and pushed through, cooled to just above solid, and pulled out by hand, taking the dirt with it. Load the filament first. The printer homes, lifts the nozzle to Z%d and purges %d mm. Each time it needs you it stops, beeps and sends a notification; continue on the <a href='/print'>print page</a>."
+msgstr "Чистка сопла: пластик расплавляется и продавливается, остывает почти до твёрдого состояния и вытягивается рукой вместе с грязью. Сначала заправьте пруток. Принтер делает хоминг, поднимает сопло на Z%d и выдавливает %d мм. Каждый раз, когда нужны вы, он останавливается, пищит и присылает уведомление; продолжайте на <a href='/print'>странице печати</a>."
+
+#: main/cold_pull.c:110
+msgid "Plastic"
+msgstr "Пластик"
+
+#: main/cold_pull.c:125
+msgid "Melt at"
+msgstr "Расплавить при"
+
+#: main/cold_pull.c:125
+msgid "Pull at"
+msgstr "Тянуть при"
+
+#: main/cold_pull.c:126
+msgid "Pulls"
+msgstr "Протяжек"
+
+#: main/cold_pull.c:127
+msgid "If the plug snaps, pull a few degrees hotter; if it stretches into a thread, cooler."
+msgstr "Если пробка рвётся, тяните на несколько градусов горячее; если тянется ниткой — холоднее."
+
+#: main/cold_pull.c:128
+msgid "Start"
+msgstr "Начать"
+
+#: main/cold_pull.c:131
+msgid "The printer must be connected and idle"
+msgstr "Принтер должен быть подключён и свободен"
+
+#: main/cold_pull.c:174 main/obico_client.c:942
+msgid "Back"
+msgstr "Назад"
+
+#: main/cold_pull.c:182
+msgid "Empty form."
+msgstr "Пустая форма."
+
+#: main/cold_pull.c:190
+msgid "Missing or bad field."
+msgstr "Поле не заполнено или заполнено неверно."
+
+#: main/cold_pull.c:195
+msgid "Melt 180-300 C, pull 50-200 C and at least 50 C below melt, 1-5 pulls."
+msgstr "Расплав 180–300 °C, протяжка 50–200 °C и хотя бы на 50 °C ниже расплава, от 1 до 5 протяжек."
+
+#: main/cold_pull.c:201
+msgid "The printer must be connected and idle."
+msgstr "Принтер должен быть подключён и свободен."
+
+#: main/cold_pull.c:205 main/ota.c:63
+msgid "Out of memory."
+msgstr "Не хватает памяти."
+
+#: main/cold_pull.c:208
+msgid "Script too long."
+msgstr "Скрипт слишком длинный."
+
+#: main/cold_pull.c:217
+msgid "Could not start, try again."
+msgstr "Не удалось начать, попробуйте ещё раз."
+
+#: main/httpd.c:404
+msgid "ESP32 FDM Dashboard"
+msgstr "ESP32 FDM"
+
+#: main/httpd.c:421
+msgid "Z offset (baby stepping)"
+msgstr "Смещение Z (babystep)"
+
+#: main/httpd.c:431
+msgid "Save all settings to EEPROM (M500)"
+msgstr "Сохранить все настройки в EEPROM (M500)"
+
+#: main/httpd.c:431 main/httpd.c:643 main/httpd.c:655 main/hub_client.c:322
+msgid "Save"
+msgstr "Сохранить"
+
+#: main/httpd.c:433
+msgid "closer to the bed"
+msgstr "ближе к столу"
+
+#: main/httpd.c:433
+msgid "farther from the bed"
+msgstr "дальше от стола"
+
+#: main/httpd.c:433
+msgid "Save writes to EEPROM (M500)"
+msgstr "«Сохранить» пишет в EEPROM (M500)"
+
+#: main/httpd.c:438
+msgid "Temperatures"
+msgstr "Температуры"
+
+#: main/httpd.c:439 main/httpd.c:599 main/layout.c:94 main/print_page.c:133
+msgid "Nozzle"
+msgstr "Сопло"
+
+#: main/httpd.c:440 main/httpd.c:449 main/httpd.c:503
+msgid "Off"
+msgstr "Выкл"
+
+#: main/httpd.c:446 main/httpd.c:455
+msgid "Set"
+msgstr "Задать"
+
+#: main/httpd.c:448 main/httpd.c:599 main/layout.c:95 main/print_page.c:134
+msgid "Bed"
+msgstr "Стол"
+
+#: main/httpd.c:460
+msgid "Move"
+msgstr "Перемещение"
+
+#: main/httpd.c:461
+msgid "Step (mm)"
+msgstr "Шаг (мм)"
+
+#: main/httpd.c:467
+msgid "Axes"
+msgstr "Оси"
+
+#: main/httpd.c:475
+msgid "Extruder"
+msgstr "Экструдер"
+
+#: main/httpd.c:476
+msgid "Retract"
+msgstr "Втянуть"
+
+#: main/httpd.c:477
+msgid "Extrude"
+msgstr "Выдавить"
+
+#: main/httpd.c:478
+msgid "Normal"
+msgstr "Обычно"
+
+#: main/httpd.c:479
+msgid "Slow"
+msgstr "Медленно"
+
+#: main/httpd.c:481
+msgid "Normal: 300 mm/min. Slow: 60 mm/min (for measuring filament length)."
+msgstr "Обычно: 300 мм/мин. Медленно: 60 мм/мин (чтобы измерить длину прутка)."
+
+#: main/httpd.c:482
+msgid "Homing"
+msgstr "Хоминг"
+
+#: main/httpd.c:483 main/logbuf.c:225
+msgid "All"
+msgstr "Все"
+
+#: main/httpd.c:491
+msgid "Speed / Flow / Fan"
+msgstr "Скорость / поток / обдув"
+
+#: main/httpd.c:492
+msgid "Speed"
+msgstr "Скорость"
+
+#: main/httpd.c:497
+msgid "Flow"
+msgstr "Поток"
+
+#: main/httpd.c:502
+msgid "Fan"
+msgstr "Обдув"
+
+#: main/httpd.c:513 main/httpd.c:791
+msgid "Camera"
+msgstr "Камера"
+
+#: main/httpd.c:585 main/sdcard_httpd.c:72 main/sdcard_httpd.c:72
+msgid "min"
+msgstr "мин"
+
+#: main/httpd.c:585
+msgid "s"
+msgstr "с"
+
+#: main/httpd.c:599
+msgid "Nozzle target"
+msgstr "Цель сопла"
+
+#: main/httpd.c:599
+msgid "Bed target"
+msgstr "Цель стола"
+
+#: main/httpd.c:626 main/layout.c:84
+msgid "Settings"
+msgstr "Настройки"
+
+#: main/httpd.c:634 main/logbuf.c:226
+msgid "Printer"
+msgstr "Принтер"
+
+#: main/httpd.c:635 main/httpd.c:719
+msgid "Save &amp; Reboot"
+msgstr "Сохранить и перезагрузить"
+
+#: main/httpd.c:654
+msgid "Video"
+msgstr "Видео"
+
+#: main/httpd.c:657
+msgid "Rotate 180°"
+msgstr "Повернуть на 180°"
+
+#: main/httpd.c:660
+msgid "safe"
+msgstr "надёжно"
+
+#: main/httpd.c:663
+msgid "fast"
+msgstr "быстро"
+
+#: main/httpd.c:665
+msgid "Reboot to apply"
+msgstr "Применится после перезагрузки"
+
+#: main/httpd.c:666
+msgid "WebRTC streaming"
+msgstr "трансляция WebRTC"
+
+#: main/httpd.c:667
+msgid "Host"
+msgstr "Хост"
+
+#: main/httpd.c:669
+msgid "Port"
+msgstr "Порт"
+
+#: main/httpd.c:671
+msgid "Leave host empty to disable Janus proxy."
+msgstr "Оставьте хост пустым, чтобы отключить Janus proxy."
+
+#: main/httpd.c:686
+msgid "Unlink from Obico?"
+msgstr "Отвязать от Obico?"
+
+#: main/httpd.c:686
+msgid "Unlink"
+msgstr "Отвязать"
+
+#: main/httpd.c:691
+msgid "Link"
+msgstr "Привязать"
+
+#: main/httpd.c:702
+msgid "External Endpoints"
+msgstr "Внешние адреса"
+
+#: main/httpd.c:704 main/httpd.c:801
+msgid "MJPEG Stream"
+msgstr "Поток MJPEG"
+
+#: main/httpd.c:705
+msgid "Snapshot"
+msgstr "Снимок"
+
+#: main/httpd.c:718
+msgid "Device"
+msgstr "Устройство"
+
+#: main/httpd.c:721
+msgid "Hostname"
+msgstr "Имя хоста"
+
+#: main/httpd.c:724
+msgid "Letters, digits, hyphens. Must start with a letter."
+msgstr "Латинские буквы, цифры и дефисы. Первой должна быть буква."
+
+#: main/httpd.c:727
+msgid "Visible on router and as"
+msgstr "Видно в роутере и как"
+
+#: main/httpd.c:727
+msgid "via mDNS."
+msgstr "через mDNS."
+
+#: main/httpd.c:741
+msgid "Reset WiFi credentials and reboot?"
+msgstr "Сбросить настройки WiFi и перезагрузить?"
+
+#: main/httpd.c:741
+msgid "Reset WiFi"
+msgstr "Сбросить WiFi"
+
+#: main/httpd.c:745
+msgid "Connected to:"
+msgstr "Подключено к:"
+
+#: main/httpd.c:762 main/httpd.c:767
+msgid "Utilities"
+msgstr "Утилиты"
+
+#: main/httpd.c:768
+msgid "Probe bed mesh, visualize, and calculate screw adjustments"
+msgstr "Снять карту стола, посмотреть её и рассчитать поворот винтов"
+
+#: main/httpd.c:772
+msgid "Clean the nozzle by pulling out cooled filament"
+msgstr "Почистить сопло, вытянув остывающий пластик"
+
+#: main/httpd.c:804
+msgid "Image Settings"
+msgstr "Настройки изображения"
+
+#: main/httpd.c:805
+msgid "Brightness"
+msgstr "Яркость"
+
+#: main/httpd.c:808
+msgid "Contrast"
+msgstr "Контраст"
+
+#: main/httpd.c:811
+msgid "Saturation"
+msgstr "Насыщенность"
+
+#: main/httpd.c:814
+msgid "AE Level"
+msgstr "Экспозиция"
+
+#: main/httpd.c:910
+msgid "Device name saved. Rebooting..."
+msgstr "Имя устройства сохранено. Перезагрузка..."
+
+#: main/httpd.c:925
+msgid "WiFi credentials erased. Rebooting..."
+msgstr "Настройки WiFi стёрты. Перезагрузка..."
+
+#: main/httpd.c:951 main/httpd.c:959
+msgid "WiFi Setup"
+msgstr "Настройка WiFi"
+
+#: main/httpd.c:963
+msgid "Password"
+msgstr "Пароль"
+
+#: main/httpd.c:965
+msgid "Connect"
+msgstr "Подключиться"
+
+#: main/httpd.c:1007
+msgid "Rebooting and connecting to WiFi..."
+msgstr "Перезагрузка и подключение к WiFi..."
+
+#: main/hub_client.c:321
+msgid "Notifications"
+msgstr "Уведомления"
+
+#: main/hub_client.c:324
+msgid "Hub URL"
+msgstr "Адрес хаба"
+
+#: main/hub_client.c:328
+msgid "Address of the notification hub. Leave empty to turn notifications off."
+msgstr "Адрес хаба уведомлений. Оставьте пустым, чтобы отключить уведомления."
+
+#: main/hub_client.c:329
+msgid "Send test"
+msgstr "Отправить тест"
+
+#: main/hub_client.c:332 main/print_page.c:137
+msgid "Sending..."
+msgstr "Отправка..."
+
+#: main/hub_client.c:335
+msgid "Delivered"
+msgstr "Доставлено"
+
+#: main/hub_client.c:336
+msgid "Failed, see /logs"
+msgstr "Ошибка, см. /logs"
+
+#: main/hub_client.c:337
+msgid "Save the hub URL first"
+msgstr "Сначала сохраните адрес хаба"
+
+#: main/hub_client.c:338 main/hub_client.c:339 main/hub_client.c:341
+msgid "No answer"
+msgstr "Нет ответа"
+
+#: main/hub_client.c:374
+msgid "URL must start with http://"
+msgstr "Адрес должен начинаться с http://"
+
+#: main/hub_client.c:378
+msgid "Could not save"
+msgstr "Не удалось сохранить"
+
+#: main/layout.c:71
+msgid "Menu"
+msgstr "Меню"
+
+#: main/layout.c:74 main/layout.c:75
+msgid "Home"
+msgstr "Главная"
+
+#: main/layout.c:76
+msgid "Cam"
+msgstr "Камера"
+
+#: main/layout.c:77
+msgid "SD"
+msgstr "SD"
+
+#: main/layout.c:79
+msgid "Term"
+msgstr "Терминал"
+
+#: main/layout.c:80
+msgid "Utils"
+msgstr "Утилиты"
+
+#: main/layout.c:83 main/logbuf.c:264
+msgid "Logs"
+msgstr "Логи"
+
+#: main/layout.c:100 main/print_page.c:138
+msgid "Pause"
+msgstr "Пауза"
+
+#: main/layout.c:101 main/print_page.c:137
+msgid "Continue"
+msgstr "Продолжить"
+
+#: main/layout.c:101
+msgid "Resume"
+msgstr "Возобновить"
+
+#: main/layout.c:102
+msgid "Stop print?"
+msgstr "Остановить печать?"
+
+#: main/layout.c:102 main/print_page.c:139
+msgid "Stop"
+msgstr "Стоп"
+
+#: main/layout.c:103
+msgid "WAITING"
+msgstr "ЖДЁТ ВАС"
+
+#: main/layout.c:103
+msgid "PAUSED"
+msgstr "ПАУЗА"
+
+#: main/layout.c:103
+msgid "PREPARING"
+msgstr "ПОДГОТОВКА"
+
+#: main/layout.c:103
+msgid "PRINTING"
+msgstr "ПЕЧАТЬ"
+
+#: main/layout.c:104
+msgid "Control"
+msgstr "Управление"
+
+#: main/layout.c:106
+msgid "Layer"
+msgstr "Слой"
+
+#: main/layout.c:108
+msgid "Error"
+msgstr "Ошибка"
+
+#: main/layout.c:108
+msgid "Ready"
+msgstr "готов"
+
+#: main/layout.c:108
+msgid "Disconnected"
+msgstr "не подключён"
+
+#: main/logbuf.c:227
+msgid "System"
+msgstr "Система"
+
+#: main/logbuf.c:228
+msgid "Heap"
+msgstr "Память"
+
+#: main/logbuf.c:267
+msgid "Filter:"
+msgstr "Фильтр:"
+
+#: main/logbuf.c:278
+msgid "Clear all logs?"
+msgstr "Очистить все логи?"
+
+#: main/logbuf.c:278
+msgid "Clear"
+msgstr "Очистить"
+
+#: main/obico_client.c:866 main/obico_client.c:883
+msgid "Status:"
+msgstr "Статус:"
+
+#: main/obico_client.c:866 main/obico_client.c:932
+msgid "Linked"
+msgstr "Привязан"
+
+#: main/obico_client.c:867
+msgid "to %s"
+msgstr "к %s"
+
+#: main/obico_client.c:883
+msgid "Not linked"
+msgstr "Не привязан"
+
+#: main/obico_client.c:883
+msgid "Server URL"
+msgstr "Адрес сервера"
+
+#: main/obico_client.c:884
+msgid "Enter the 6-digit code from"
+msgstr "Введите 6-значный код из"
+
+#: main/obico_client.c:889 main/obico_client.c:1029
+msgid "Status"
+msgstr "Статус"
+
+#: main/obico_client.c:889 main/obico_client.c:1024
+msgid "Simulate"
+msgstr "Симуляция"
+
+#: main/obico_client.c:932
+msgid "Link Failed"
+msgstr "Ошибка привязки"
+
+#: main/obico_client.c:937
+msgid "Linked successfully!"
+msgstr "Привязка выполнена!"
+
+#: main/obico_client.c:937
+msgid "This printer is now connected to Obico."
+msgstr "Теперь принтер подключён к Obico."
+
+#: main/obico_client.c:942
+msgid "Linking failed"
+msgstr "Привязать не удалось"
+
+#: main/obico_client.c:942
+msgid "Check the code and try again."
+msgstr "Проверьте код и попробуйте ещё раз."
+
+#: main/obico_client.c:1019
+msgid "ON"
+msgstr "ВКЛ"
+
+#: main/obico_client.c:1019
+msgid "OFF"
+msgstr "ВЫКЛ"
+
+#: main/obico_client.c:1020
+msgid "printing with fake data"
+msgstr "печать с вымышленными данными"
+
+#: main/obico_client.c:1021
+msgid "real printer state"
+msgstr "реальное состояние принтера"
+
+#: main/obico_client.c:1029
+msgid "Simulation:"
+msgstr "Симуляция:"
+
+#: main/obico_client.c:1029
+msgid "Toggle"
+msgstr "Переключить"
+
+#: main/ota.c:48
+msgid "No OTA partition"
+msgstr "Нет раздела OTA"
+
+#: main/ota.c:56
+msgid "OTA begin failed"
+msgstr "Не удалось начать OTA"
+
+#: main/ota.c:96
+msgid "Not a valid ESP32 application image"
+msgstr "Это не образ приложения ESP32"
+
+#: main/ota.c:107
+msgid "Wrong firmware — project name does not match"
+msgstr "Не та прошивка — имя проекта не совпадает"
+
+#: main/ota.c:130
+msgid "OTA write failed"
+msgstr "Ошибка записи OTA"
+
+#: main/ota.c:138
+msgid "Firmware validation failed — bad image?"
+msgstr "Прошивка не прошла проверку — повреждённый образ?"
+
+#: main/ota.c:145
+msgid "Set boot partition failed"
+msgstr "Не удалось выбрать загрузочный раздел"
+
+#: main/ota.c:168
+msgid "No firmware data"
+msgstr "Нет данных прошивки"
+
+#: main/ota.c:174
+msgid "Invalid firmware size"
+msgstr "Неверный размер прошивки"
+
+#: main/ota.c:223
+msgid "Firmware Update"
+msgstr "Обновление прошивки"
+
+#: main/ota.c:224
+msgid "Running:"
+msgstr "Работает:"
+
+#: main/ota.c:224
+msgid "on partition"
+msgstr "в разделе"
+
+#: main/ota.c:225
+msgid "Built"
+msgstr "сборка"
+
+#: main/ota.c:229
+msgid "Upload &amp; Flash"
+msgstr "Загрузить и прошить"
+
+#: main/ota.c:238
+msgid "Select a firmware .bin file"
+msgstr "Выберите файл прошивки .bin"
+
+#: main/ota.c:239
+msgid "Flash firmware"
+msgstr "Прошить файл"
+
+#: main/ota.c:247
+msgid "Uploading:"
+msgstr "Загрузка:"
+
+#: main/ota.c:249
+msgid "Firmware flashed! Rebooting..."
+msgstr "Прошивка записана! Перезагрузка..."
+
+#: main/ota.c:253
+msgid "Upload failed"
+msgstr "Не удалось загрузить"
+
+#: main/print_page.c:34 main/print_page.c:115 main/print_page.c:124 main/sdcard_httpd.c:103
+msgid "Print"
+msgstr "Печать"
+
+#: main/print_page.c:67
+msgid "Connecting..."
+msgstr "Подключение..."
+
+#: main/print_page.c:83
+msgid "Print again"
+msgstr "Напечатать снова"
+
+#: main/print_page.c:84
+msgid "All files"
+msgstr "Все файлы"
+
+#: main/print_page.c:85
+msgid "Dashboard"
+msgstr "Главная"
+
+#: main/print_page.c:100
+msgid "Z shift:"
+msgstr "Сдвиг Z:"
+
+#: main/print_page.c:101
+msgid "Sending to printer, applied"
+msgstr "Отправляется на принтер, применено"
+
+#: main/print_page.c:104
+msgid "Limit is 1 mm per print"
+msgstr "Не больше 1 мм за печать"
+
+#: main/print_page.c:104
+msgid "Not sent, try again"
+msgstr "Не отправлено, попробуйте ещё раз"
+
+#: main/print_page.c:109
+msgid "Stop the print and turn off the heaters?"
+msgstr "Остановить печать и выключить нагрев?"
+
+#: main/print_page.c:114
+msgid "Not on the SD card"
+msgstr "Нет на SD-карте"
+
+#: main/print_page.c:115
+msgid "Is the bed clear?"
+msgstr "Стол свободен?"
+
+#: main/print_page.c:117
+msgid "Not started"
+msgstr "Не запущено"
+
+#: main/print_page.c:126
+msgid "Waiting for you"
+msgstr "Ждёт вас"
+
+#: main/print_page.c:126
+msgid "Preparing..."
+msgstr "Подготовка..."
+
+#: main/print_page.c:126
+msgid "Printing"
+msgstr "Печать"
+
+#: main/print_page.c:126
+msgid "Paused"
+msgstr "Пауза"
+
+#: main/print_page.c:127
+msgid "Printer not connected"
+msgstr "Принтер не подключён"
+
+#: main/print_page.c:127
+msgid "No print running"
+msgstr "Печать не идёт"
+
+#: main/print_page.c:129
+msgid "Notification was not delivered"
+msgstr "Уведомление не доставлено"
+
+#: main/print_page.c:131
+msgid "layer"
+msgstr "слой"
+
+#: main/print_page.c:138
+msgid "Pausing..."
+msgstr "Ставлю на паузу..."
+
+#: main/print_page.c:139
+msgid "Stopping..."
+msgstr "Останавливаю..."
+
+#: main/print_page.c:143
+msgid "No connection to the printer"
+msgstr "Нет связи с принтером"
+
+#: main/print_page.c:330
+msgid "Marlin only"
+msgstr "Только для Marlin"
+
+#: main/print_page.c:336
+msgid "Not in the recent files"
+msgstr "Этого файла нет среди последних"
+
+#: main/print_page.c:337
+msgid "The file is not on the SD card"
+msgstr "Файла нет на SD-карте"
+
+#: main/print_page.c:342
+msgid "The printer is not idle"
+msgstr "Принтер занят"
+
+#: main/print_page.c:345
+msgid "Not started, try again"
+msgstr "Не запущено, попробуйте ещё раз"
+
+#: main/printer_comm.c:1257
+msgid "USB serial"
+msgstr "USB-порт"
+
+#: main/printer_comm.c:1261
+msgid "Moonraker Host/IP:"
+msgstr "Хост/IP Moonraker:"
+
+#: main/printer_comm.c:1262
+msgid "Moonraker Port:"
+msgstr "Порт Moonraker:"
+
+#: main/printer_comm.c:1264
+msgid "Test Moonraker connection"
+msgstr "Проверить связь с Moonraker"
+
+#: main/printer_comm.c:1279
+msgid "Pause Command"
+msgstr "Команда паузы"
+
+#: main/printer_comm.c:1280
+msgid "Pause SD print (can resume)"
+msgstr "пауза печати с SD (можно продолжить)"
+
+#: main/printer_comm.c:1281
+msgid "Abort print (if M25 crashes firmware)"
+msgstr "прервать печать (если от M25 падает прошивка)"
+
+#: main/printer_comm.c:1284
+msgid "Filament Sensor"
+msgstr "Датчик прутка"
+
+#: main/printer_comm.c:1285
+msgid "Poll filament sensor (M119) during host print"
+msgstr "Опрашивать датчик прутка (M119) при печати с платы"
+
+#: main/printer_comm.c:1285
+msgid "auto-pause on runout"
+msgstr "пауза, когда пруток кончится"
+
+#: main/printer_comm.c:1290
+msgid "Some printers hold USB responses until the next command is sent. Adding commands here sends a harmless M118 ping after them to flush the response."
+msgstr "Некоторые принтеры придерживают ответ по USB до следующей команды. После перечисленных здесь команд отправляется безобидный пинг M118, который выталкивает ответ."
+
+#: main/printer_comm.c:1292
+msgid "Typical candidates:"
+msgstr "Обычно это:"
+
+#: main/printer_comm.c:1293
+msgid "e.g."
+msgstr "напр."
+
+#: main/printer_comm.c:1355
+msgid "Saved"
+msgstr "Сохранено"
+
+#: main/printer_comm.c:1358
+msgid "Configuration saved!"
+msgstr "Настройки сохранены!"
+
+#: main/printer_comm.c:1359
+msgid "Rebooting in 3 seconds..."
+msgstr "Перезагрузка через 3 секунды..."
+
+#: main/sdcard_httpd.c:53
+msgid "Size"
+msgstr "Размер"
+
+#: main/sdcard_httpd.c:54
+msgid "Layers"
+msgstr "Слоёв"
+
+#: main/sdcard_httpd.c:55
+msgid "Layer height"
+msgstr "Высота слоя"
+
+#: main/sdcard_httpd.c:56
+msgid "Object height"
+msgstr "Высота модели"
+
+#: main/sdcard_httpd.c:57
+msgid "Estimated time"
+msgstr "Время печати"
+
+#: main/sdcard_httpd.c:58
+msgid "Filament"
+msgstr "Пластик"
+
+#: main/sdcard_httpd.c:61 main/sdcard_httpd.c:63
+msgid "Upload"
+msgstr "Загрузить"
+
+#: main/sdcard_httpd.c:66
+msgid "Files"
+msgstr "Файлы"
+
+#: main/sdcard_httpd.c:67
+msgid "File"
+msgstr "Файл"
+
+#: main/sdcard_httpd.c:72
+msgid "h"
+msgstr "ч"
+
+#: main/sdcard_httpd.c:75
+msgid "Loading..."
+msgstr "Загрузка..."
+
+#: main/sdcard_httpd.c:90
+msgid "m"
+msgstr "м"
+
+#: main/sdcard_httpd.c:90
+msgid "g"
+msgstr "г"
+
+#: main/sdcard_httpd.c:94
+msgid "No preview"
+msgstr "Нет превью"
+
+#: main/sdcard_httpd.c:95
+msgid "Could not load the file info"
+msgstr "Не удалось загрузить сведения о файле"
+
+#: main/sdcard_httpd.c:102
+msgid "Info"
+msgstr "Инфо"
+
+#: main/sdcard_httpd.c:104
+msgid "Delete"
+msgstr "Удалить"
+
+#: main/sdcard_httpd.c:106
+msgid "No files"
+msgstr "Нет файлов"
+
+#: main/sdcard_httpd.c:125
+msgid "SD Card"
+msgstr "SD-карта"
+
+#: main/terminal.c:112
+msgid "Terminal locked during print"
+msgstr "Во время печати терминал заблокирован"
+
+#: main/terminal.c:114
+msgid "GCode command (e.g. M105)"
+msgstr "Команда G-code (например, M105)"
+
+#: main/terminal.c:116
+msgid "Send"
+msgstr "Отправить"
+
+#: main/terminal.c:118 main/terminal.c:145
+msgid "Pause Polling"
+msgstr "Пауза опроса"
+
+#: main/terminal.c:145
+msgid "Resume Polling"
+msgstr "Возобновить опрос"
+
+#: main/terminal.c:169
+msgid "Terminal"
+msgstr "Терминал"
+
+#: main/terminal.c:175
+msgid "Terminal is not available with Klipper backend."
+msgstr "С Klipper терминал недоступен."
+
+#: main/terminal.c:176
+msgid "Use Mainsail or Fluidd for GCode terminal access."
+msgstr "Для команд G-code используйте Mainsail или Fluidd."
+
+#: main/terminal.c:222
+msgid "Printing in progress"
+msgstr "Идёт печать"
+
+#: main/terminal.c:226
+msgid "Send failed"
+msgstr "Не удалось отправить"

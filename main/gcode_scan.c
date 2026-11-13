@@ -29,6 +29,9 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     while (fgets(buf, sizeof(buf), f)) {
         out->total_lines++;
 
+        /* Runs next to a print: let the streaming and idle tasks in */
+        if ((out->total_lines & 0x3FF) == 0) vTaskDelay(1);
+
         /* Slicer metadata comments */
         if (buf[0] == ';') {
             /* PrusaSlicer/SuperSlicer/OrcaSlicer: ; layer_height = 0.2 */

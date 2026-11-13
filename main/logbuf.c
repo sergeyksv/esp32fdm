@@ -9,33 +9,101 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_cache.h"
+#include "esp_system.h"
+#include <inttypes.h>
+#include <stdbool.h>
+#include "i18n.h"
 #include "layout.h"
 
 static const char *TAG = "logbuf";
 
-/* ---- Ring buffer ---- */
+/* ---- Ring buffer ----
+ *
+ * The ring lives in the PSRAM .noinit segment, which nothing clears at boot
+ * (the PSRAM memtest skips it), so a software reset -- panic, watchdog,
+ * esp_restart -- keeps it. On boot a valid header means we carry on writing
+ * after the old lines, behind a "reboot" marker with the reset reason. A
+ * power loss or brownout wipes PSRAM, so then the header is garbage and the
+ * ring starts empty. A new firmware may move the segment, which also fails
+ * the header check.
+ *
+ * PSRAM sits behind a write-back cache: on a crash, lines still in the cache
+ * never reach PSRAM. Each write is pushed out with esp_cache_msync, so the
+ * lines right before a crash -- the ones we want -- survive.
+ *
+ * The segment starts at PSRAM address 0, and every boot the MSPI timing tuning
+ * for 80 MHz PSRAM writes its 64-byte test pattern (0xa5ff005a) there
+ * (MSPI_TIMING_PSRAM_TEST_DATA_ADDR). So the ring is one object that starts
+ * with a reserved block nothing of ours is kept in. */
 
 #define LOGBUF_SIZE (2 * 1024 * 1024)   /* 2 MB in PSRAM */
 #define FMT_BUF_SIZE 512                /* stack buffer for vsnprintf */
+#define LOGBUF_MAGIC 0x4C4F4742u        /* "LOGB" */
+#define LOGBUF_RESERVED 4096            /* Covers the 64-byte tuning pattern, with room to spare */
 
-static char *s_buf;
-static int   s_head;       /* next write position */
-static int   s_count;      /* valid bytes in buffer (≤ LOGBUF_SIZE) */
+typedef struct {
+    uint32_t magic;
+    uint32_t head;      /* next write position */
+    uint32_t count;     /* valid bytes in buffer (<= LOGBUF_SIZE) */
+    uint32_t boots;     /* boots this ring has seen */
+    uint32_t check;     /* magic ^ head ^ count ^ boots, catches a torn header */
+} logbuf_hdr_t;
+
+/* One object, so that the linker cannot reorder the parts */
+static EXT_RAM_NOINIT_ATTR struct {
+    char reserved[LOGBUF_RESERVED];     /* Overwritten at boot, see above */
+    logbuf_hdr_t hdr;
+    char buf[LOGBUF_SIZE];
+} s_ring;
+
+#define s_hdr s_ring.hdr
+#define s_buf s_ring.buf
+
 static SemaphoreHandle_t s_mutex;
 static vprintf_like_t s_orig_vprintf;
+
+static uint32_t hdr_check(void)
+{
+    return s_hdr.magic ^ s_hdr.head ^ s_hdr.count ^ s_hdr.boots;
+}
+
+static void flush(const void *addr, size_t len)
+{
+    if (len)
+        esp_cache_msync((void *)addr, len,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
 
 /* ---- Ring helpers ---- */
 
 static void ring_write(const char *data, size_t len)
 {
-    for (size_t i = 0; i < len; i++) {
-        s_buf[s_head] = data[i];
-        s_head = (s_head + 1) % LOGBUF_SIZE;
+    if (len > LOGBUF_SIZE) {
+        data += len - LOGBUF_SIZE;
+        len = LOGBUF_SIZE;
     }
-    if (s_count + (int)len > LOGBUF_SIZE)
-        s_count = LOGBUF_SIZE;
-    else
-        s_count += (int)len;
+    uint32_t head = s_hdr.head;
+    size_t first = LOGBUF_SIZE - head;
+    if (first > len) first = len;
+    memcpy(s_buf + head, data, first);
+    memcpy(s_buf, data + first, len - first);
+    flush(s_buf + head, first);
+    flush(s_buf, len - first);
+
+    s_hdr.head = (head + len) % LOGBUF_SIZE;
+    s_hdr.count = (s_hdr.count + len > LOGBUF_SIZE) ? LOGBUF_SIZE : s_hdr.count + len;
+    s_hdr.check = hdr_check();
+    flush(&s_hdr, sizeof(s_hdr));
+}
+
+static void ring_reset(void)
+{
+    s_hdr.head = 0;
+    s_hdr.count = 0;
+    s_hdr.check = hdr_check();
+    flush(&s_hdr, sizeof(s_hdr));
 }
 
 /* ---- esp_log hook ---- */
@@ -65,19 +133,53 @@ static int log_vprintf(const char *fmt, va_list args)
 
 /* ---- Init ---- */
 
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    case ESP_RST_EFUSE:     return "EFUSE";
+    case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+    default:                return "UNKNOWN";
+    }
+}
+
 void logbuf_init(void)
 {
-    s_buf = heap_caps_calloc(1, LOGBUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!s_buf) {
-        printf("logbuf: PSRAM alloc failed!\n");
-        return;
+    bool kept = s_hdr.magic == LOGBUF_MAGIC && s_hdr.check == hdr_check() &&
+                s_hdr.head < LOGBUF_SIZE && s_hdr.count <= LOGBUF_SIZE;
+    if (kept) {
+        s_hdr.boots++;
+    } else {
+        s_hdr.magic = LOGBUF_MAGIC;
+        s_hdr.boots = 1;
+        s_hdr.head = 0;
+        s_hdr.count = 0;
     }
-    s_head = 0;
-    s_count = 0;
+    s_hdr.check = hdr_check();
+    flush(&s_hdr, sizeof(s_hdr));
     s_mutex = xSemaphoreCreateMutex();
 
     s_orig_vprintf = esp_log_set_vprintf(log_vprintf);
-    ESP_LOGI(TAG, "Log buffer initialized (%d KB, PSRAM)", LOGBUF_SIZE / 1024);
+
+    esp_reset_reason_t why = esp_reset_reason();
+    if (kept)
+        ESP_LOGW(TAG, "==== reboot #%" PRIu32 ": reason=%s, log before it kept (%" PRIu32 " KB) ====",
+                 s_hdr.boots, reset_reason_str(why), s_hdr.count / 1024);
+    else
+        ESP_LOGW(TAG, "==== boot: reason=%s, no previous log ====", reset_reason_str(why));
+    ESP_LOGI(TAG, "Log buffer initialized (%d KB, PSRAM noinit)", LOGBUF_SIZE / 1024);
 }
 
 /* ---- TAG classification ---- */
@@ -112,13 +214,26 @@ typedef enum { FILTER_ALL, FILTER_PRINTER, FILTER_SYSTEM, FILTER_HEAP } log_filt
 typedef struct {
     httpd_req_t *req;
     log_filter_t filter;
+    int lang;           /* i18n language of the request: the task does not inherit it */
 } logs_ctx_t;
+
+static const struct {
+    log_filter_t filter;
+    const char *href;
+    const char *label;  /* NT_(): translated with TR() */
+} s_filters[] = {
+    { FILTER_ALL,     "/logs",                NT_("All") },
+    { FILTER_PRINTER, "/logs?filter=printer", NT_("Printer") },
+    { FILTER_SYSTEM,  "/logs?filter=system",  NT_("System") },
+    { FILTER_HEAP,    "/logs?filter=heap",    NT_("Heap") },
+};
 
 static void logs_task(void *arg)
 {
     logs_ctx_t *ctx = (logs_ctx_t *)arg;
     httpd_req_t *req = ctx->req;
     log_filter_t filter = ctx->filter;
+    i18n_set_lang(ctx->lang);
     bool send_ok = true;  /* track client disconnect */
 
     /* Snapshot the ring buffer to avoid holding mutex during HTTP send */
@@ -128,8 +243,8 @@ static void logs_task(void *arg)
 
     if (snap && s_mutex) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        snap_len = s_count;
-        snap_start = (s_head - s_count + LOGBUF_SIZE) % LOGBUF_SIZE;
+        snap_len = (int)s_hdr.count;
+        snap_start = (int)((s_hdr.head - s_hdr.count + LOGBUF_SIZE) % LOGBUF_SIZE);
         /* Linearize ring into snapshot */
         if (snap_start + snap_len <= LOGBUF_SIZE) {
             memcpy(snap, s_buf + snap_start, snap_len);
@@ -146,32 +261,21 @@ static void logs_task(void *arg)
     /* HTML header via layout */
     html_buf_t page;
     html_buf_init(&page);
-    layout_html_begin(&page, "Logs", "/logs");
+    layout_html_begin(&page, NT_("Logs"), "/logs");
 
     /* Filter buttons */
-    html_buf_printf(&page,
-        "<div style='margin:12px 0'>"
-        "<b>Filter:</b> ");
-    if (filter == FILTER_ALL)
-        html_buf_printf(&page, "<b>[All]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs'>All</a> ");
-    if (filter == FILTER_PRINTER)
-        html_buf_printf(&page, "<b>[Printer]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=printer'>Printer</a> ");
-    if (filter == FILTER_SYSTEM)
-        html_buf_printf(&page, "<b>[System]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=system'>System</a> ");
-    if (filter == FILTER_HEAP)
-        html_buf_printf(&page, "<b>[Heap]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=heap'>Heap</a> ");
+    html_buf_printf(&page, "<div style='margin:12px 0'><b>%s</b> ", _("Filter:"));
+    for (size_t i = 0; i < sizeof(s_filters) / sizeof(s_filters[0]); i++) {
+        if (filter == s_filters[i].filter)
+            html_buf_printf(&page, "<b>[%s]</b> ", TR(s_filters[i].label));
+        else
+            html_buf_printf(&page, "<a href='%s'>%s</a> ", s_filters[i].href, TR(s_filters[i].label));
+    }
     html_buf_printf(&page,
         " | <form method='POST' action='/logs/clear' style='display:inline'>"
-        "<button type='submit' onclick=\"return confirm('Clear all logs?')\">"
-        "Clear</button></form>");
+        "<button type='submit' onclick=\"return confirm('%s')\">"
+        "%s</button></form>",
+        _("Clear all logs?"), _("Clear"));
     html_buf_printf(&page, "</div>"
         "<pre style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
         "font-size:13px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;"
@@ -293,6 +397,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
     }
     ctx->req = async_req;
     ctx->filter = filter;
+    ctx->lang = i18n_lang();
 
     /* 6KB stack: 1KB chunk buf + html_buf + PSRAM snapshot pointer */
     if (xTaskCreatePinnedToCore(logs_task, "logs", 6144, ctx,
@@ -311,8 +416,7 @@ static esp_err_t logs_clear_handler(httpd_req_t *req)
 {
     if (s_mutex) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_head = 0;
-        s_count = 0;
+        ring_reset();
         xSemaphoreGive(s_mutex);
     }
     ESP_LOGI(TAG, "Log buffer cleared");

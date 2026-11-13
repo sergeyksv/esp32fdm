@@ -18,6 +18,15 @@ menu "ESP32 FDM Bridge Configuration"
         help
             Default baud rate for USB serial connection to the printer.
 
+    config HOLD_TIMEOUT_MIN
+        int "Cancel a print waiting on M0/M1 after (minutes)"
+        default 30
+        range 1 240
+        help
+            M0/M1 in a file printed from SD makes the printer wait for the user
+            with the heaters on.  If nobody continues within this time, the
+            print is cancelled and the heaters are turned off.
+
     menu "Obico Integration"
 
         config OBICO_SERVER_URL

@@ -11,6 +11,7 @@
 #include "logbuf.h"
 #include "mdns_service.h"
 #include "ota.h"
+#include "hub_client.h"
 #include "esp_littlefs.h"
 
 #include "esp_log.h"
@@ -112,6 +113,9 @@ void app_main(void)
     /* Printer comm — always init with USB serial */
     ESP_ERROR_CHECK(usb_serial_init(printer_comm_rx_cb, NULL));
     ESP_ERROR_CHECK(printer_comm_init());
+
+    /* Events for the notification hub */
+    hub_client_init();
 
     /* Obico client */
     ESP_ERROR_CHECK(obico_client_init());
