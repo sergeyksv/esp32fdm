@@ -1,4 +1,5 @@
 #include "camera.h"
+#include "task_util.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -278,8 +279,7 @@ void camera_start_capture_task(void)
     ESP_LOGI(TAG, "Allocated %dx %u KB PSRAM frame buffers",
              FRAME_COUNT, (unsigned)(FRAME_BUF_INIT_SIZE / 1024));
 
-    xTaskCreatePinnedToCore(camera_capture_task, "cam_cap", 3072,
-                            NULL, 5, NULL, 0);
+    task_create_psram(camera_capture_task, "cam_cap", 8192, NULL, 5, NULL, 0);
 }
 
 camera_frame_t *camera_get_frame(void)

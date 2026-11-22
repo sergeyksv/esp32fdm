@@ -1,4 +1,5 @@
 #include "rfc2217.h"
+#include "task_util.h"
 
 #include "usb_serial.h"
 
@@ -314,7 +315,7 @@ static void rfc2217_server_task(void *arg)
     int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (listen_sock < 0) {
         ESP_LOGE(TAG, "Failed to create socket");
-        vTaskDelete(NULL);
+        vTaskSuspend(NULL);     /* A PSRAM stack cannot delete itself */
         return;
     }
 
@@ -330,14 +331,14 @@ static void rfc2217_server_task(void *arg)
     if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         ESP_LOGE(TAG, "Bind failed");
         close(listen_sock);
-        vTaskDelete(NULL);
+        vTaskSuspend(NULL);     /* A PSRAM stack cannot delete itself */
         return;
     }
 
     if (listen(listen_sock, 1) != 0) {
         ESP_LOGE(TAG, "Listen failed");
         close(listen_sock);
-        vTaskDelete(NULL);
+        vTaskSuspend(NULL);     /* A PSRAM stack cannot delete itself */
         return;
     }
 
@@ -405,10 +406,14 @@ esp_err_t rfc2217_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    xTaskCreatePinnedToCore(rfc2217_server_task, "rfc2217_srv", 6144,
-                            NULL, 10, NULL, 0);
-    xTaskCreatePinnedToCore(rfc2217_tx_drain_task, "rfc2217_tx", 4096,
-                            NULL, 12, NULL, 0);
+    /* Network only, no flash: stacks in PSRAM */
+    task_create_psram(rfc2217_server_task, "rfc2217_srv", 8192, NULL, 10, NULL, 0);
+    task_create_psram(rfc2217_tx_drain_task, "rfc2217_tx", 8192, NULL, 12, NULL, 0);
 
     return ESP_OK;
+}
+
+bool rfc2217_client_connected(void)
+{
+    return s_client_sock >= 0;
 }

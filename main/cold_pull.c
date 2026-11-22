@@ -10,6 +10,7 @@
 #include "httpd.h"
 #include "i18n.h"
 #include "layout.h"
+#include "plastics.h"
 #include "printer_comm.h"
 #include "url_util.h"
 
@@ -20,21 +21,6 @@ static const char *TAG = "cold_pull";
 #define SAFE_Z          50      /* Room under the nozzle for the purged plastic */
 #define CYCLES_MAX      5
 #define SCRIPT_SIZE     2048
-
-typedef struct {
-    const char *name;
-    int load_c, pull_c;
-} plastic_t;
-
-/* Starting points: published values differ by up to 20 C, and the right pull
- * temperature is the one where the plug neither snaps nor stretches. */
-static const plastic_t PLASTICS[] = {
-    { "PLA",   210,  90 },
-    { "PETG",  240, 125 },
-    { "ABS",   240, 140 },
-    { "Nylon", 250, 150 },
-};
-#define PLASTIC_COUNT (sizeof(PLASTICS) / sizeof(PLASTICS[0]))
 
 /* ---- Script ---- */
 
@@ -77,7 +63,12 @@ size_t cold_pull_build(const cold_pull_params_t *p, char *buf, size_t size)
         out(&o, "G1 E%d F%d\nM400\n", PURGE_MM, PURGE_FEED);
         /* Cool with the part fan, then hold the pull temperature for as long as
          * the user takes to come: the window does not close on them */
-        out(&o, "M104 S0\nM106 S255\nM109 R%d\nM104 S%d\nM107\n", p->pull_c, p->pull_c);
+        if (p->klipper) {
+            out(&o, "M104 S0\nM106 S255\nTEMPERATURE_WAIT SENSOR=extruder MAXIMUM=%d\n"
+                    "M104 S%d\nM107\n", p->pull_c, p->pull_c);
+        } else {
+            out(&o, "M104 S0\nM106 S255\nM109 R%d\nM104 S%d\nM107\n", p->pull_c, p->pull_c);
+        }
         out(&o, "; @pause Nozzle at %d C: pull the filament out now\n", p->pull_c);
     }
 
@@ -108,8 +99,11 @@ static esp_err_t page_handler(httpd_req_t *req)
         "<table>"
         "<tr><td>%s</td><td><select name='plastic' id='pl' onchange='pick()'>",
         _("Plastic"));
-    for (size_t i = 0; i < PLASTIC_COUNT; i++) {
-        html_buf_printf(&p, "<option value='%u'>%s</option>", (unsigned)i, PLASTICS[i].name);
+    int loaded = plastic_loaded();
+    int sel = loaded >= 0 ? loaded : 0;
+    for (int i = 0; i < PLASTIC_COUNT; i++) {
+        html_buf_printf(&p, "<option value='%d'%s>%s</option>", i, i == sel ? " selected" : "",
+                        PLASTICS[i].name);
     }
     html_buf_printf(&p,
         "</select></td></tr>"
@@ -122,7 +116,7 @@ static esp_err_t page_handler(httpd_req_t *req)
         "</table>"
         "<p style='color:#888;font-size:13px'>%s</p>"
         "<button type='submit'%s>%s</button>",
-        _("Melt at"), PLASTICS[0].load_c, _("Pull at"), PLASTICS[0].pull_c,
+        _("Melt at"), PLASTICS[sel].print_c, _("Pull at"), PLASTICS[sel].pull_c,
         _("Pulls"), CYCLES_MAX,
         _("If the plug snaps, pull a few degrees hotter; if it stretches into a thread, cooler."),
         ready ? "" : " disabled", _("Start"));
@@ -131,8 +125,8 @@ static esp_err_t page_handler(httpd_req_t *req)
                         _("The printer must be connected and idle"));
     }
     html_buf_printf(&p, "</form><script>var T=[");
-    for (size_t i = 0; i < PLASTIC_COUNT; i++) {
-        html_buf_printf(&p, "%s[%d,%d]", i ? "," : "", PLASTICS[i].load_c, PLASTICS[i].pull_c);
+    for (int i = 0; i < PLASTIC_COUNT; i++) {
+        html_buf_printf(&p, "%s[%d,%d]", i ? "," : "", PLASTICS[i].print_c, PLASTICS[i].pull_c);
     }
     html_buf_printf(&p,
         "];function pick(){var t=T[document.getElementById('pl').value];"
@@ -144,24 +138,6 @@ static esp_err_t page_handler(httpd_req_t *req)
     esp_err_t ret = httpd_resp_send(req, p.data, p.len);
     html_buf_free(&p);
     return ret;
-}
-
-/** Find name=value in a form body.  Returns false if it is missing. */
-static bool form_int(const char *body, const char *name, int *out)
-{
-    size_t n = strlen(name);
-    for (const char *s = body; s && *s; s = strchr(s, '&'), s = s ? s + 1 : NULL) {
-        if (strncmp(s, name, n) == 0 && s[n] == '=') {
-            char val[12];
-            char *end;
-            url_decode_field(s + n + 1, val, sizeof(val));
-            long v = strtol(val, &end, 10);
-            if (end == val || *end != '\0') return false;
-            *out = (int)v;
-            return true;
-        }
-    }
-    return false;
 }
 
 static esp_err_t reply_error(httpd_req_t *req, const char *status, const char *msg)
@@ -184,7 +160,7 @@ static esp_err_t start_handler(httpd_req_t *req)
 
     int plastic;
     cold_pull_params_t prm;
-    if (!form_int(body, "plastic", &plastic) || plastic < 0 || plastic >= (int)PLASTIC_COUNT ||
+    if (!form_int(body, "plastic", &plastic) || plastic < 0 || plastic >= PLASTIC_COUNT ||
         !form_int(body, "load", &prm.load_c) || !form_int(body, "pull", &prm.pull_c) ||
         !form_int(body, "cycles", &prm.cycles)) {
         return reply_error(req, "400 Bad Request", _("Missing or bad field."));
@@ -194,6 +170,7 @@ static esp_err_t start_handler(httpd_req_t *req)
         return reply_error(req, "400 Bad Request",
                            _("Melt 180-300 C, pull 50-200 C and at least 50 C below melt, 1-5 pulls."));
     }
+    prm.klipper = printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER;
 
     printer_state_t st;
     printer_comm_get_state(&st);
@@ -213,7 +190,7 @@ static esp_err_t start_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "%s: %d/%d C, %d cycle(s)", name, prm.load_c, prm.pull_c, prm.cycles);
 
     /* The script now belongs to the print, whatever happens */
-    if (printer_comm_host_print_script(name, script) != ESP_OK) {
+    if (printer_comm_host_print_script(name, script, plastic_script_done, plastic) != ESP_OK) {
         return reply_error(req, "409 Conflict", _("Could not start, try again."));
     }
 

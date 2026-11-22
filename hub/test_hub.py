@@ -93,6 +93,85 @@ class HubTest(unittest.TestCase):
         self.assertIn("отменена", self.tg.messages[0]["text"])
         self.assertNotIn("http://", self.tg.messages[0]["text"])
 
+    def test_updated(self):
+        self.assertEqual(self.post(event(type="updated", message="2.4 → 2.5", filename="")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("обновлена", text)
+        self.assertIn("2.4 → 2.5", text)
+        self.assertNotIn("http://", text)
+
+    def test_update_failed(self):
+        self.assertEqual(self.post(event(type="update_failed", message="2.5: flash write failed",
+                                         filename="")), 200)
+        self.assertIn("flash write failed", self.tg.messages[0]["text"])
+
+    def test_maintenance_links_to_its_page(self):
+        self.assertEqual(self.post(event(type="maintenance", message="Проверить ремни",
+                                         filename="")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("обслуживание", text)
+        self.assertIn("Проверить ремни", text)
+        self.assertIn("http://fdm03.lan/maintenance", text)
+
+    def test_print_with_maintenance_overdue(self):
+        self.assertEqual(self.post(event(type="maintenance_skipped",
+                                         message="Стол: смыть клей (+3 печ.)",
+                                         filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("обслуживание просрочено", text)
+        self.assertIn("Стол: смыть клей (+3 печ.)", text)
+        self.assertIn("Файл: part.gcode", text)
+        self.assertIn("http://fdm03.lan/maintenance", text)
+
+    def test_stack_low_names_the_task(self):
+        self.assertEqual(self.post(event(type="stack_low",
+                                         message="task led: 52 bytes of stack left at the least, PSRAM",
+                                         filename="")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("стека", text)
+        self.assertIn("task led: 52 bytes", text)
+
+    def test_nozzle_standby(self):
+        self.assertEqual(self.post(event(type="nozzle_standby", message="245° → 160°",
+                                         filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("дежурную", text)
+        self.assertIn("245° → 160°", text)
+        self.assertIn("Файл: part.gcode", text)
+        self.assertIn("http://fdm03.lan/print", text)
+
+    def test_print_check(self):
+        msg = "Z-offset -2.10, проверенный -1.69: сопло пойдёт на 0.41 мм ниже, в стол"
+        self.assertEqual(self.post(event(type="print_check", message=msg, filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("без проверки", text)
+        self.assertIn(msg, text)
+        self.assertIn("Файл: part.gcode", text)
+        self.assertIn("http://fdm03.lan/print", text)
+
+    def test_filament_runout(self):
+        self.assertEqual(self.post(event(type="filament_runout", message="245° → 160°, 10 min",
+                                         filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("кончился филамент", text)
+        self.assertIn("245° → 160°, 10 min", text)
+        self.assertIn("http://fdm03.lan/print", text)
+
+    def test_filament_runout_pla(self):
+        self.assertEqual(self.post(event(type="filament_runout", message="", filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("кончился филамент", text)
+        self.assertNotIn("дежурную", text)
+
+    def test_obico_pause(self):
+        self.assertEqual(self.post(event(type="obico_pause", message="",
+                                         filename="part.gcode")), 200)
+        text = self.tg.messages[0]["text"]
+        self.assertIn("Obico", text)
+        self.assertIn("паузу", text)
+        self.assertIn("Файл: part.gcode", text)
+        self.assertIn("http://fdm03.lan/print", text)
+
     def test_retry_is_not_sent_twice(self):
         self.assertEqual(self.post(event()), 200)
         self.assertEqual(self.post(event()), 200)
@@ -200,6 +279,21 @@ class PrintersTest(unittest.TestCase):
         self.assertNotIn("progress", item)      # A stale percentage would mislead
         self.assertEqual(item["seen_s_ago"], 40)
 
+    def test_print_hours_pass_through(self):
+        p = self.make()
+        p.update(hubmod.clean_status(status(state="idle", print_hours=123.4, prints=56,
+                                            maintenance_due=2, wifi_ap="Мастерская", wifi_rssi=-71)))
+        item = p.snapshot("lan")[0]
+        self.assertEqual((item["print_hours"], item["prints"], item["maintenance_due"],
+                          item["wifi_ap"], item["wifi_rssi"]), (123.4, 56, 2, "Мастерская", -71))
+
+    def test_update_pending_comes_and_goes(self):
+        p = self.make()
+        p.update(hubmod.clean_status(status(update_pending="2.5")))
+        self.assertEqual(p.snapshot("lan")[0]["update_pending"], "2.5")
+        p.update(hubmod.clean_status(status(state="idle")))
+        self.assertNotIn("update_pending", p.snapshot("lan")[0])
+
     def test_offline_board_survives_restart(self):
         self.make().update(hubmod.clean_status(status()))
         self.wall.t += 3600
@@ -235,6 +329,8 @@ class PrintersTest(unittest.TestCase):
         self.assertNotIn("progress", clean)
         self.assertNotIn("preparing", clean)
         self.assertEqual(len(clean["hold_msg"]), 64)
+        self.assertEqual(hubmod.clean_status(status(build="16.11.26 14:32 deee079+"))["build"],
+                         "16.11.26 14:32 deee079+")
         bad_name = status(device={"id": "e072a1d5606c", "name": "<b>", "ip": "10.0.0.1"})
         self.assertEqual(hubmod.clean_status(bad_name)["device"]["name"], "e072a1d5606c")
         for bad in (status(state="burning"),
@@ -245,6 +341,23 @@ class PrintersTest(unittest.TestCase):
                 hubmod.clean_status(bad)
 
 
+class DashboardScriptTest(unittest.TestCase):
+    def test_script_parses(self):
+        """A stray escape in DASHBOARD_HTML once broke the whole page"""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        html = hubmod.DASHBOARD_HTML
+        js = html[html.index("<script>") + 8:html.rindex("</script>")]
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(js)
+        self.addCleanup(Path(f.name).unlink)
+        r = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 class StatusHttpTest(unittest.TestCase):
     def setUp(self):
         hub = hubmod.Hub(hubmod.Telegram(TOKEN, "-5", api_url="http://127.0.0.1:9"))
@@ -253,6 +366,14 @@ class StatusHttpTest(unittest.TestCase):
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         self.base = f"http://127.0.0.1:{srv.server_port}"
+
+    def test_printers_readable_from_board_pages(self):
+        req = urllib.request.Request(self.base + "/api/v1/status",
+                                     data=json.dumps(status(model="Kobra 2")).encode())
+        urllib.request.urlopen(req).close()
+        with urllib.request.urlopen(self.base + "/api/v1/printers") as r:
+            self.assertEqual(r.headers["Access-Control-Allow-Origin"], "*")
+            self.assertEqual(json.load(r)["printers"][0]["model"], "Kobra 2")
 
     def test_status_round_trip(self):
         req = urllib.request.Request(self.base + "/api/v1/status",

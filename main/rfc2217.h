@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -17,3 +18,6 @@ esp_err_t rfc2217_start(void);
  * Safe to call from ISR context — uses a StreamBuffer internally.
  */
 void rfc2217_feed_serial_data(const uint8_t *data, size_t len, void *user_ctx);
+
+/** True while a client (OctoPrint) is connected: it may be printing through us. */
+bool rfc2217_client_connected(void);

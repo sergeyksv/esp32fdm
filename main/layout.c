@@ -3,6 +3,7 @@
 #include "i18n.h"
 #include "printer_backend.h"
 #include "sdcard.h"
+#include "wifi.h"
 
 static void nav_link(html_buf_t *p, const char *path, const char *label, bool active)
 {
@@ -28,6 +29,7 @@ void layout_html_begin(html_buf_t *p, const char *title, const char *current_pat
         "nav a{color:#fff;text-decoration:none}"
         "nav .items a,nav .items b{color:#fff;margin:0 6px;white-space:nowrap}"
         "nav .brand{font-weight:bold;margin-right:12px}"
+        "nav .pn{font-size:21px;font-weight:800;color:#ffca28;line-height:1}"
         "nav .cur,nav .mb,nav .items .home{display:none}"
         /* Phone: one line with the page name and a menu button, the links
          * open as a list, so the length of the labels does not matter */
@@ -63,28 +65,32 @@ void layout_html_begin(html_buf_t *p, const char *title, const char *current_pat
         ".hint{font-size:13px;color:#666}"
         "</style></head><body>"
         "<nav id='nav'>"
-        "<a class='brand' href='/'>ESP32FDM</a>"
+        "<a class='brand%s' href='/'>%s</a>"
         "<span class='cur'>%s</span>"
         "<button class='mb' aria-label='%s' "
         "onclick=\"document.getElementById('nav').classList.toggle('open')\">&#9776;</button>"
         "<span class='items'>",
-        i18n_lang_code(i18n_lang()), TR(title), IS("/") ? "" : TR(title), _("Menu"));
+        i18n_lang_code(i18n_lang()), TR(title),
+        /* The print screen is the one for a printer at a glance: its name */
+        IS("/print") ? " pn" : "", IS("/print") ? wifi_get_hostname() : "ESP32FDM",
+        IS("/") ? "" : TR(title), _("Menu"));
 
     /* The brand links home, so on wide screens the list skips it */
     if (IS("/")) html_buf_printf(p, " <b class='home'>%s</b>", _("Home"));
     else html_buf_printf(p, " <a class='home' href='/'>%s</a>", _("Home"));
+    nav_link(p, "/print", NT_("Print"), IS("/print"));
     nav_link(p, "/camera", NT_("Cam"), IS("/camera"));
     if (sdcard_is_mounted()) nav_link(p, "/sd", NT_("SD"), IS("/sd"));
-    if (!is_klipper) {
-        nav_link(p, "/terminal", NT_("Term"), IS("/terminal"));
-        nav_link(p, "/utils", NT_("Utils"),
-                 IS("/utils") || strncmp(current_path, "/bedlevel", 9) == 0);
-    }
+    if (!is_klipper) nav_link(p, "/terminal", NT_("Term"), IS("/terminal"));
+    nav_link(p, "/utils", NT_("Utils"),
+             IS("/utils") || strncmp(current_path, "/bedlevel", 9) == 0);
     nav_link(p, "/logs", NT_("Logs"), IS("/logs"));
     nav_link(p, "/settings", NT_("Settings"), IS("/settings"));
 #undef IS
 
-    html_buf_printf(p, "</span></nav><div id='pst'></div>");
+    /* The print screen shows all of it itself */
+    html_buf_printf(p, "</span></nav><div id='pst'%s></div>",
+                    strcmp(current_path, "/print") == 0 ? " hidden" : "");
 }
 
 /* Built once per language by i18n_page(): a printf format, so % is doubled */
@@ -98,14 +104,16 @@ static const char END_TMPL[] =
     "p.className=a?s.state:s.state=='error'?'error':'';"
     "if(a){var bt='<span class=pctl>';"
     "if(s.state=='printing')bt+='<button onclick=\"fetch(\\'/sd/pause\\',{method:\\'POST\\'})\">" N_("Pause") "</button>';"
-    "else bt+='<button class=btn-green onclick=\"fetch(\\'/sd/resume\\',{method:\\'POST\\'})\">'+(s.hold?'" N_("Continue") "':'" N_("Resume") "')+'</button>';"
+    "else bt+='<button class=btn-green onclick=\"'+(s.hold?'fetch(\\'/print/continue\\',{method:\\'POST\\',body:\\'id='+s.hold_id+'\\'})':'fetch(\\'/sd/resume\\',{method:\\'POST\\'})')+'\">'+(s.hold?'" N_("Continue") "':'" N_("Resume") "')+'</button>';"
     "bt+='<button class=btn-red onclick=\"if(confirm(\\'" N_("Stop print?") "\\'))fetch(\\'/sd/cancel\\',{method:\\'POST\\'})\">" N_("Stop") "</button></span>';"
     "p.innerHTML=bt+'<b>'+(s.hold?'" N_("WAITING") "':s.state=='paused'?'" N_("PAUSED") "':s.preparing?'" N_("PREPARING") "':'" N_("PRINTING") "')+':</b> '+(s.hold?s.hold_msg+' &middot; ':'')+(s.filename||'')"
     "+' <a href=/print>" N_("Control") "</a>'"
     "+'<div class=pbar><div style=\"width:'+Math.min(100,s.progress||0)+'%%\"></div></div>'"
     "+(s.preparing?'':~~s.progress+'%%')+(s.layer&&s.layer.slice(-2)!='/0'?' &middot; " N_("Layer") " '+s.layer:'')"
     "+'<div style=\"font-size:12px;color:#555;margin-top:2px\">'+tp(s)+'</div>';}"
-    "else{p.innerHTML=s.backend+': '+(s.state=='error'?'" N_("Error") "':s.usb?'" N_("Ready") "':'" N_("Disconnected") "')"
+    "else if(s.upload>=0){p.className='printing';p.innerHTML='<b>" N_("Sending to the printer") ":</b> '+s.upload+'%%'"
+    "+'<div class=pbar><div style=\"width:'+s.upload+'%%\"></div></div>'}"
+    "else{p.innerHTML=s.backend+': '+(s.state=='error'?'" N_("Error") "':(s.backend=='Klipper'?s.state!='disconnected':s.usb)?'" N_("Ready") "':'" N_("Disconnected") "')"
     "+'<div style=\"font-size:12px;color:#888\">'+tp(s)+'</div>';}"
     "}).catch(function(){})}"
     "u();setInterval(u,3000);"
@@ -120,7 +128,7 @@ static const char END_TMPL[] =
     "cs();setInterval(cs,3000)}()"
     "</script>"
     "<footer style='margin-top:32px;padding:12px 0;border-top:1px solid #ddd;text-align:center;font-size:12px;color:#999'>"
-    "&copy; Sergey Korotkov &amp; Claude 2026 &middot; v" FW_VERSION;
+    "&copy; Sergey Korotkov &amp; Claude 2026 &middot; ";
 
 void layout_html_end(html_buf_t *p)
 {
@@ -129,10 +137,11 @@ void layout_html_end(html_buf_t *p)
 
     html_buf_printf(p, i18n_page(END_TMPL));
     html_buf_printf(p,
+        "<span title='%s'>v%s &middot; %s</span>"
         " &middot; <span class='lng'>%s</span> &middot; "
         "<span class='cpu-bars'>"
         "C0<span class='cpu-bar'><div id='cb0'></div></span>"
         "C1<span class='cpu-bar'><div id='cb1'></div></span>"
         "</span></footer></body></html>",
-        langs);
+        _("Build time and commit, + if there were uncommitted changes"), FW_VERSION, FW_BUILD, langs);
 }

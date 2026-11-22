@@ -1,8 +1,10 @@
 #include "obico_client.h"
+#include "task_util.h"
 #include "httpd.h"
 
 #include "camera.h"
 #include "printer_comm.h"
+#include "hub_client.h"
 #include "i18n.h"
 #include "layout.h"
 #include "url_util.h"
@@ -273,16 +275,16 @@ esp_err_t obico_link_with_code(const char *code)
 
             /* Start the background tasks now that we're linked */
             if (!s_ws_task_handle) {
-                xTaskCreatePinnedToCore(obico_ws_task, "obico_ws", 6144,
+                task_create_psram(obico_ws_task, "obico_ws", 12288,
                                         NULL, 5, &s_ws_task_handle, 0);
             }
             if (!s_snap_task_handle) {
-                xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
+                task_create_psram(obico_snap_task, "obico_snap", 12288,
                                         NULL, 4, &s_snap_task_handle, 0);
             }
             if (!s_janus_rx_task_handle && janus_proxy_configured()) {
                 s_janus_sock_mutex = xSemaphoreCreateMutex();
-                xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+                task_create_psram(janus_proxy_task, "janus_proxy", 8192,
                                         NULL, 5, &s_janus_rx_task_handle, 0);
             }
             return ESP_OK;
@@ -300,17 +302,17 @@ esp_err_t obico_link_with_code(const char *code)
         cJSON_Delete(root);
 
         if (!s_ws_task_handle) {
-            xTaskCreatePinnedToCore(obico_ws_task, "obico_ws", 6144,
+            task_create_psram(obico_ws_task, "obico_ws", 12288,
                                     NULL, 5, &s_ws_task_handle, 0);
         }
         if (!s_snap_task_handle) {
-            xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
+            task_create_psram(obico_snap_task, "obico_snap", 12288,
                                     NULL, 4, &s_snap_task_handle, 0);
         }
 #ifdef CONFIG_OBICO_JANUS_PROXY_HOST
         if (!s_janus_rx_task_handle && janus_proxy_configured()) {
             s_janus_sock_mutex = xSemaphoreCreateMutex();
-            xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+            task_create_psram(janus_proxy_task, "janus_proxy", 8192,
                                     NULL, 5, &s_janus_rx_task_handle, 0);
         }
 #endif
@@ -569,8 +571,20 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
 
                         if (strcmp(cmd_str, "pause") == 0) {
                             pcmd.type = PCMD_PAUSE;
+                            pcmd.standby = true;    /* Nobody may come soon: see nozzle_guard.h */
                             printer_comm_send_cmd(&pcmd);
-                            ESP_LOGI(TAG, "Obico command: pause");
+                            /* Obico's failure detection pauses with initiator
+                             * "system", a user in the Obico app with "api" */
+                            const cJSON *init = cJSON_GetObjectItem(item, "initiator");
+                            bool by_ai = cJSON_IsString(init) &&
+                                         strcmp(init->valuestring, "system") == 0;
+                            ESP_LOGI(TAG, "Obico command: pause (initiator %s)",
+                                     cJSON_IsString(init) ? init->valuestring : "none");
+                            if (by_ai) {
+                                printer_state_t ps;
+                                printer_comm_get_state(&ps);
+                                hub_client_send_event(HUB_EVENT_OBICO_PAUSE, "", ps.filename);
+                            }
                         } else if (strcmp(cmd_str, "resume") == 0) {
                             pcmd.type = PCMD_RESUME;
                             printer_comm_send_cmd(&pcmd);
@@ -650,6 +664,8 @@ static void obico_ws_task(void *arg)
             .reconnect_timeout_ms = 10000,
             .network_timeout_ms = 20000,
             .buffer_size = 2048,
+            /* 4 KB default left 600 bytes at the deepest point seen */
+            .task_stack = 6144,
         };
 
         s_ws_client = esp_websocket_client_init(&ws_config);
@@ -1326,7 +1342,7 @@ esp_err_t obico_set_janus_proxy(const char *host, uint16_t port)
         if (!s_janus_sock_mutex) {
             s_janus_sock_mutex = xSemaphoreCreateMutex();
         }
-        xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+        task_create_psram(janus_proxy_task, "janus_proxy", 8192,
                                 NULL, 5, &s_janus_rx_task_handle, 0);
     }
 
@@ -1351,13 +1367,13 @@ esp_err_t obico_client_init(void)
     if (s_linked) {
         ESP_LOGI(TAG, "Device is linked to Obico — starting tasks");
 
-        xTaskCreatePinnedToCore(obico_ws_task, "obico_ws", 6144,
+        task_create_psram(obico_ws_task, "obico_ws", 12288,
                                 NULL, 5, &s_ws_task_handle, 0);
-        xTaskCreatePinnedToCore(obico_snap_task, "obico_snap", 6144,
+        task_create_psram(obico_snap_task, "obico_snap", 12288,
                                 NULL, 4, &s_snap_task_handle, 0);
         if (janus_proxy_configured()) {
             s_janus_sock_mutex = xSemaphoreCreateMutex();
-            xTaskCreatePinnedToCore(janus_proxy_task, "janus_proxy", 4096,
+            task_create_psram(janus_proxy_task, "janus_proxy", 8192,
                                     NULL, 5, &s_janus_rx_task_handle, 0);
             ESP_LOGI(TAG, "Janus proxy relay enabled -> %s:%d",
                      s_janus_host, s_janus_port);

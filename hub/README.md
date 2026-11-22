@@ -83,7 +83,7 @@ did not, so that the board can retry. A repeated `event_id` is not sent again.
 }
 ```
 
-`type` is `hold`, `hold_timeout` or `test`. `GET /healthz` reports that the hub is running.
+`type` is `hold`, `hold_timeout`, `test`, `maintenance` (`message` lists the jobs that fell due), `maintenance_skipped` (a print started with maintenance overdue: `message` lists what and by how much, `filename` the print), `updated` (a firmware update deferred during a print was installed, `message` is "2.4 → 2.5"), `update_failed`, `stack_low` (a task came within 768 bytes of the end of its stack: `message` names it and how much was left), `obico_pause` (Obico's failure detection paused the print, `filename` the print; a pause from the Obico app sends nothing) `print_check` (a print started with a check before a print failed: a Z offset a bed calibration changed, a mesh profile that no longer matches the bed; `message` lists them, `filename` the print) `filament_runout` (the filament ran out and the print is paused: `message` is "245° → 160°, 10 min", where the nozzle goes and when if nobody comes, or empty for a plastic left hot, `filename` the print) or `nozzle_standby` (a wait went on and the board took the nozzle down to its standby temperature so the plastic does not char: `message` is "245° → 160°", `filename` the print). A status may carry `print_hours` and `prints` (shown on an idle tile), `maintenance_due` (🔧 on the tile), `model`, `wifi_ap` and `wifi_rssi` (⚠ Wi-Fi on the tile below -75 dBm) and `update_pending` (the version waiting to install), shown as ↻ on the tile. `GET /healthz` reports that the hub is running.
 
 ### Status
 

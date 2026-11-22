@@ -20,12 +20,13 @@ menu "ESP32 FDM Bridge Configuration"
 
     config HOLD_TIMEOUT_MIN
         int "Cancel a print waiting on M0/M1 after (minutes)"
-        default 30
+        default 120
         range 1 240
         help
-            M0/M1 in a file printed from SD makes the printer wait for the user
-            with the heaters on.  If nobody continues within this time, the
-            print is cancelled and the heaters are turned off.
+            M0/M1 in a file printed from SD makes the printer wait for the user.
+            The nozzle guard (Settings) takes a hot nozzle down to standby after
+            a while; if nobody continues within this time, the print is
+            cancelled and the heaters are turned off.
 
     menu "Obico Integration"
 

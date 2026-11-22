@@ -1,31 +1,45 @@
 #include "wifi.h"
+#include "task_util.h"
 
 #include <string.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "wifi";
 
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-#define MAX_RETRY          3
+#define WIFI_FAIL_BIT      BIT1     /* Boot only: gave up, start the setup AP */
+#define WIFI_DISC_BIT      BIT2     /* A disconnect for the Wi-Fi task to handle */
+#define WIFI_SCAN_BIT      BIT3     /* The status page asked for a scan */
+#define MAX_RETRY          3        /* At boot, before falling back to the setup AP */
 
 #define NVS_WIFI_NAMESPACE "wifi"
 #define NVS_KEY_SSID       "ssid"
 #define NVS_KEY_PASSWORD   "password"
 #define NVS_KEY_HOSTNAME   "hostname"
+#define NVS_KEY_PREFERRED  "pref_bssid"
+#define NVS_KEY_AP_NAMES   "ap_names"
 #define DEFAULT_HOSTNAME   "esp32fdm"
 
-#define ROAM_RSSI_THRESHOLD   (-70)   /* trigger scan when below this */
-#define ROAM_RSSI_HYSTERESIS  10      /* only roam if new AP is this much better */
-#define ROAM_SCAN_INTERVAL_MS 30000   /* min interval between roam scans */
+#define ROAM_RSSI_THRESHOLD   (-70)   /* Look for a better AP below this */
+#define ROAM_RSSI_HYSTERESIS  10      /* ...and move only if it is this much better */
+#define ROAM_CHECK_US         (30 * 1000000LL)
+#define PREF_MIN_RSSI         (-75)   /* The preferred AP is taken only if this strong */
+#define PREF_CHECK_US         (5 * 60 * 1000000LL)  /* Look for it this often when elsewhere */
+#define PREF_AFTER_BTM_US     (30 * 60 * 1000000LL) /* ...but not this soon after the network moved us */
+#define LOST_US               (20 * 1000000LL)      /* Not back by itself after this: reconnect */
+#define CONNECT_WAIT_MS       15000
+#define BACKOFF_MAX_S         60
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
@@ -36,9 +50,136 @@ static char s_current_ssid[33];
 static char s_current_pass[65];
 static char s_hostname[32] = DEFAULT_HOSTNAME;
 
-/* Scan for all APs matching ssid, return the BSSID of the strongest one.
- * Returns true if a match was found (best_bssid and best_rssi populated). */
-static bool scan_best_ap(const char *ssid, uint8_t *best_bssid, int8_t *best_rssi)
+/* After boot the Wi-Fi task owns reconnecting, and never gives up */
+static volatile bool s_managed;
+/* The task is switching APs itself: its own disconnect is not a loss */
+static volatile bool s_switching;
+
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static wifi_stats_t s_stats;
+static uint8_t s_preferred[6];
+static bool s_has_preferred;
+static wifi_ap_name_t s_names[WIFI_AP_NAMES_MAX];
+static int s_name_count;
+
+static SemaphoreHandle_t s_scan_lock;
+static wifi_seen_ap_t s_seen[WIFI_SEEN_MAX];
+static int s_seen_count;
+static int64_t s_seen_us;
+
+static bool bssid_eq(const uint8_t *a, const uint8_t *b)
+{
+    return memcmp(a, b, 6) == 0;
+}
+
+/* ---- Names and the preferred AP (NVS) ---- */
+
+static void load_ap_prefs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
+    size_t len = sizeof(s_preferred);
+    s_has_preferred = nvs_get_blob(nvs, NVS_KEY_PREFERRED, s_preferred, &len) == ESP_OK && len == 6;
+    len = sizeof(s_names);
+    if (nvs_get_blob(nvs, NVS_KEY_AP_NAMES, s_names, &len) == ESP_OK) {
+        s_name_count = len / sizeof(wifi_ap_name_t);
+    }
+    nvs_close(nvs);
+}
+
+static void save_ap_prefs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    if (s_has_preferred) nvs_set_blob(nvs, NVS_KEY_PREFERRED, s_preferred, 6);
+    else nvs_erase_key(nvs, NVS_KEY_PREFERRED);
+    if (s_name_count) nvs_set_blob(nvs, NVS_KEY_AP_NAMES, s_names, s_name_count * sizeof(wifi_ap_name_t));
+    else nvs_erase_key(nvs, NVS_KEY_AP_NAMES);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+bool wifi_ap_name(const uint8_t bssid[6], char *out, size_t size)
+{
+    bool found = false;
+    taskENTER_CRITICAL(&s_mux);
+    for (int i = 0; i < s_name_count; i++) {
+        if (bssid_eq(s_names[i].bssid, bssid)) {
+            strlcpy(out, s_names[i].name, size);
+            found = true;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_mux);
+    if (!found && size) out[0] = '\0';
+    return found;
+}
+
+int wifi_get_ap_names(wifi_ap_name_t *out, int max)
+{
+    taskENTER_CRITICAL(&s_mux);
+    int n = s_name_count < max ? s_name_count : max;
+    memcpy(out, s_names, n * sizeof(wifi_ap_name_t));
+    taskEXIT_CRITICAL(&s_mux);
+    return n;
+}
+
+void wifi_set_ap_names(const wifi_ap_name_t *names, int count)
+{
+    if (count > WIFI_AP_NAMES_MAX) count = WIFI_AP_NAMES_MAX;
+    taskENTER_CRITICAL(&s_mux);
+    memcpy(s_names, names, count * sizeof(wifi_ap_name_t));
+    s_name_count = count;
+    taskEXIT_CRITICAL(&s_mux);
+    save_ap_prefs();
+}
+
+bool wifi_get_preferred(uint8_t out[6])
+{
+    taskENTER_CRITICAL(&s_mux);
+    bool has = s_has_preferred;
+    if (has) memcpy(out, s_preferred, 6);
+    taskEXIT_CRITICAL(&s_mux);
+    return has;
+}
+
+void wifi_set_preferred(const uint8_t *bssid)
+{
+    taskENTER_CRITICAL(&s_mux);
+    s_has_preferred = bssid != NULL;
+    if (bssid) memcpy(s_preferred, bssid, 6);
+    taskEXIT_CRITICAL(&s_mux);
+    save_ap_prefs();
+}
+
+/* ---- Status ---- */
+
+void wifi_get_stats(wifi_stats_t *out)
+{
+    taskENTER_CRITICAL(&s_mux);
+    *out = s_stats;
+    taskEXIT_CRITICAL(&s_mux);
+}
+
+int wifi_get_seen(wifi_seen_ap_t *out, int max, int64_t *when_us)
+{
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    int n = s_seen_count < max ? s_seen_count : max;
+    memcpy(out, s_seen, n * sizeof(wifi_seen_ap_t));
+    if (when_us) *when_us = s_seen_us;
+    xSemaphoreGive(s_scan_lock);
+    return n;
+}
+
+void wifi_request_scan(void)
+{
+    if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_SCAN_BIT);
+}
+
+/* ---- Scanning and choosing ---- */
+
+/** Scan for our SSID, keep what was seen for the status page */
+static int scan_ssid(const char *ssid)
 {
     wifi_scan_config_t scan_cfg = {
         .ssid = (uint8_t *)ssid,
@@ -47,124 +188,181 @@ static bool scan_best_ap(const char *ssid, uint8_t *best_bssid, int8_t *best_rss
         .scan_time.active = { .min = 100, .max = 300 },
     };
 
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_scan_lock);
         ESP_LOGW(TAG, "Scan failed: %s", esp_err_to_name(err));
-        return false;
+        return 0;
     }
 
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count == 0) {
+    uint16_t count = WIFI_SEEN_MAX;
+    wifi_ap_record_t *list = calloc(count, sizeof(wifi_ap_record_t));
+    if (!list) {
         esp_wifi_clear_ap_list();
-        return false;
+        xSemaphoreGive(s_scan_lock);
+        return 0;
     }
+    esp_wifi_scan_get_ap_records(&count, list);
 
-    uint16_t fetch = ap_count > 20 ? 20 : ap_count;
-    wifi_ap_record_t *ap_list = calloc(fetch, sizeof(wifi_ap_record_t));
-    if (!ap_list) {
-        esp_wifi_clear_ap_list();
-        return false;
+    s_seen_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp((char *)list[i].ssid, ssid) != 0) continue;
+        wifi_seen_ap_t *a = &s_seen[s_seen_count++];
+        memcpy(a->bssid, list[i].bssid, 6);
+        a->channel = list[i].primary;
+        a->rssi = list[i].rssi;
+        ESP_LOGI(TAG, "  AP: " MACSTR "  ch=%d  rssi=%d", MAC2STR(a->bssid), a->channel, a->rssi);
     }
-
-    esp_wifi_scan_get_ap_records(&fetch, ap_list);
-
-    bool found = false;
-    int8_t top_rssi = -127;
-    for (int i = 0; i < fetch; i++) {
-        if (strcmp((char *)ap_list[i].ssid, ssid) != 0)
-            continue;
-        ESP_LOGI(TAG, "  AP: %02x:%02x:%02x:%02x:%02x:%02x  ch=%d  rssi=%d",
-                 ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
-                 ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5],
-                 ap_list[i].primary, ap_list[i].rssi);
-        if (ap_list[i].rssi > top_rssi) {
-            top_rssi = ap_list[i].rssi;
-            memcpy(best_bssid, ap_list[i].bssid, 6);
-            found = true;
-        }
-    }
-
-    free(ap_list);
-    if (found)
-        *best_rssi = top_rssi;
-    return found;
+    s_seen_us = esp_timer_get_time();
+    int n = s_seen_count;
+    xSemaphoreGive(s_scan_lock);
+    free(list);
+    return n;
 }
 
-static void roam_task(void *arg)
+/** The AP to connect to: the preferred one if it is strong enough, else the
+ *  strongest.  False if none of ours is in range. */
+static bool choose_ap(const char *ssid, uint8_t *bssid, int8_t *rssi)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(5000)); /* wait for initial connection to settle */
+    if (!scan_ssid(ssid)) return false;
+    uint8_t pref[6];
+    bool has_pref = wifi_get_preferred(pref);
+
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    int best = -1;
+    for (int i = 0; i < s_seen_count; i++) {
+        if (has_pref && bssid_eq(s_seen[i].bssid, pref) && s_seen[i].rssi >= PREF_MIN_RSSI) {
+            best = i;
+            break;
+        }
+        if (best < 0 || s_seen[i].rssi > s_seen[best].rssi) best = i;
+    }
+    if (best >= 0) {
+        memcpy(bssid, s_seen[best].bssid, 6);
+        if (rssi) *rssi = s_seen[best].rssi;
+    }
+    xSemaphoreGive(s_scan_lock);
+    return best >= 0;
+}
+
+/** Station config for our network, locked to bssid if given.  Without a
+ *  lock the driver scans every channel and takes the strongest AP. */
+static void make_config(wifi_config_t *cfg, const uint8_t *bssid)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    strncpy((char *)cfg->sta.ssid, s_current_ssid, sizeof(cfg->sta.ssid) - 1);
+    strncpy((char *)cfg->sta.password, s_current_pass, sizeof(cfg->sta.password) - 1);
+    cfg->sta.threshold.authmode = s_current_pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    cfg->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    cfg->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    cfg->sta.rm_enabled = 1;   /* 802.11k: answer the AP's radio measurement requests */
+    cfg->sta.btm_enabled = 1;  /* 802.11v: move when the network (DAWN) asks */
+    if (bssid) {
+        memcpy(cfg->sta.bssid, bssid, 6);
+        cfg->sta.bssid_set = true;
+    }
+}
+
+/** Connect (again) to bssid, or to the strongest AP if NULL, and wait.
+ *  Only from the Wi-Fi task. */
+static bool connect_to(const uint8_t *bssid)
+{
+    wifi_config_t cfg;
+    make_config(&cfg, bssid);
+    s_switching = true;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISC_BIT);
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_connect();
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(CONNECT_WAIT_MS));
+    s_switching = false;
+    return bits & WIFI_CONNECTED_BIT;
+}
+
+/** Connection lost: try until it is back, choosing the AP afresh each time */
+static void reconnect(void)
+{
+    for (int attempt = 0;; attempt++) {
+        uint8_t bssid[6];
+        int8_t rssi;
+        /* After a few misses, let the driver pick: the scan may be what fails */
+        bool chosen = attempt < 4 && choose_ap(s_current_ssid, bssid, &rssi);
+        if (chosen) ESP_LOGI(TAG, "Reconnecting to " MACSTR " (rssi %d)", MAC2STR(bssid), rssi);
+        else ESP_LOGI(TAG, "Reconnecting to the strongest AP");
+        if (connect_to(chosen ? bssid : NULL)) {
+            taskENTER_CRITICAL(&s_mux);
+            s_stats.reconnects++;
+            taskEXIT_CRITICAL(&s_mux);
+            return;
+        }
+        int wait_s = 5 << (attempt < 4 ? attempt : 4);
+        if (wait_s > BACKOFF_MAX_S) wait_s = BACKOFF_MAX_S;
+        ESP_LOGW(TAG, "Reconnect attempt %d failed (reason %u), next in %d s",
+                 attempt + 1, s_stats.last_reason, wait_s);
+        vTaskDelay(pdMS_TO_TICKS(wait_s * 1000));
+        if (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) return;
+    }
+}
+
+/** Connected: move to a better AP if the signal is poor, or back to the
+ *  preferred one when it is in range again */
+static void roam_check(int64_t *pref_checked_us)
+{
+    wifi_ap_record_t cur;
+    if (esp_wifi_sta_get_ap_info(&cur) != ESP_OK) return;
+
+    int64_t now = esp_timer_get_time();
+    uint8_t pref[6];
+    bool has_pref = wifi_get_preferred(pref);
+    bool weak = cur.rssi < ROAM_RSSI_THRESHOLD;
+    bool want_pref = has_pref && !bssid_eq(cur.bssid, pref) &&
+                     now - *pref_checked_us >= PREF_CHECK_US &&
+                     (!s_stats.last_btm_us || now - s_stats.last_btm_us >= PREF_AFTER_BTM_US);
+    if (!weak && !want_pref) return;
+    if (want_pref) *pref_checked_us = now;
+
+    uint8_t best[6];
+    int8_t best_rssi;
+    if (!choose_ap(s_current_ssid, best, &best_rssi) || bssid_eq(best, cur.bssid)) return;
+    bool to_pref = has_pref && bssid_eq(best, pref);
+    if (!to_pref && best_rssi < cur.rssi + ROAM_RSSI_HYSTERESIS) return;
+
+    ESP_LOGW(TAG, "Moving to " MACSTR " (rssi %d, was %d)%s", MAC2STR(best), best_rssi, cur.rssi,
+             to_pref ? ": the preferred AP" : "");
+    if (connect_to(best)) {
+        taskENTER_CRITICAL(&s_mux);
+        s_stats.roams++;
+        taskEXIT_CRITICAL(&s_mux);
+    } else {
+        ESP_LOGW(TAG, "Move failed, back to the strongest AP");
+        reconnect();
+    }
+}
+
+static void wifi_task(void *arg)
+{
+    int64_t roam_checked_us = esp_timer_get_time();
+    int64_t pref_checked_us = roam_checked_us;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(ROAM_SCAN_INTERVAL_MS));
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_DISC_BIT | WIFI_SCAN_BIT,
+                                               pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
+        int64_t now = esp_timer_get_time();
+        bool connected = xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT;
 
-        /* Only roam if connected */
-        EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-        if (!(bits & WIFI_CONNECTED_BIT))
-            continue;
-
-        /* Check current RSSI */
-        wifi_ap_record_t current_ap;
-        if (esp_wifi_sta_get_ap_info(&current_ap) != ESP_OK)
-            continue;
-
-        if (current_ap.rssi >= ROAM_RSSI_THRESHOLD)
-            continue;
-
-        ESP_LOGI(TAG, "RSSI %d below threshold %d, scanning for better AP...",
-                 current_ap.rssi, ROAM_RSSI_THRESHOLD);
-
-        uint8_t best_bssid[6];
-        int8_t best_rssi;
-        if (!scan_best_ap(s_current_ssid, best_bssid, &best_rssi))
-            continue;
-
-        /* Only roam if the best AP is significantly better */
-        if (best_rssi <= current_ap.rssi + ROAM_RSSI_HYSTERESIS) {
-            ESP_LOGI(TAG, "Best AP rssi=%d, current=%d — not worth roaming",
-                     best_rssi, current_ap.rssi);
+        /* A disconnect, or a network move (802.11v) that did not come back */
+        if (!connected && ((bits & WIFI_DISC_BIT) || now - s_stats.disconnected_us >= LOST_US)) {
+            reconnect();
             continue;
         }
-
-        /* Don't roam to the same AP */
-        if (memcmp(best_bssid, current_ap.bssid, 6) == 0)
-            continue;
-
-        ESP_LOGW(TAG, "Roaming to %02x:%02x:%02x:%02x:%02x:%02x (rssi=%d, was %d)",
-                 best_bssid[0], best_bssid[1], best_bssid[2],
-                 best_bssid[3], best_bssid[4], best_bssid[5],
-                 best_rssi, current_ap.rssi);
-
-        /* Update config to target the better AP */
-        wifi_config_t wifi_config = {};
-        strncpy((char *)wifi_config.sta.ssid, s_current_ssid, sizeof(wifi_config.sta.ssid) - 1);
-        strncpy((char *)wifi_config.sta.password, s_current_pass, sizeof(wifi_config.sta.password) - 1);
-        memcpy(wifi_config.sta.bssid, best_bssid, 6);
-        wifi_config.sta.bssid_set = true;
-        wifi_config.sta.rm_enabled = 1;
-        wifi_config.sta.btm_enabled = 1;
-
-        s_max_retry = MAX_RETRY;
-        s_retry_num = 0;
-        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-
-        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-        esp_wifi_disconnect();
-        esp_wifi_connect();
-
-        /* Wait for reconnect */
-        xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-
-        bits = xEventGroupGetBits(s_wifi_event_group);
-        if (!(bits & WIFI_CONNECTED_BIT)) {
-            /* Roam failed — reconnect without BSSID lock */
-            ESP_LOGW(TAG, "Roam failed, reconnecting to any AP...");
-            wifi_config.sta.bssid_set = false;
-            esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-            esp_wifi_connect();
+        if (bits & WIFI_SCAN_BIT) {
+            scan_ssid(s_current_ssid);
+        }
+        if (connected && now - roam_checked_us >= ROAM_CHECK_US) {
+            roam_checked_us = now;
+            roam_check(&pref_checked_us);
         }
     }
 }
@@ -172,11 +370,36 @@ static void roam_task(void *arg)
 static void event_handler(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        wifi_event_sta_connected_t *ev = (wifi_event_sta_connected_t *)event_data;
+        taskENTER_CRITICAL(&s_mux);
+        memcpy(s_stats.bssid, ev->bssid, 6);
+        s_stats.channel = ev->channel;
+        s_stats.connected_us = esp_timer_get_time();
+        taskEXIT_CRITICAL(&s_mux);
+        ESP_LOGI(TAG, "Associated with " MACSTR " on channel %d", MAC2STR(ev->bssid), ev->channel);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)event_data;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        if (s_retry_num < s_max_retry) {
+        int64_t now = esp_timer_get_time();
+        taskENTER_CRITICAL(&s_mux);
+        s_stats.last_reason = ev->reason;
+        s_stats.disconnected_us = now;
+        s_stats.disconnects++;
+        if (ev->reason == WIFI_REASON_ROAMING) {
+            s_stats.btm_roams++;
+            s_stats.last_btm_us = now;
+        }
+        taskEXIT_CRITICAL(&s_mux);
+
+        if (ev->reason == WIFI_REASON_ROAMING) {
+            /* The network asked us to move (802.11v): the supplicant connects
+             * to the new AP itself, and the task steps in only if it does not */
+            ESP_LOGI(TAG, "Moved by the network (802.11v)");
+        } else if (s_managed) {
+            ESP_LOGW(TAG, "Disconnected, reason %u", ev->reason);
+            if (!s_switching) xEventGroupSetBits(s_wifi_event_group, WIFI_DISC_BIT);
+        } else if (s_retry_num < s_max_retry) {
             s_retry_num++;
             ESP_LOGW(TAG, "Retrying connection (%d/%d)...", s_retry_num, s_max_retry);
             esp_wifi_connect();
@@ -271,13 +494,11 @@ static esp_err_t try_sta_connect(const char *ssid, const char *pass)
         apply_hostname();
     }
 
-    wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    wifi_config.sta.rm_enabled = 1;   /* 802.11k Radio Measurement */
-    wifi_config.sta.btm_enabled = 1;  /* 802.11v BSS Transition Management */
+    strlcpy(s_current_ssid, ssid, sizeof(s_current_ssid));
+    strlcpy(s_current_pass, pass, sizeof(s_current_pass));
 
+    wifi_config_t wifi_config;
+    make_config(&wifi_config, NULL);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
@@ -287,37 +508,28 @@ static esp_err_t try_sta_connect(const char *ssid, const char *pass)
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Scan for the strongest AP before connecting */
-    ESP_LOGI(TAG, "Scanning for best AP...");
-    uint8_t best_bssid[6];
-    int8_t best_rssi;
-    if (scan_best_ap(ssid, best_bssid, &best_rssi)) {
-        ESP_LOGI(TAG, "Best AP: %02x:%02x:%02x:%02x:%02x:%02x (rssi=%d)",
-                 best_bssid[0], best_bssid[1], best_bssid[2],
-                 best_bssid[3], best_bssid[4], best_bssid[5], best_rssi);
-        /* Lock to best BSSID */
-        memcpy(wifi_config.sta.bssid, best_bssid, 6);
-        wifi_config.sta.bssid_set = true;
+    /* The preferred AP if it is strong enough, else the strongest */
+    ESP_LOGI(TAG, "Scanning for the best AP...");
+    uint8_t bssid[6];
+    int8_t rssi;
+    bool locked = choose_ap(ssid, bssid, &rssi);
+    if (locked) {
+        ESP_LOGI(TAG, "Chosen AP: " MACSTR " (rssi=%d)", MAC2STR(bssid), rssi);
+        make_config(&wifi_config, bssid);
         esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     }
-
-    /* Save for roaming use */
-    strncpy(s_current_ssid, ssid, sizeof(s_current_ssid) - 1);
-    strncpy(s_current_pass, pass, sizeof(s_current_pass) - 1);
-
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE, portMAX_DELAY);
-
     if (bits & WIFI_CONNECTED_BIT)
         return ESP_OK;
 
     /* If BSSID-locked connect failed, retry without lock */
-    if (wifi_config.sta.bssid_set) {
+    if (locked) {
         ESP_LOGW(TAG, "BSSID-locked connect failed, trying any AP...");
-        wifi_config.sta.bssid_set = false;
+        make_config(&wifi_config, NULL);
         esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
         s_retry_num = 0;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
@@ -326,7 +538,6 @@ static esp_err_t try_sta_connect(const char *ssid, const char *pass)
         bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE, pdFALSE, portMAX_DELAY);
-
         if (bits & WIFI_CONNECTED_BIT)
             return ESP_OK;
     }
@@ -361,10 +572,21 @@ static void start_ap_mode(void)
     ESP_LOGW(TAG, "AP mode started: \"%s\" — configure at http://192.168.4.1/", ap_ssid);
 }
 
+/** From here on the Wi-Fi task keeps the connection, whatever happens */
+static void start_managing(void)
+{
+    s_managed = true;
+    /* 4 KB: 3 KB had 392 bytes left on boards that switch APs, since each
+     * line logged (the AP list) takes over 1 KB of stack */
+    task_create_psram(wifi_task, "wifi_mgr", 8192, NULL, 2, NULL, 0);
+}
+
 wifi_result_t wifi_init(void)
 {
     s_wifi_event_group = xEventGroupCreate();
+    s_scan_lock = xSemaphoreCreateMutex();
     load_hostname();
+    load_ap_prefs();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -384,7 +606,7 @@ wifi_result_t wifi_init(void)
     if (nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
         ESP_LOGI(TAG, "Found WiFi credentials in NVS");
         if (try_sta_connect(ssid, pass) == ESP_OK) {
-            xTaskCreatePinnedToCore(roam_task, "roam", 4096, NULL, 2, NULL, 0);
+            start_managing();
             return WIFI_RESULT_STA_CONNECTED;
         }
     }
@@ -394,7 +616,7 @@ wifi_result_t wifi_init(void)
         ESP_LOGI(TAG, "Trying Kconfig credentials...");
         if (try_sta_connect(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD) == ESP_OK) {
             nvs_save_creds(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
-            xTaskCreatePinnedToCore(roam_task, "roam", 4096, NULL, 2, NULL, 0);
+            start_managing();
             return WIFI_RESULT_STA_CONNECTED;
         }
     }

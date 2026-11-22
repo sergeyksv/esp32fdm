@@ -32,7 +32,9 @@ SEEN_EVENTS_MAX = 256
 
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 DEVICE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-EVENT_TYPES = ("hold", "hold_timeout", "test")
+EVENT_TYPES = ("hold", "hold_timeout", "test", "updated", "update_failed", "maintenance",
+               "maintenance_skipped", "stack_low", "obico_pause", "nozzle_standby",
+               "print_check", "filament_runout")
 
 # Board status, for the dashboard
 STATES = ("idle", "printing", "paused", "hold", "error", "no_printer")
@@ -40,8 +42,10 @@ DEFAULT_INTERVAL_S = 10
 MISSED_REPORTS = 3          # A board is offline after this many missed reports
 SAVE_LAST_SEEN_S = 300      # How stale the saved "last seen" may get
 MAX_PRINTERS = 64
-STATUS_STRINGS = {"filename": 64, "hold_msg": 64, "version": 16}
-STATUS_NUMBERS = ("progress", "time_left_s", "hotend", "hotend_target", "bed", "bed_target")
+STATUS_STRINGS = {"filename": 64, "hold_msg": 64, "version": 16, "build": 32, "update_pending": 48,
+                  "model": 32, "wifi_ap": 26}
+STATUS_NUMBERS = ("progress", "time_left_s", "hotend", "hotend_target", "bed", "bed_target",
+                  "print_hours", "prints", "maintenance_due", "wifi_rssi")
 
 
 class TelegramError(Exception):
@@ -61,13 +65,13 @@ def load_env(path):
     return values
 
 
-def device_link(device, domain):
-    """Link to the board's print page, or None if the event has no usable address."""
+def device_link(device, domain, path="/print"):
+    """Link to a page on the board, or None if the event has no usable address."""
     name = str(device.get("name") or "")
     if domain and HOSTNAME_RE.match(name):
-        return f"http://{name}.{domain}/print"
+        return f"http://{name}.{domain}{path}"
     try:
-        return f"http://{ipaddress.IPv4Address(str(device.get('ip') or ''))}/print"
+        return f"http://{ipaddress.IPv4Address(str(device.get('ip') or ''))}{path}"
     except ValueError:
         return None
 
@@ -83,13 +87,35 @@ def format_message(event, domain):
         lines = [f"⏸ {name} ждёт вас", text]
     elif kind == "hold_timeout":
         lines = [f"⛔ {name}: никто не продолжил, печать отменена, нагрев выключен"]
+    elif kind == "updated":
+        lines = [f"🔄 {name}: прошивка обновлена после печати", text]
+    elif kind == "update_failed":
+        lines = [f"⚠️ {name}: отложенное обновление не установилось", text]
+    elif kind == "maintenance":
+        lines = [f"🔧 {name}: пора на обслуживание", text]
+    elif kind == "maintenance_skipped":
+        lines = [f"⚠️ {name}: печать начата, хотя обслуживание просрочено", text]
+    elif kind == "stack_low":
+        lines = [f"⚠️ {name}: задаче почти не хватило стека, плату стоит обновить", text]
+    elif kind == "nozzle_standby":
+        lines = [f"🌡 {name}: ждёт давно, сопло переведено на дежурную температуру, чтобы пластик не подгорел",
+                 text, "«Продолжить» сначала нагреет сопло"]
+    elif kind == "print_check":
+        lines = [f"⚠️ {name}: печать начата без проверки, может процарапать стол", text]
+    elif kind == "filament_runout":
+        lines = [f"🧵 {name}: кончился филамент, печать на паузе",
+                 f"Если никто не подойдёт, сопло перейдёт на дежурную температуру: {text}" if text else ""]
+    elif kind == "obico_pause":
+        lines = [f"🍝 {name}: Obico заметил сбой печати и поставил её на паузу", text]
     else:
         lines = [f"✅ {name}: тест уведомлений"]
 
     if filename:
         lines.append(f"Файл: {filename}")
-    if kind != "hold_timeout":
-        link = device_link(device, domain)
+    if kind in ("hold", "test", "maintenance", "maintenance_skipped", "obico_pause", "nozzle_standby",
+                "print_check", "filament_runout"):
+        link = device_link(device, domain,
+                           "/maintenance" if kind.startswith("maintenance") else "/print")
         if link:
             lines.append(link)
     return "\n".join(line for line in lines if line)
@@ -181,11 +207,13 @@ color:inherit;text-decoration:none;overflow:hidden;-webkit-tap-highlight-color:t
 transition:transform .08s,filter .08s}
 a.t:active{transform:scale(.96);filter:brightness(.9)}
 .n{font-weight:700;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.md{font-size:11px;opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .s{font-size:13px;margin-top:2px;font-weight:600}
 .pc{font-size:24px;font-weight:700;line-height:1.1;margin-top:2px}
 .m{font-size:12px;margin-top:3px;opacity:.85;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;
 -webkit-box-orient:vertical;word-break:break-word}
 .x{font-size:11px;margin-top:auto;padding-top:4px;opacity:.75;white-space:nowrap}
+.v{font-size:9px;opacity:.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .idle{background:var(--idle);color:var(--idle-fg)}
 .printing{color:var(--run-fg);background:linear-gradient(to right,var(--run-fill) var(--p,0%),var(--run) var(--p,0%))}
 .paused{background:var(--pause);color:var(--pause-fg)}
@@ -197,6 +225,7 @@ a.t:active{transform:scale(.96);filter:brightness(.9)}
 @media(prefers-reduced-motion:reduce){.hold{animation:none}}
 .rm{position:absolute;top:2px;right:2px;border:0;background:none;color:inherit;font-size:16px;
 padding:4px 7px;opacity:.6;cursor:pointer}
+.up{position:absolute;top:6px;right:7px;font-size:11px;font-weight:600;opacity:.8}
 #empty{color:var(--dim);font-size:14px;line-height:1.5}
 </style></head><body>
 <header><h1>Принтеры</h1><span id="up"></span></header>
@@ -220,6 +249,7 @@ function tile(p){
  var t=el(p.online&&p.link?"a":"div","t "+st);
  if(p.online&&p.link)t.href=p.link;
  t.appendChild(el("div","n",p.name));
+ if(p.model)t.appendChild(el("div","md",p.model));
  var active=st=="printing"||st=="paused"||st=="hold";
  var pct=typeof p.progress=="number"?Math.floor(p.progress):null;
  if(st=="printing"&&p.preparing)t.appendChild(el("div","s","подготовка"));
@@ -229,7 +259,18 @@ function tile(p){
  if(st=="hold")t.appendChild(el("div","m",p.hold_msg||""));
  else if(st=="offline")t.appendChild(el("div","m",p.seen_s_ago!=null?ago(p.seen_s_ago)+" назад":""));
  else if(active)t.appendChild(el("div","m",st=="printing"&&p.time_left_s!=null?left(p.time_left_s):(p.filename||"")));
- if(p.online)t.appendChild(el("div","x",temps(p)));
+ else if(p.print_hours!=null)t.appendChild(el("div","m",Math.round(p.print_hours)+" ч печати"));
+ if(p.print_hours!=null)t.title=p.print_hours.toFixed(1)+" ч печати, печатей: "+(p.prints||0)+
+  (p.wifi_ap?"\\nWi-Fi: "+p.wifi_ap+", "+p.wifi_rssi+" dBm":"");
+ if(p.online)t.appendChild(el("div","x",temps(p)+(p.wifi_rssi!=null&&p.wifi_rssi<-75?" \u00b7 \u26a0 Wi-Fi":"")));
+ /* Which firmware: the build time tells apart flashes of the same version */
+ if(p.version){var bt=(p.build||"").split(" ");t.appendChild(el("div","v",p.version+(bt.length>2?" \u00b7 "+bt[0].slice(0,5)+" "+bt[1]:"")));
+  t.title+=(t.title?"\\n":"")+"v"+p.version+(p.build?" "+p.build:"")}
+ var badge=(p.maintenance_due?"🔧"+(p.maintenance_due>1?p.maintenance_due:"")+" ":"")+
+  (p.update_pending?"\u21bb "+p.update_pending:"");
+ if(p.online&&badge){var u=el("div","up",badge);
+  u.title=(p.maintenance_due?"Пора на обслуживание: "+p.maintenance_due+". ":"")+
+   (p.update_pending?"Обновление "+p.update_pending+" ждёт конца печати":"");t.appendChild(u)}
  if(!p.online){var b=el("button","rm","\u00d7");b.title="Убрать из списка";
   b.onclick=function(){if(confirm("Убрать "+p.name+" из списка? Плата вернётся, если снова пришлёт статус."))
    fetch("/api/v1/printers/"+p.id,{method:"DELETE"}).then(load)};t.appendChild(b)}
@@ -423,11 +464,13 @@ def make_handler(hub, printers=None, domain=""):
         protocol_version = "HTTP/1.1"
         timeout = 15
 
-        def _reply(self, status, **body):
+        def _reply(self, status, cors=False, **body):
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            if cors:
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
 
@@ -444,7 +487,8 @@ def make_handler(hub, printers=None, domain=""):
             if path == "/healthz":
                 self._reply(200, ok=True)
             elif path == "/api/v1/printers":
-                self._reply(200, ok=True, printers=printers.snapshot(domain))
+                # Read by the boards' settings pages, to offer the others to copy from
+                self._reply(200, cors=True, ok=True, printers=printers.snapshot(domain))
             elif path in ("/", "/index.html"):
                 self._send(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode())
             elif path == "/manifest.webmanifest":

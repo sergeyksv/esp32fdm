@@ -69,7 +69,13 @@ static bool try_open_device(void)
     const cdc_acm_host_device_config_t dev_config = {
         .connection_timeout_ms = 1000,
         .out_buffer_size = 512,
-        .in_buffer_size = 512,
+        /* One packet per IN transfer (0 = the endpoint's MPS). A bigger
+         * transfer completes only on a short packet, and the Kobra 2 Neo
+         * sends no zero-length packet after a full one: a reply of exactly
+         * 64 bytes ("X:38.80 Y:206.65 Z:2.95 E:210.00 Count ...\nok\n" to
+         * M114 or G28) stayed in the transfer until the printer's next reply,
+         * so G28 "never answered" (fdm05, 17.11.26) */
+        .in_buffer_size = 0,
         .event_cb = handle_device_event,
         .data_cb = handle_rx,
         .user_arg = nullptr,
@@ -179,7 +185,7 @@ extern "C" esp_err_t usb_serial_init(usb_serial_rx_cb_t rx_cb, void *rx_cb_ctx)
 
     /* Install CDC-ACM driver with new-device notification */
     const cdc_acm_host_driver_config_t acm_config = {
-        .driver_task_stack_size = 4096,
+        .driver_task_stack_size = 6144,
         .driver_task_priority = 20,
         .xCoreID = 1,
         .new_dev_cb = new_device_cb,
@@ -194,11 +200,11 @@ extern "C" esp_err_t usb_serial_init(usb_serial_rx_cb_t rx_cb, void *rx_cb_ctx)
     ESP_LOGI(TAG, "USB Host initialized (CDC-ACM + CH34x + CP210x + FT23x)");
 
     /* Start USB host library event task */
-    xTaskCreatePinnedToCore(usb_host_lib_task, "usb_host_lib", 4096,
+    xTaskCreatePinnedToCore(usb_host_lib_task, "usb_host_lib", 4096,  /* ~2.4 KB used on fdm05 */
                             nullptr, 10, nullptr, 1);
 
     /* Start device poll task */
-    xTaskCreatePinnedToCore(usb_device_poll_task, "usb_dev_poll", 4096,
+    xTaskCreatePinnedToCore(usb_device_poll_task, "usb_dev_poll", 6144,
                             nullptr, 15, nullptr, 1);
 
     return ESP_OK;

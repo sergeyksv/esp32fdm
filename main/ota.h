@@ -20,6 +20,17 @@ void ota_confirm_boot(void);
 void ota_register_httpd(httpd_handle_t server);
 
 /**
+ * Version of an update waiting for the printer to be idle, "" if none.
+ */
+void ota_get_pending(char *out, size_t size);
+
+/**
+ * Report a deferred update installed before this boot to the hub.
+ * Call after hub_client_init().
+ */
+void ota_report_update(void);
+
+/**
  * Render the firmware update section for the settings page.
  */
 void ota_render_settings(html_buf_t *p);

@@ -1,4 +1,5 @@
 #include "httpd.h"
+#include "task_util.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_memory_utils.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -17,6 +19,8 @@
 #include "sdcard.h"
 #include "sdcard_httpd.h"
 #include "printer_comm.h"
+#include "plastics.h"
+#include "printer_comm_klipper.h"
 #include "usb_serial.h"
 #include "layout.h"
 
@@ -29,6 +33,14 @@
 #include "hub_client.h"
 #include "print_page.h"
 #include "cold_pull.h"
+#include "filament.h"
+#include "maintenance.h"
+#include "settings_copy.h"
+#include "board_led.h"
+#include "nozzle_guard_ui.h"
+#include "print_checks.h"
+#include "wifi_page.h"
+#include "print_stats.h"
 
 static const char *TAG = "httpd";
 
@@ -65,7 +77,7 @@ static void capture_task(void *arg)
     }
 
     httpd_req_async_handler_complete(req);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 /* Inline SVG favicon: 3D printer hotend silhouette */
@@ -93,7 +105,7 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (xTaskCreatePinnedToCore(capture_task, "capture", 4096, async_req,
+    if (task_create_psram(capture_task, "capture", 8192, async_req,
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         return ESP_FAIL;
@@ -150,7 +162,7 @@ static void stream_task(void *arg)
 
     ESP_LOGI(TAG, "Stream client disconnected");
     httpd_req_async_handler_complete(req);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static esp_err_t stream_handler(httpd_req_t *req)
@@ -179,7 +191,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (xTaskCreatePinnedToCore(stream_task, "stream", 4096, async_req,
+    if (task_create_psram(stream_task, "stream", 8192, async_req,
                                  5, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create stream task");
         httpd_req_async_handler_complete(async_req);
@@ -209,19 +221,28 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     int32_t layer = st.current_layer;
     int32_t total_layers = st.total_layers;
 
-    /* Sync baby Z from printer when available (probe_z_offset is 0 until M290 response) */
-    if (!s_baby_z_seeded && st.probe_z_offset != 0.0f) {
+    /* Sync baby Z from printer when available (probe_z_offset is 0 until M290 response).
+     * Klipper reports its gcode offset with every poll: always take that. */
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        s_baby_z = st.probe_z_offset;
+    } else if (!s_baby_z_seeded && st.probe_z_offset != 0.0f) {
         s_baby_z = st.probe_z_offset;
         s_baby_z_seeded = true;
     }
 
-    char json[768];
+    char pending[32];
+    ota_get_pending(pending, sizeof(pending));
+    print_stats_t ps;
+    print_stats_get(&ps);
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
-        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,"
+        "\"layer\":\"%ld/%ld\",\"z\":%.2f,\"baby_z\":%.2f,\"usb\":%s,"
         "\"name\":\"%s\",\"preparing\":%s,\"hold\":%s,\"hold_id\":%lu,\"hold_msg\":\"%s\","
-        "\"z_shift\":%.2f,\"z_pending\":%.2f,\"notify\":\"%s\"}",
+        "\"z_shift\":%.2f,\"z_pending\":%.2f,\"notify\":\"%s\",\"update_pending\":\"%s\","
+        "\"print_hours\":%.1f,\"prints\":%lu,\"upload\":%d,\"fan\":%d,\"motors\":%d,\"plastic\":\"%s\",\"nozzle\":\"%s\",\"version\":\"%s\",\"build\":\"%s\"}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -240,11 +261,64 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         st.hold_msg,
         st.z_shift,
         st.z_pending,
-        hub_client_notify_status());
+        hub_client_notify_status(),
+        pending,
+        ps.print_s / 3600.0, (unsigned long)ps.started,
+        printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER ? st.upload_pct : -1,
+        (int)st.fan_pct, (int)st.motors, plastic_loaded() >= 0 ? PLASTICS[plastic_loaded()].name : "",
+        st.nozzle == NOZZLE_STANDBY ? "standby" : st.nozzle == NOZZLE_HEATING ? "heating" : "hot",
+        FW_VERSION, FW_BUILD);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json, strlen(json));
+}
+
+/* ---- GET /api/heap — memory, for diagnostics ---- */
+
+static esp_err_t api_heap_handler(httpd_req_t *req)
+{
+    char json[320];
+    snprintf(json, sizeof(json),
+             "{\"internal\":{\"free\":%u,\"largest\":%u,\"min\":%u},"
+             "\"dma\":{\"free\":%u,\"largest\":%u,\"min\":%u},"
+             "\"psram\":{\"free\":%u,\"largest\":%u},\"uptime_s\":%lld}",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+             (long long)(esp_timer_get_time() / 1000000));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_sendstr(req, json);
+}
+
+/* ---- GET /api/tasks — tasks and their stacks, for diagnostics ---- */
+
+static esp_err_t api_tasks_handler(httpd_req_t *req)
+{
+    UBaseType_t n = uxTaskGetNumberOfTasks() + 4;
+    TaskStatus_t *ts = heap_caps_malloc(n * sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
+    if (!ts) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+    n = uxTaskGetSystemState(ts, n, NULL);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "[");
+    for (UBaseType_t i = 0; i < n; i++) {
+        char row[160];
+        snprintf(row, sizeof(row), "%s{\"name\":\"%s\",\"prio\":%u,\"core\":%d,\"free_min\":%u,\"psram\":%s}",
+                 i ? "," : "", ts[i].pcTaskName, (unsigned)ts[i].uxCurrentPriority,
+                 xTaskGetCoreID(ts[i].xHandle) == tskNO_AFFINITY ? -1 : (int)xTaskGetCoreID(ts[i].xHandle),
+                 (unsigned)ts[i].usStackHighWaterMark,
+                 esp_ptr_external_ram(ts[i].pxStackBase) ? "true" : "false");
+        httpd_resp_sendstr_chunk(req, row);
+    }
+    free(ts);
+    httpd_resp_sendstr_chunk(req, "]");
+    return httpd_resp_sendstr_chunk(req, NULL);
 }
 
 /* ---- GET /api/stats — per-core CPU usage ---- */
@@ -389,6 +463,45 @@ static esp_err_t api_command_handler(httpd_req_t *req)
     return httpd_resp_send(req, "OK", 2);
 }
 
+/* ---- /api/zoffset — the board's Z offset for prints (Klipper) ---- */
+
+static esp_err_t zoffset_reply(httpd_req_t *req)
+{
+    float z;
+    bool saved = klipper_backend_get_zoffset(&z);
+    char json[64];
+    snprintf(json, sizeof(json), "{\"saved\":%s,\"z\":%.3f}", saved ? "true" : "false", saved ? z : 0.0f);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t api_zoffset_get_handler(httpd_req_t *req)
+{
+    return zoffset_reply(req);
+}
+
+/* save=1: the gcode offset Klipper has now; clear=1: forget it */
+static esp_err_t api_zoffset_post_handler(httpd_req_t *req)
+{
+    if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Klipper only");
+    char body[32] = "";
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    body[len > 0 ? len : 0] = '\0';
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (strstr(body, "save=1")) {
+        printer_state_t st;
+        printer_comm_get_state(&st);
+        if (st.opstate == PRINTER_DISCONNECTED || st.opstate == PRINTER_ERROR)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Klipper not ready");
+        err = klipper_backend_set_zoffset(true, st.probe_z_offset);
+    } else if (strstr(body, "clear=1")) {
+        err = klipper_backend_set_zoffset(false, 0);
+    }
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+    return zoffset_reply(req);
+}
+
 void httpd_note_babystep(float dz)
 {
     s_baby_z += dz;
@@ -427,11 +540,34 @@ static esp_err_t root_handler(httpd_req_t *req)
     html_buf_printf(&p,
         i18n_page(
         "<button onclick=\"zb(0.01)\">\xe2\x96\xb2 0.01</button>"
-        "<button onclick=\"zb(0.05)\">\xe2\x96\xb2 0.05</button>"
-        "<button onclick=\"gc('M500')\" style='margin-left:8px' title='" N_("Save all settings to EEPROM (M500)") "'>" N_("Save") "</button>"
-        "</div>"
-        "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc " N_("closer to the bed") " &middot; \xe2\x96\xb2 " N_("farther from the bed") " &middot; " N_("Save writes to EEPROM (M500)") "</p>"
-        "</div></details>"));
+        "<button onclick=\"zb(0.05)\">\xe2\x96\xb2 0.05</button>"));
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
+        /* No M290 and no M500 in Klipper: the gcode offset, kept until Klipper
+         * restarts.  Saved on the board, it goes into each file sent, at
+         * "; @zoffset" in the start G-code (klipper_holds.h). */
+        html_buf_printf(&p, "%s", i18n_page(
+            "<button onclick=\"zsave(1)\" style='margin-left:8px'>" N_("Save for prints") "</button>"
+            "<button onclick=\"zsave(0)\">" N_("Forget") "</button>"
+            "</div>"
+            "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc " N_("closer to the bed") " &middot; \xe2\x96\xb2 " N_("farther from the bed") "</p>"
+            "<p class='hint' style='margin:4px 0 0' id='zsv'></p>"
+            "<p class='hint' style='margin:4px 0 0'>" N_("Saved, it is put into each file the board sends, at the start G-code's ; @zoffset line. "
+            "Not saved, the printer's own offset applies: the Neptune 4's screen sets it at power-on.") "</p>"
+            "</div></details>"
+            "<script>"
+            "function zshow(j){document.getElementById('zsv').textContent=j.saved?'" N_("Saved for prints:") " '+j.z.toFixed(2)"
+            ":'" N_("Not saved: prints use the offset the printer sets") "'}"
+            "function zsave(on){fetch('/api/zoffset',{method:'POST',body:on?'save=1':'clear=1'})"
+            ".then(function(r){return r.json()}).then(zshow)}"
+            "fetch('/api/zoffset').then(function(r){return r.json()}).then(zshow);"
+            "</script>"));
+    } else {
+        html_buf_printf(&p, "%s", i18n_page(
+            "<button onclick=\"gc('M500')\" style='margin-left:8px' title='" N_("Save all settings to EEPROM (M500)") "'>" N_("Save") "</button>"
+            "</div>"
+            "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc " N_("closer to the bed") " &middot; \xe2\x96\xb2 " N_("farther from the bed") " &middot; " N_("Save writes to EEPROM (M500)") "</p>"
+            "</div></details>"));
+    }
 
     html_buf_printf(&p,
         i18n_page(
@@ -471,7 +607,9 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<button id='yp' onclick=\"jog('Y',1)\">Y+</button>"
         "<button id='zm' onclick=\"jog('Z',-1)\">Z-</button>"
         "<button id='zp' onclick=\"jog('Z',1)\">Z+</button>"
+        "<button id='z0' onclick=\"zzero()\" title='" N_("Lower the nozzle to Z0, where the Z offset puts it") "'>Z0</button>"
         "</div>"
+        "<p class='hint' style='margin:4px 0 0'>" N_("Z- stops at 0. To set the Z offset: home, Z0, then the Z offset buttons until the paper drags.") "</p>"
         "<label>" N_("Extruder") "</label><div class='bg'>"
         "<button id='er' onclick=\"extrude(-1)\">" N_("Retract") "</button>"
         "<button id='ee' onclick=\"extrude(1)\">" N_("Extrude") "</button>"
@@ -521,8 +659,12 @@ static esp_err_t root_handler(httpd_req_t *req)
         /* gc() — send GCode via /api/command */
         "function gc(c){fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(c)})}"
         "var zoff=%.2f;"
-        "function zb(d){zoff=Math.round((zoff+d)*100)/100;gc('M290 Z'+d);document.getElementById('zof').textContent=zoff.toFixed(2)}",
-        s_baby_z);
+        "function zb(d){zoff=Math.round((zoff+d)*100)/100;"
+        "gc(%s);document.getElementById('zof').textContent=zoff.toFixed(2)}",
+        s_baby_z,
+        /* Klipper: no M290; its gcode offset is what the printer's screen sets too */
+        printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER
+            ? "'SET_GCODE_OFFSET Z_ADJUST='+d+' MOVE=1'" : "'M290 Z'+d");
     html_buf_printf(&p, i18n_page(
         /* Step selector for jog */
         "var step=0.1;"
@@ -530,8 +672,14 @@ static esp_err_t root_handler(httpd_req_t *req)
         "document.getElementById(v==0.1?'s01':v==1?'s1':v==10?'s10':'s100').style.fontWeight='bold'}"
         /* Jog function — relative move */
         "var isPrinting=false;"
+        /* Z never goes below 0 from here: the status Z lags behind quick taps,
+           so the taps since the last status count too */
+        "var zt=0,zj=0;"
         "function jog(ax,dir){if(isPrinting)return;"
-        "var d=step*dir;var f=ax=='Z'?600:3000;gc('G91\\nG0 '+ax+d+' F'+f+'\\nG90')}"
+        "var d=step*dir;var f=ax=='Z'?600:3000;"
+        "if(ax=='Z'){var t=Math.round((zt+d)*100)/100;if(t<0)t=0;d=Math.round((t-zt)*100)/100;if(!d)return;zt=t;zj=Date.now()}"
+        "gc('G91\\nG0 '+ax+d+' F'+f+'\\nG90')}"
+        "function zzero(){if(isPrinting)return;zt=0;zj=Date.now();gc('G90\\nG0 Z0 F600')}"
         /* Extruder — two speed modes: normal 300mm/min, slow 60mm/min */
         "var espd=0;"
         "function setESpd(m){espd=m;document.getElementById('esn').style.fontWeight=m?'normal':'bold';"
@@ -548,7 +696,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "function u(){"
         "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
         "isPrinting=s.state=='printing'||s.state=='paused';"
-        "['xm','xp','ym','yp','zm','zp','er','ee','ha','hx','hy','hz'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=isPrinting});"
+        "['xm','xp','ym','yp','zm','zp','z0','er','ee','ha','hx','hy','hz'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=isPrinting});"
+        "if(typeof s.z==='number'&&Date.now()-zj>4000)zt=s.z;"
         "if(typeof s.baby_z==='number'){zoff=s.baby_z;document.getElementById('zof').textContent=zoff.toFixed(2)}"
         "var hi=document.getElementById('ht'),bi=document.getElementById('bt');"
         "if(hi&&document.activeElement!==hi)hi.value=s.hotend[1]>0?s.hotend[1].toFixed(0):'';"
@@ -642,6 +791,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
             "<hr><div class='sh'><h2>Marlin</h2>"
             "<button type='submit' form='f-marlin'>" N_("Save") "</button></div>"));
         printer_config_render_marlin(&p);
+    } else {
+        html_buf_printf(&p,
+            i18n_page(
+            "<hr><div class='sh'><h2>Klipper</h2>"
+            "<button type='submit' form='f-marlin'>" N_("Save") "</button></div>"));
+        printer_config_render_klipper(&p);
     }
 
     /* 3. Video (camera + streaming) */
@@ -692,9 +847,10 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     }
     obico_render_settings(&p);
 
-    if (is_marlin) {
-        hub_client_render_settings(&p);
-    }
+    hub_client_render_settings(&p);
+    print_stats_render_settings(&p);
+    board_led_render_settings(&p);
+    nozzle_guard_render_settings(&p);
 
     /* 5. External Endpoints (read-only) */
     html_buf_printf(&p,
@@ -731,6 +887,8 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     /* 7. Firmware Update (OTA) */
     ota_render_settings(&p);
 
+    settings_copy_render_settings(&p);
+
     /* 8. WiFi */
     char ssid[33] = {0};
     html_buf_printf(&p,
@@ -744,6 +902,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         html_buf_printf(&p,
             "<p>%s <b>%s</b></p>", _("Connected to:"), ssid);
     }
+    html_buf_printf(&p, "<p><a href='/wifi'>%s &rarr;</a></p>", _("Wi-Fi status and access points"));
 
     layout_html_end(&p);
 
@@ -766,11 +925,14 @@ static esp_err_t utils_page_handler(httpd_req_t *req)
         "<tr><td><a href='/bedlevel'><b>%s</b></a></td><td>%s</td></tr>",
         _("Utilities"), _("Bed Leveling"),
         _("Probe bed mesh, visualize, and calculate screw adjustments"));
-    if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER) {
-        html_buf_printf(&p,
-            "<tr><td><a href='/utils/coldpull'><b>%s</b></a></td><td>%s</td></tr>",
-            _("Cold Pull"), _("Clean the nozzle by pulling out cooled filament"));
-    }
+    html_buf_printf(&p,
+        "<tr><td><a href='/maintenance'><b>%s</b></a></td><td>%s</td></tr>",
+        _("Maintenance"), _("Jobs due by print hours or days, with reminders"));
+    html_buf_printf(&p,
+        "<tr><td><a href='/utils/filament'><b>%s</b></a></td><td>%s</td></tr>"
+        "<tr><td><a href='/utils/coldpull'><b>%s</b></a></td><td>%s</td></tr>",
+        _("Filament Change"), _("Load new filament over the old one, purging at the hotter temperature"),
+        _("Cold Pull"), _("Clean the nozzle by pulling out cooled filament"));
     html_buf_printf(&p, "</table>");
     layout_html_end(&p);
 
@@ -1063,7 +1225,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 64;
+    config.max_uri_handlers = 104;
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1123,12 +1285,39 @@ esp_err_t httpd_start_server(void)
     };
     HTTPD_REGISTER(server, &api_temp_history);
 
+    httpd_uri_t api_heap = {
+        .uri      = "/api/heap",
+        .method   = HTTP_GET,
+        .handler  = api_heap_handler,
+    };
+    HTTPD_REGISTER(server, &api_heap);
+
+    httpd_uri_t api_tasks = {
+        .uri      = "/api/tasks",
+        .method   = HTTP_GET,
+        .handler  = api_tasks_handler,
+    };
+    HTTPD_REGISTER(server, &api_tasks);
+
     httpd_uri_t api_command = {
         .uri      = "/api/command",
         .method   = HTTP_POST,
         .handler  = api_command_handler,
     };
     HTTPD_REGISTER(server, &api_command);
+
+    httpd_uri_t api_zoffset_get = {
+        .uri      = "/api/zoffset",
+        .method   = HTTP_GET,
+        .handler  = api_zoffset_get_handler,
+    };
+    HTTPD_REGISTER(server, &api_zoffset_get);
+    httpd_uri_t api_zoffset_post = {
+        .uri      = "/api/zoffset",
+        .method   = HTTP_POST,
+        .handler  = api_zoffset_post_handler,
+    };
+    HTTPD_REGISTER(server, &api_zoffset_post);
 
     httpd_uri_t camera_page = {
         .uri      = "/camera",
@@ -1182,11 +1371,17 @@ esp_err_t httpd_start_server(void)
     sdcard_httpd_register(server);
 
     terminal_register_httpd(server);
-    if (printer_comm_get_backend() != PRINTER_BACKEND_KLIPPER) {
-        bedlevel_register_httpd(server);
-        cold_pull_register_httpd(server);
-    }
+    bedlevel_register_httpd(server);
+    cold_pull_register_httpd(server);
+    filament_register_httpd(server);
     logbuf_register_httpd(server);
+    print_stats_register_httpd(server);
+    maintenance_register_httpd(server);
+    settings_copy_register_httpd(server);
+    board_led_register_httpd(server);
+    nozzle_guard_register_httpd(server);
+    print_checks_register_httpd(server);
+    wifi_page_register_httpd(server);
     obico_register_httpd(server);
     printer_config_register_httpd(server);
     ota_register_httpd(server);

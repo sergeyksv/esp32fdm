@@ -1,4 +1,9 @@
 #include "printer_comm.h"
+#include "print_checks.h"
+#include "task_util.h"
+
+#include "cJSON.h"
+#include <ctype.h>
 #include "printer_comm_klipper.h"
 #include "httpd.h"
 
@@ -60,6 +65,7 @@ static bool              s_sync_cmd_pending;
 #define NVS_KEY_PAUSE_CMD       "pause_cmd"
 #define NVS_KEY_FILAMENT_CHK    "fil_chk"
 #define NVS_KEY_ECHO_PING       "echo_ping"
+#define NVS_KEY_HOLD_BEEP       "hold_beep"
 
 /* ---- Backend config ---- */
 
@@ -73,7 +79,32 @@ static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
 static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
 static bool s_filament_check = false;  /* Poll M119 for filament runout during host print */
+static uint16_t s_hold_beep_s = 10;     /* Beeps repeat while waiting for the user; 0 = once */
 static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
+/* The printer task reads the list for every line it sends, while a settings
+ * form or a settings copy may rewrite it: copied in and out under this lock */
+static portMUX_TYPE s_echo_ping_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void get_echo_ping(char *out, size_t size)
+{
+    taskENTER_CRITICAL(&s_echo_ping_lock);
+    strlcpy(out, s_echo_ping_cmds, size);
+    taskEXIT_CRITICAL(&s_echo_ping_lock);
+}
+
+/** Only what a list of G-code names needs: it goes into an HTML attribute */
+static void set_echo_ping(const char *cmds)
+{
+    char clean[sizeof(s_echo_ping_cmds)];
+    size_t n = 0;
+    for (const char *p = cmds; *p && n < sizeof(clean) - 1; p++) {
+        if (isalnum((unsigned char)*p) || *p == ' ' || *p == ',') clean[n++] = *p;
+    }
+    clean[n] = '\0';
+    taskENTER_CRITICAL(&s_echo_ping_lock);
+    strlcpy(s_echo_ping_cmds, clean, sizeof(s_echo_ping_cmds));
+    taskEXIT_CRITICAL(&s_echo_ping_lock);
+}
 
 /* ---- Temperature history circular buffer ---- */
 
@@ -112,8 +143,11 @@ static int64_t s_last_m114_us;
 static int64_t s_last_m119_us;
 static bool s_filament_sensor_present;  /* true once M119 reports a filament: line */
 
-/* One-shot M290 query on connect */
-static bool s_m290_queried;
+/* M290 (the probe Z offset): on connect, then every minute while idle, since a
+ * bed calibration from the printer's screen changes it (print_checks.c) */
+#define POLL_M290_INTERVAL_MS   60000
+static volatile bool s_m290_queried;
+static int64_t s_last_m290_us;
 
 /* Print start time tracking */
 static int64_t s_print_start_us;
@@ -123,6 +157,10 @@ static bool s_have_m73;        /* true once we've seen M73 — prefer slicer pro
 /* Cooldown after pause/resume/cancel — let firmware settle */
 int64_t s_cmd_cooldown_until_us;
 
+/* A command from the terminal, the bed probe or a page: a G29 takes minutes */
+static volatile bool s_user_cmd_running;
+static volatile int64_t s_user_cmd_done_us;
+
 /* Unsupported command tracking — commands that Marlin reports as unknown.
  * Store just the numeric code (e.g. 73 for M73, 900 for M900). */
 uint16_t s_unsupported_cmds[UNSUPPORTED_CMD_MAX];
@@ -131,16 +169,16 @@ int s_unsupported_count;
 /** Check if a GCode command matches one of the echo-ping prefixes. */
 static bool needs_echo_ping(const char *gcode)
 {
-    if (s_echo_ping_cmds[0] == '\0') return false;
+    char buf[sizeof(s_echo_ping_cmds)];
+    get_echo_ping(buf, sizeof(buf));
+    if (buf[0] == '\0') return false;
     const char *cmd = gcode;
     if ((cmd[0] == 'N' || cmd[0] == 'n') && cmd[1] >= '0' && cmd[1] <= '9') {
         const char *sp = strchr(cmd, ' ');
         if (sp) cmd = sp + 1;
     }
-    char buf[128];
-    strncpy(buf, s_echo_ping_cmds, sizeof(buf));
-    buf[sizeof(buf) - 1] = '\0';
-    char *tok = strtok(buf, ", ");
+    char *save;
+    char *tok = strtok_r(buf, ", ", &save);
     while (tok) {
         while (*tok == ' ') tok++;
         size_t tlen = strlen(tok);
@@ -148,7 +186,7 @@ static bool needs_echo_ping(const char *gcode)
             char next = cmd[tlen];
             if (next == '\0' || next == ' ' || next == '*') return true;
         }
-        tok = strtok(NULL, ", ");
+        tok = strtok_r(NULL, ", ", &save);
     }
     return false;
 }
@@ -329,7 +367,7 @@ static void parse_m119(const char *line)
         /* Filament runout detected */
         if (hp_is_active() && !hp_is_paused()) {
             ESP_LOGW(TAG, "Filament runout detected via M119 — pausing host print");
-            printer_cmd_t cmd = { .type = PCMD_PAUSE };
+            printer_cmd_t cmd = { .type = PCMD_PAUSE, .runout = true };
             xQueueSend(s_cmd_queue, &cmd, 0);
         }
     }
@@ -367,8 +405,12 @@ static void process_line(const char *line)
         float z = strtof(poff + 14, NULL);
         xSemaphoreTake(g_state_mutex, portMAX_DELAY);
         g_state.probe_z_offset = z;
+        /* M290 Z<d> answers with the offset too: Z taps in a print */
+        bool busy = hp_is_active() || g_state.opstate == PRINTER_PRINTING ||
+                    g_state.opstate == PRINTER_PAUSED;
         xSemaphoreGive(g_state_mutex);
         ESP_LOGI(TAG, "Probe Z offset: %.2f", z);
+        print_checks_z_seen(z, busy);
     }
 
     /* Detect unsupported commands: echo:Unknown command: "M73 P15 R21" */
@@ -473,7 +515,7 @@ static void process_line(const char *line)
         if (strcmp(action, "pause") == 0 || strcmp(action, "out_of_filament") == 0) {
             if (hp_is_active() && !hp_is_paused()) {
                 ESP_LOGW(TAG, "Printer requested pause: %s", action);
-                printer_cmd_t cmd = { .type = PCMD_PAUSE };
+                printer_cmd_t cmd = { .type = PCMD_PAUSE, .runout = action[0] == 'o' };
                 xQueueSend(s_cmd_queue, &cmd, 0);
             }
         } else if (strcmp(action, "resume") == 0) {
@@ -673,6 +715,7 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     int64_t deadline = start_us + timeout_ms * 1000LL;
     int stall_pings = 0;
     uint8_t rx_byte;
+    bool saw_busy = false;
 
     while (s_pending_query != QUERY_NONE) {
         /* Bail immediately if USB was unplugged while waiting */
@@ -718,9 +761,9 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                  * For all commands, extend deadline since printer is alive. */
                 if (s_pending_query == QUERY_NONE
                     && esp_timer_get_time() < s_cmd_cooldown_until_us) {
-                    if (wait) {
-                        s_pending_query = qtype;
-                    }
+                    /* The printer is busy with this command: its ok is still to come */
+                    s_pending_query = qtype;
+                    saw_busy = true;
                     int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
                     deadline = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
                 }
@@ -736,6 +779,8 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
         }
     }
 
+    /* Its ok came after a busy: the printer is ready for the next command */
+    if (saw_busy) s_cmd_cooldown_until_us = 0;
     return true;
 }
 
@@ -790,7 +835,7 @@ static void printer_comm_task(void *arg)
             } else if (cmd.type == PCMD_HOST_SCRIPT) {
                 hp_cmd_start_script(cmd.gcode); continue;
             } else if (cmd.type == PCMD_HOST_PAUSE) {
-                hp_cmd_pause(); continue;
+                hp_cmd_pause(false, false); continue;
             } else if (cmd.type == PCMD_HOST_RESUME) {
                 hp_cmd_resume(); continue;
             } else if (cmd.type == PCMD_HOST_CANCEL) {
@@ -801,7 +846,7 @@ static void printer_comm_task(void *arg)
 
             /* Route pause/resume/cancel to host print if active */
             if (hp_is_active()) {
-                if (cmd.type == PCMD_PAUSE) { hp_cmd_pause(); continue; }
+                if (cmd.type == PCMD_PAUSE) { hp_cmd_pause(cmd.standby, cmd.runout); continue; }
                 if (cmd.type == PCMD_RESUME) { hp_cmd_resume(); continue; }
                 if (cmd.type == PCMD_CANCEL) { hp_cmd_cancel(); continue; }
             }
@@ -819,7 +864,10 @@ static void printer_comm_task(void *arg)
             }
             if (gcode) {
                 ESP_LOGI(TAG, "Sending command: %s", gcode);
+                s_user_cmd_running = true;
                 marlin_send_cmd(gcode, QUERY_CMD);
+                s_user_cmd_done_us = esp_timer_get_time();
+                s_user_cmd_running = false;
 
                 /* Notify synchronous caller if waiting */
                 if (cmd.type == PCMD_RAW && s_sync_cmd_pending) {
@@ -872,10 +920,12 @@ static void printer_comm_task(void *arg)
             goto poll_done;
         }
 
-        /* Query M290 once on connect to get current probe Z offset */
-        if (!s_m290_queried) {
+        /* M290: the probe Z offset, on connect, when asked and every minute */
+        now = esp_timer_get_time();
+        if (!s_m290_queried || now - s_last_m290_us >= POLL_M290_INTERVAL_MS * 1000LL) {
             s_m290_queried = true;
             marlin_send_cmd("M290", QUERY_CMD);
+            s_last_m290_us = esp_timer_get_time();
             CHECK_COOLDOWN();
         }
 
@@ -954,6 +1004,8 @@ static void load_config_from_nvs(void)
     if (nvs_get_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds, &ping_len) != ESP_OK) {
         s_echo_ping_cmds[0] = '\0';
     }
+
+    nvs_get_u16(nvs, NVS_KEY_HOLD_BEEP, &s_hold_beep_s);
 
     nvs_close(nvs);
 
@@ -1059,9 +1111,24 @@ void printer_comm_set_simulate(bool enable)
     }
 }
 
+bool printer_comm_user_cmd_running(void)
+{
+    return s_user_cmd_running;
+}
+
+int64_t printer_comm_last_user_cmd_us(void)
+{
+    return s_user_cmd_running ? esp_timer_get_time() : s_user_cmd_done_us;
+}
+
 bool printer_comm_is_simulating(void)
 {
     return s_simulate;
+}
+
+void printer_comm_query_probe_offset(void)
+{
+    s_m290_queried = false;
 }
 
 esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)
@@ -1140,9 +1207,12 @@ esp_err_t printer_comm_init(void)
     g_state.print_time_s = -1;
     g_state.print_time_left_s = -1;
     g_state.total_layers = -1;
+    g_state.fan_pct = -1;
+    g_state.motors = -1;
 
-    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 6144,
-                            NULL, 8, NULL, 1);  /* Core 1: with USB host, isolated from WiFi/HTTP */
+    /* Core 1: with USB host, isolated from WiFi/HTTP. Stack in PSRAM: the
+     * serial line is ~11 KB/s, and the USB driver copies what it sends */
+    task_create_psram(printer_comm_task, "printer_comm", 12288, NULL, 8, NULL, 1);
 
     ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
     return ESP_OK;
@@ -1151,12 +1221,25 @@ esp_err_t printer_comm_init(void)
 /* ---- Host print public API ---- */
 
 esp_err_t printer_comm_host_print_start(const char *filename) { return hp_start(filename); }
-esp_err_t printer_comm_host_print_script(const char *name, char *script) { return hp_start_script(name, script); }
+esp_err_t printer_comm_host_print_script(const char *name, char *script,
+                                         host_script_done_t done, int done_arg)
+{
+    if (s_backend == PRINTER_BACKEND_KLIPPER) return klipper_backend_print_script(name, script, done, done_arg);
+    return hp_start_script(name, script, done, done_arg);
+}
 esp_err_t printer_comm_host_print_pause(void)  { return hp_pause(); }
 esp_err_t printer_comm_host_print_resume(void) { return hp_resume(); }
 esp_err_t printer_comm_host_print_cancel(void) { return hp_cancel(); }
-esp_err_t printer_comm_host_print_continue(uint32_t hold_id) { return hp_continue(hold_id); }
-esp_err_t printer_comm_host_print_zstep(float dz) { return hp_zstep(dz); }
+esp_err_t printer_comm_host_print_continue(uint32_t hold_id)
+{
+    if (s_backend == PRINTER_BACKEND_KLIPPER) return klipper_backend_continue(hold_id);
+    return hp_continue(hold_id);
+}
+esp_err_t printer_comm_host_print_zstep(float dz)
+{
+    if (s_backend == PRINTER_BACKEND_KLIPPER) return klipper_backend_zstep(dz);
+    return hp_zstep(dz);
+}
 bool printer_comm_is_host_printing(void) { return hp_is_active(); }
 
 void printer_comm_set_polling_suppressed(bool suppress)
@@ -1272,11 +1355,38 @@ void printer_config_render_backend(html_buf_t *p)
         checked_marlin, checked_klipper, s_mr_host, s_mr_port);
 }
 
+/* Shared by the Marlin and the Klipper forms */
+static const char BEEP_FIELD[] =
+        "<div style='margin:10px 0'>"
+        "<label style='display:block;margin:8px 0 4px'><b>" N_("Beep while waiting for you") "</b></label>"
+        "<select name='hold_beep' style='padding:6px'>"
+        "<option value='0'%s>" N_("Once") "</option>"
+        "<option value='10'%s>" N_("Every 10 s") "</option>"
+        "<option value='15'%s>" N_("Every 15 s") "</option>"
+        "<option value='30'%s>" N_("Every 30 s") "</option>"
+        "<option value='60'%s>" N_("Every minute") "</option>"
+        "<option value='120'%s>" N_("Every 2 minutes") "</option></select>"
+        "<p style='margin:4px 0;font-size:13px;color:#666'>"
+        N_("When a print stops for you (M0, @pause, cold pull, filament change): three beeps, repeated "
+           "for the first 10 minutes, then every 5 minutes, and every 15 s in the last minute "
+           "before the print is cancelled.") "</p>"
+        "</div>";
+
+static void render_beep_field(html_buf_t *p)
+{
+    html_buf_printf(p, i18n_page(BEEP_FIELD),
+        s_hold_beep_s == 0 ? " selected" : "", s_hold_beep_s == 10 ? " selected" : "",
+        s_hold_beep_s == 15 ? " selected" : "", s_hold_beep_s == 30 ? " selected" : "",
+        s_hold_beep_s == 60 ? " selected" : "", s_hold_beep_s == 120 ? " selected" : "");
+}
+
 void printer_config_render_marlin(html_buf_t *p)
 {
     const char *checked_m25  = (s_pause_cmd == PAUSE_CMD_M25)  ? "checked" : "";
     const char *checked_m524 = (s_pause_cmd == PAUSE_CMD_M524) ? "checked" : "";
     const char *checked_fil  = s_filament_check ? "checked" : "";
+    char ping[sizeof(s_echo_ping_cmds)];
+    get_echo_ping(ping, sizeof(ping));
 
     html_buf_printf(p,
         i18n_page(
@@ -1289,7 +1399,11 @@ void printer_config_render_marlin(html_buf_t *p)
         "<div style='margin:10px 0'>"
         "<label style='display:block;margin:8px 0 4px'><b>" N_("Filament Sensor") "</b></label>"
         "<label style='display:block;margin:8px 0 4px'><input type='checkbox' name='filament_chk' value='1' %s> " N_("Poll filament sensor (M119) during host print") " &mdash; " N_("auto-pause on runout") "</label>"
-        "</div>"
+        "</div>"),
+        checked_m25, checked_m524, checked_fil);
+    render_beep_field(p);
+    html_buf_printf(p,
+        i18n_page(
         "<div style='margin:10px 0'>"
         "<label style='display:block;margin:8px 0 4px'><b>CDC Echo Ping</b></label>"
         "<p style='margin:4px 0;font-size:13px;color:#666'>"
@@ -1300,7 +1414,25 @@ void printer_config_render_marlin(html_buf_t *p)
         " style='width:100%%;padding:6px;font-family:monospace'>"
         "</div>"
         "</form>"),
-        checked_m25, checked_m524, checked_fil, s_echo_ping_cmds);
+        ping);
+}
+
+void printer_config_render_klipper(html_buf_t *p)
+{
+    /* The same form as Marlin's, so the Marlin options it does not show go
+     * along unchanged (they are copied between boards with the beep) */
+    char ping[sizeof(s_echo_ping_cmds)];
+    get_echo_ping(ping, sizeof(ping));
+    html_buf_printf(p,
+        "<form id='f-marlin' method='POST' action='/printer/config/marlin'>"
+        "<input type='hidden' name='pause_cmd' value='%s'>"
+        "%s"
+        "<input type='hidden' name='echo_ping' value='%s'>",
+        s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
+        s_filament_check ? "<input type='hidden' name='filament_chk' value='1'>" : "",
+        ping);
+    render_beep_field(p);
+    html_buf_printf(p, "</form>");
 }
 
 static esp_err_t printer_config_get_handler(httpd_req_t *req)
@@ -1377,6 +1509,74 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void save_marlin_options(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)s_pause_cmd);
+        nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, s_filament_check ? 1 : 0);
+        char ping[sizeof(s_echo_ping_cmds)];
+        get_echo_ping(ping, sizeof(ping));
+        nvs_set_str(nvs, NVS_KEY_ECHO_PING, ping);
+        nvs_set_u16(nvs, NVS_KEY_HOLD_BEEP, s_hold_beep_s);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+/** Only the choices the form offers */
+static uint16_t valid_hold_beep(int s)
+{
+    return s == 0 || s == 10 || s == 15 || s == 30 || s == 60 || s == 120 ? s : 10;
+}
+
+uint16_t printer_comm_hold_beep_s(void)
+{
+    return s_hold_beep_s;
+}
+
+#define HOLD_BEEP_OFTEN_US  (10 * 60 * 1000000LL)   /* Repeat at the chosen interval this long */
+#define HOLD_BEEP_LATER_US  (5 * 60 * 1000000LL)    /* ...then at least this far apart */
+#define HOLD_BEEP_LAST_US   (60 * 1000000LL)        /* The last minute before the timeout... */
+#define HOLD_BEEP_URGENT_US (15 * 1000000LL)        /* ...beeps this often */
+
+int64_t printer_comm_next_beep_series(int64_t now, int64_t hold_since_us)
+{
+    int64_t every = s_hold_beep_s * 1000000LL;
+    if (!every) return 0;
+    int64_t elapsed = now - hold_since_us;
+    int64_t left = CONFIG_HOLD_TIMEOUT_MIN * 60 * 1000000LL - elapsed;
+    if (left <= HOLD_BEEP_LAST_US) return now + HOLD_BEEP_URGENT_US;
+    if (elapsed >= HOLD_BEEP_OFTEN_US && every < HOLD_BEEP_LATER_US) every = HOLD_BEEP_LATER_US;
+    /* Do not sleep past the start of the last minute */
+    if (left - every < HOLD_BEEP_LAST_US) return now + (left - HOLD_BEEP_LAST_US);
+    return now + every;
+}
+
+void printer_comm_settings_export(cJSON *obj)
+{
+    cJSON_AddNumberToObject(obj, "hold_beep_s", s_hold_beep_s);
+    cJSON_AddStringToObject(obj, "pause_cmd", s_pause_cmd == PAUSE_CMD_M524 ? "M524" : "M25");
+    cJSON_AddBoolToObject(obj, "filament_check", s_filament_check);
+    char ping[sizeof(s_echo_ping_cmds)];
+    get_echo_ping(ping, sizeof(ping));
+    cJSON_AddStringToObject(obj, "echo_ping", ping);
+}
+
+void printer_comm_settings_import(const cJSON *obj)
+{
+    const cJSON *v;
+    if ((v = cJSON_GetObjectItem(obj, "pause_cmd")) && cJSON_IsString(v))
+        s_pause_cmd = strcmp(v->valuestring, "M524") == 0 ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
+    if ((v = cJSON_GetObjectItem(obj, "filament_check")) && cJSON_IsBool(v))
+        s_filament_check = cJSON_IsTrue(v);
+    if ((v = cJSON_GetObjectItem(obj, "hold_beep_s")) && cJSON_IsNumber(v))
+        s_hold_beep_s = valid_hold_beep(v->valueint);
+    if ((v = cJSON_GetObjectItem(obj, "echo_ping")) && cJSON_IsString(v))
+        set_echo_ping(v->valuestring);
+    save_marlin_options();
+}
+
 static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
 {
     char body[256];
@@ -1406,18 +1606,12 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
         size_t plen = strlen(new_ping);
         while (plen > 0 && new_ping[plen-1] == ' ') new_ping[--plen] = '\0';
     }
-    strncpy(s_echo_ping_cmds, new_ping, sizeof(s_echo_ping_cmds));
-    s_echo_ping_cmds[sizeof(s_echo_ping_cmds) - 1] = '\0';
+    set_echo_ping(new_ping);
 
-    /* Persist to NVS */
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)new_cmd);
-        nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, new_fil_chk ? 1 : 0);
-        nvs_set_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
+    int beep;
+    if (form_int(body, "hold_beep", &beep)) s_hold_beep_s = valid_hold_beep(beep);
+
+    save_marlin_options();
 
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/settings");

@@ -1,8 +1,10 @@
 #include "marlin_proto.h"
+#include "task_util.h"
 #include "gcode_scan.h"
 #include "gcode_wait.h"
 #include "httpd.h"
 #include "hub_client.h"
+#include "nozzle_guard.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -15,6 +17,11 @@
 #include <string.h>
 
 static const char *TAG = "host_print";
+
+/* Waiting for the user: a series of beeps, repeated (see printer_comm_next_beep_series) */
+#define HOLD_BEEP_GCODE     "M300 S2000 P150"
+#define HOLD_BEEPS          3
+#define HOLD_BEEP_GAP_US    600000LL            /* Between beeps: the printer drops overlapping ones */
 
 /* ---- Constants ---- */
 
@@ -29,7 +36,6 @@ static const char *TAG = "host_print";
 
 /* Wait for user (M0/M1 in the file) */
 #define HOLD_SEND_ATTEMPTS    15     /* M400 can outlast several busy: cooldowns */
-#define Z_SHIFT_LIMIT_CU      100    /* 1 mm: total manual Z shift allowed per print */
 
 /* ---- Host print state ---- */
 
@@ -41,6 +47,9 @@ typedef struct {
     bool holding;
     uint32_t hold_id;
     int64_t hold_since_us;
+    int beeps_left;             /* Of the series being played */
+    int64_t next_beep_us;
+    int64_t next_series_us;     /* 0 = no more series */
 
     /* Manual Z, in hundredths of a mm so that taps add up exactly.
      * Both are guarded by g_state_mutex: taps arrive from HTTP handlers. */
@@ -50,6 +59,8 @@ typedef struct {
     /* File I/O */
     FILE *file;
     char *script;       /* Built-in script the file reads from (fmemopen), or NULL */
+    host_script_done_t done;    /* Told how the script ended */
+    int done_arg;
     char filename[64];
     int32_t lines_sent, total_lines;
 
@@ -78,6 +89,15 @@ typedef struct {
 
     /* Park position */
     float park_x, park_y, park_z;
+
+    /* The extruder as the file leaves it, so the guard's own E moves can put
+     * it back: relative (M83/G91) or absolute (M82/G90), and the position */
+    bool e_rel;
+    float last_e;
+
+    /* Nozzle guard in a wait or a pause from Obico (nozzle_guard.h) */
+    ng_hold_t ng;
+    int64_t ng_next_us;         /* Checked once a second: the plastic is in NVS */
 } hp_ctx_t;
 
 static hp_ctx_t s_hp;
@@ -272,8 +292,10 @@ static void host_print_unpark(void)
     marlin_send_cmd("G91", QUERY_CMD);            /* Relative positioning */
     snprintf(buf, sizeof(buf), "G1 E%.1f F2400", PARK_RETRACT);
     marlin_send_cmd(buf, QUERY_CMD);              /* Prime filament */
-    marlin_send_cmd("G90", QUERY_CMD);            /* Absolute positioning */
-    marlin_send_cmd("M83", QUERY_CMD);            /* Extruder relative (most slicers use this) */
+    marlin_send_cmd("G90", QUERY_CMD);            /* Absolute positioning, E too */
+    /* The extruder as the file had it: G91/G90 above changed its mode, and the
+     * retract and prime cancel out, so the position is the file's */
+    marlin_send_cmd(s_hp.e_rel ? "M83" : "M82", QUERY_CMD);
 }
 
 /* Identifies the current print, guarded by g_state_mutex.  A scan that finishes
@@ -301,10 +323,132 @@ static bool hold_send(const char *gcode)
     return false;
 }
 
+/** Follow the extruder's mode and position through the lines sent */
+static void track_e(const char *line)
+{
+    char c = line[0] & ~0x20;
+    if (c != 'G' && c != 'M') return;
+    int code = atoi(line + 1);
+    if (c == 'M') {
+        if (code == 82) s_hp.e_rel = false;
+        else if (code == 83) s_hp.e_rel = true;
+        return;
+    }
+    if (code == 90) { s_hp.e_rel = false; return; }    /* Marlin: E with the other axes */
+    if (code == 91) { s_hp.e_rel = true; return; }
+    if (code != 0 && code != 1 && code != 92) return;
+    const char *e = NULL;
+    bool any = false;
+    for (const char *p = line + 1; *p; p++) {
+        char u = *p & ~0x20;
+        if (u < 'A' || u > 'Z') continue;
+        any = true;
+        if (u == 'E') { e = p; break; }
+    }
+    if (code == 92 && !any) { s_hp.last_e = 0; return; }   /* Plain G92: every axis to 0 */
+    if (!e) return;
+    float v = strtof(e + 1, NULL);
+    if (code == 92 || !s_hp.e_rel) s_hp.last_e = v;
+    else s_hp.last_e += v;
+}
+
+/** Put the extruder's mode and position back as the file expects them */
+static void restore_e(void)
+{
+    if (s_hp.e_rel) {
+        hold_send("M83");
+        return;
+    }
+    char cmd[32];
+    hold_send("M82");
+    snprintf(cmd, sizeof(cmd), "G92 E%.5f", s_hp.last_e);
+    hold_send(cmd);
+}
+
+/** Push out (or with mm < 0 pull back) filament outside the file, then put
+ *  the extruder back.  Returns false if the move was surely not sent. */
+static bool guard_extrude(float mm, int feed)
+{
+    if (!hold_send("M83")) return false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "G1 E%.2f F%d", mm, feed);
+    bool maybe = marlin_send_cmd(cmd, QUERY_CMD) ||
+                 (marlin_is_connected() && esp_timer_get_time() >= s_cmd_cooldown_until_us);
+    restore_e();
+    return maybe;
+}
+
+static void set_nozzle_state(int8_t v)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.nozzle = v;
+    xSemaphoreGive(g_state_mutex);
+}
+
+static int hotend_target_c(void)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    float t = g_state.hotend_target;
+    xSemaphoreGive(g_state_mutex);
+    return (int)(t + 0.5f);
+}
+
+/** The guard in a wait: purge before the first layer, then standby.  Also
+ *  in a pause for a runout (ng active, not holding): standby only. */
+static void guard_tick(void)
+{
+    if (!s_hp.paused || !s_hp.ng.active || s_hp.ng.standby) return;
+    int64_t now = esp_timer_get_time();
+    if (now < s_hp.ng_next_us) return;
+    s_hp.ng_next_us = now + 1000000;
+    /* Sending drains RX: the same rules as for the Z taps */
+    if (!marlin_is_connected() || now < s_cmd_cooldown_until_us || s_hp.has_pending) return;
+
+    ng_config_t c;
+    ng_config_get(&c);
+    int target = hotend_target_c();
+    int sb = ng_standby_c(target);
+    ng_action_t a = ng_hold_step(&c, &s_hp.ng, now, sb);
+    if (a == NG_ACT_PURGE) {
+        ESP_LOGI(TAG, "Wait: purging %u mm", c.purge_mm);
+        guard_extrude(c.purge_mm, 180);
+        s_hp.ng.last_purge_us = esp_timer_get_time();
+    } else if (a == NG_ACT_STANDBY) {
+        ESP_LOGI(TAG, "Wait: nozzle %d -> %d C", target, sb);
+        /* A pause has parked and retracted already */
+        s_hp.ng.retracted = s_hp.holding && guard_extrude(-NG_RETRACT_MM, 1800);
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "M104 S%d", sb);
+        hold_send(cmd);
+        s_hp.ng.standby = true;
+        s_hp.ng.restore_c = target;
+        set_nozzle_state(NOZZLE_STANDBY);
+        ng_notify_standby(target, sb, s_hp.filename);
+    }
+}
+
+/** Before going on: heat back to the print temperature and wait for it,
+ *  then push back what the standby retract pulled */
+static void guard_reheat(void)
+{
+    if (s_hp.ng.standby && s_hp.ng.restore_c > 0) {
+        set_nozzle_state(NOZZLE_HEATING);
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "M109 S%d", s_hp.ng.restore_c);
+        ESP_LOGI(TAG, "Heating back: %s", cmd);
+        hold_send(cmd);
+        if (s_hp.ng.retracted) guard_extrude(NG_RETRACT_MM, 1800);
+    }
+    ng_hold_end(&s_hp.ng);
+    set_nozzle_state(NOZZLE_HOT);
+}
+
 /** Clear hold state.  Caller restores the stepper timeout. */
 static void hold_clear(void)
 {
     s_hp.holding = false;
+    s_hp.beeps_left = 0;
+    s_hp.next_series_us = 0;
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.holding = false;
     g_state.hold_msg[0] = '\0';
@@ -332,11 +476,20 @@ static void hold_begin(const char *msg)
     hold_send(lcd_msg);
 
     hold_send("M400");                 /* The head has stopped from here on */
-    hold_send("M300 S1000 P500");      /* Ignored if the printer has no beeper */
+    s_hp.beeps_left = HOLD_BEEPS;      /* hp_tick() plays them */
+    s_hp.next_beep_us = 0;
+    s_hp.next_series_us = 0;
 
     s_hp.holding = true;
     s_hp.hold_id = ++s_hold_counter;
     s_hp.hold_since_us = esp_timer_get_time();
+
+    /* Before the first layer: no layer marker yet in a file that has them */
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    bool before_layers = !s_hp.has_layer_comments && !g_state.preparing && g_state.total_layers > 0;
+    xSemaphoreGive(g_state_mutex);
+    ng_hold_begin(&s_hp.ng, s_hp.hold_since_us, before_layers);
+    s_hp.ng_next_us = 0;
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.opstate = PRINTER_PAUSED;
@@ -363,6 +516,8 @@ static void host_print_finish(bool cancelled)
 
     if (s_hp.holding)
         hold_clear();
+    ng_hold_end(&s_hp.ng);
+    set_nozzle_state(NOZZLE_HOT);
 
     if (connected) {
         /* Reset Marlin's line counter so it stops expecting numbered lines.
@@ -414,6 +569,8 @@ static void host_print_finish(bool cancelled)
     g_state.print_time_s = -1;
     g_state.print_time_left_s = -1;
     g_state.host_printing = false;
+    g_state.builtin_script = false;
+    g_state.last_host_completed = !cancelled;
     g_state.current_layer = 0;
     g_state.filename[0] = '\0';
     s_hp.z_shift_cu = 0;
@@ -423,6 +580,10 @@ static void host_print_finish(bool cancelled)
     g_state.preparing = false;
     s_scan_gen++;
     xSemaphoreGive(g_state_mutex);
+
+    host_script_done_t done = s_hp.done;
+    s_hp.done = NULL;
+    if (done) done(!cancelled, s_hp.done_arg);
 }
 
 /* ---- Whole-file scan, next to the running print ---- */
@@ -462,7 +623,7 @@ static void scan_task(void *arg)
     xSemaphoreGive(g_state_mutex);
 
     free(job);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static void scan_start(const char *path, uint32_t gen)
@@ -472,7 +633,7 @@ static void scan_start(const char *path, uint32_t gen)
         strlcpy(job->path, path, sizeof(job->path));
         job->gen = gen;
         /* Lowest priority: the print must not wait for this */
-        if (xTaskCreatePinnedToCore(scan_task, "gcode_scan", 6144, job, 1, NULL, 0) == pdPASS) {
+        if (task_create_psram(scan_task, "gcode_scan", 8192, job, 1, NULL, 0) == pdPASS) {
             return;
         }
         free(job);
@@ -493,6 +654,7 @@ static void start_common(FILE *f, char *script, const char *filename, const char
 
     s_hp.file = f;
     s_hp.script = script;
+    s_hp.done = NULL;
     s_hp.printing = true;
     s_hp.paused = false;
     s_hp.holding = false;
@@ -500,6 +662,9 @@ static void start_common(FILE *f, char *script, const char *filename, const char
     s_hp.total_lines = 0;       /* Unknown until the scan finishes */
     s_hp.layer = 0;
     s_hp.has_layer_comments = false;
+    s_hp.e_rel = false;         /* Marlin's default; files set it in their start */
+    s_hp.last_e = 0;
+    ng_hold_end(&s_hp.ng);
     s_hp.start_us = esp_timer_get_time();
     s_hp.pause_elapsed_us = 0;
     s_hp.has_pending = false;
@@ -535,6 +700,7 @@ static void start_common(FILE *f, char *script, const char *filename, const char
     g_state.print_time_s = 0;
     g_state.print_time_left_s = -1;
     g_state.host_printing = true;
+    g_state.builtin_script = script != NULL;
     g_state.current_layer = 0;
     g_state.holding = false;
     g_state.hold_msg[0] = '\0';
@@ -596,13 +762,17 @@ void hp_cmd_start(const char *filename)
 
 /* A built-in script handed over by hp_start_script(), waiting for the comm task */
 static char *s_script_pending;
+static host_script_done_t s_done_pending;
+static int s_done_arg_pending;
 static portMUX_TYPE s_script_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static char *take_pending_script(void)
+static char *take_pending_script(host_script_done_t *done, int *done_arg)
 {
     taskENTER_CRITICAL(&s_script_lock);
     char *script = s_script_pending;
     s_script_pending = NULL;
+    if (done) *done = s_done_pending;
+    if (done_arg) *done_arg = s_done_arg_pending;
     taskEXIT_CRITICAL(&s_script_lock);
     return script;
 }
@@ -610,7 +780,9 @@ static char *take_pending_script(void)
 /** Start host print of a built-in script, as if it were a file */
 void hp_cmd_start_script(const char *name)
 {
-    char *script = take_pending_script();
+    host_script_done_t done;
+    int done_arg;
+    char *script = take_pending_script(&done, &done_arg);
     if (!script) return;
     if (s_hp.printing) {
         ESP_LOGW(TAG, "Host print already active -- %s not started", name);
@@ -625,16 +797,38 @@ void hp_cmd_start_script(const char *name)
         return;
     }
     start_common(f, script, name, NULL);
+    s_hp.done = done;
+    s_hp.done_arg = done_arg;
 }
 
-/** Pause host print: park head, stop timer */
-void hp_cmd_pause(void)
+/** Pause host print: park head, stop timer.  standby (a pause from Obico):
+ *  the nozzle to its standby temperature, since nobody may come soon.
+ *  runout (the filament ran out): as a wait in the print, standby after
+ *  mid_after_min (guard_tick()), so someone who comes at once finds it hot. */
+void hp_cmd_pause(bool standby, bool runout)
 {
     if (!s_hp.printing || s_hp.paused) return;
     s_hp.paused = true;
     s_hp.pause_elapsed_us += esp_timer_get_time() - s_hp.start_us;
     host_print_park();
     marlin_send_cmd("M76", QUERY_CMD);  /* Pause Marlin print timer */
+    int target = hotend_target_c();
+    int sb = standby ? ng_standby_c(target) : 0;
+    if (sb) {
+        /* The park has retracted already */
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "M104 S%d", sb);
+        hold_send(cmd);
+        ng_hold_begin(&s_hp.ng, esp_timer_get_time(), false);
+        s_hp.ng.standby = true;
+        s_hp.ng.restore_c = target;
+        set_nozzle_state(NOZZLE_STANDBY);
+        ESP_LOGI(TAG, "Pause: nozzle %d -> %d C", target, sb);
+    } else if (runout) {
+        ng_hold_begin(&s_hp.ng, esp_timer_get_time(), false);
+        s_hp.ng_next_us = 0;
+    }
+    if (runout) ng_notify_runout(target, ng_standby_c(target), s_hp.filename);
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.opstate = PRINTER_PAUSED;
     xSemaphoreGive(g_state_mutex);
@@ -647,9 +841,11 @@ void hp_cmd_resume(void)
     if (!s_hp.printing || !s_hp.paused) return;
     if (s_hp.holding) {
         /* The head never moved, so there is nothing to restore */
+        guard_reheat();
         hold_send("M117");
         hold_clear();
     } else {
+        guard_reheat();                     /* Before the unpark primes the nozzle */
         marlin_send_cmd("M75", QUERY_CMD);  /* Resume Marlin print timer */
         host_print_unpark();
     }
@@ -715,8 +911,30 @@ void hp_cmd_cancel(void)
 
 /* ---- Host print streaming loop ---- */
 
+/* Beeps one at a time from the tick, not in a loop: some printers (the
+ * Neptune 3 Pro) drop an M300 that arrives while one is playing, so they
+ * need a gap, and Continue and the Z taps must not wait for it. */
+static void hold_beep_tick(void)
+{
+    if (!s_hp.holding) return;
+    int64_t now = esp_timer_get_time();
+    if (s_hp.beeps_left == 0) {
+        if (!s_hp.next_series_us || now < s_hp.next_series_us) return;
+        s_hp.beeps_left = HOLD_BEEPS;
+    }
+    if (now < s_hp.next_beep_us || now < s_cmd_cooldown_until_us) return;
+
+    marlin_send_cmd(HOLD_BEEP_GCODE, QUERY_CMD);    /* Ignored if the printer has no beeper */
+    s_hp.next_beep_us = now + HOLD_BEEP_GAP_US;
+    if (--s_hp.beeps_left == 0)
+        s_hp.next_series_us = printer_comm_next_beep_series(now, s_hp.hold_since_us);
+}
+
 void hp_tick(void)
 {
+    hold_beep_tick();
+    guard_tick();
+
     if (s_hp.holding &&
         esp_timer_get_time() - s_hp.hold_since_us >
             CONFIG_HOLD_TIMEOUT_MIN * 60 * 1000000LL) {
@@ -846,6 +1064,21 @@ void hp_tick(void)
             }
         }
 
+        /* The part fan, for the print screen: the printer does not report it */
+        if ((line[0] == 'M' || line[0] == 'm') && strncmp(line + 1, "10", 2) == 0 &&
+            (line[3] == '6' || line[3] == '7') && (line[4] == '\0' || line[4] == ' ')) {
+            int pct = 0;
+            if (line[3] == '6') {
+                const char *sp = strchr(line, 'S');
+                pct = sp ? (int)(strtof(sp + 1, NULL) * 100.0f / 255.0f + 0.5f) : 100;
+                if (pct > 100) pct = 100;
+                if (pct < 0) pct = 0;
+            }
+            xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+            g_state.fan_pct = (int8_t)pct;
+            xSemaphoreGive(g_state_mutex);
+        }
+
         /* Check if this command was previously reported as unsupported */
         if ((line[0] == 'M' || line[0] == 'G') && s_unsupported_count > 0) {
             uint16_t code = (uint16_t)atoi(line + 1);
@@ -903,6 +1136,7 @@ void hp_tick(void)
         }
         s_hp.lines_sent++;
         lines_this_batch++;
+        track_e(line);
 
         /* Update progress */
         xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -975,12 +1209,14 @@ esp_err_t hp_start(const char *filename)
     return printer_comm_send_cmd(&cmd);
 }
 
-esp_err_t hp_start_script(const char *name, char *script)
+esp_err_t hp_start_script(const char *name, char *script, host_script_done_t done, int done_arg)
 {
     bool queued = false;
     taskENTER_CRITICAL(&s_script_lock);
     if (!s_script_pending) {
         s_script_pending = script;
+        s_done_pending = done;
+        s_done_arg_pending = done_arg;
         queued = true;
     }
     taskEXIT_CRITICAL(&s_script_lock);
@@ -992,7 +1228,7 @@ esp_err_t hp_start_script(const char *name, char *script)
     printer_cmd_t cmd = { .type = PCMD_HOST_SCRIPT };
     strlcpy(cmd.gcode, name, sizeof(cmd.gcode));
     esp_err_t err = printer_comm_send_cmd(&cmd);
-    if (err != ESP_OK) free(take_pending_script());
+    if (err != ESP_OK) free(take_pending_script(NULL, NULL));
     return err;
 }
 
@@ -1025,7 +1261,7 @@ esp_err_t hp_zstep(float dz)
     esp_err_t err = ESP_OK;
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    if (abs(s_hp.z_shift_cu + s_hp.z_pending_cu + cu) > Z_SHIFT_LIMIT_CU) {
+    if (abs(s_hp.z_shift_cu + s_hp.z_pending_cu + cu) > z_shift_limit_cu(g_state.builtin_script)) {
         err = ESP_ERR_INVALID_SIZE;
     } else {
         s_hp.z_pending_cu += cu;

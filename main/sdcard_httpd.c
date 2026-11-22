@@ -1,4 +1,5 @@
 #include "sdcard_httpd.h"
+#include "task_util.h"
 #include "httpd.h"
 #include "sdcard.h"
 #include "printer_comm.h"
@@ -26,6 +27,9 @@ static const char *TAG = "sdcard_httpd";
 
 #define MOUNT_POINT "/sdcard"
 #define UPLOAD_BUF_SIZE 8192
+
+static volatile int s_uploads;          /* uploads to the SD card running */
+static volatile bool s_format_running;  /* set in the handler (httpd task), cleared by the format task */
 
 
 /* ---- GET /sd — HTML file manager ---- */
@@ -58,6 +62,7 @@ static const char SD_PAGE[] =
         "<tr><td>" N_("Filament") "</td><td id='info-fil'></td></tr>"
         "</table>"
         "</div></div>"
+        "<p id='card' class='hint'></p>"
         "<h3>" N_("Upload") "</h3>"
         "<input type='file' id='file' accept='.gcode,.g,.gc'>"
         "<button onclick='upload()'>" N_("Upload") "</button>"
@@ -67,6 +72,14 @@ static const char SD_PAGE[] =
         "<table><thead><tr><th>" N_("File") "</th><th></th></tr></thead>"
         "<tbody id='files'></tbody></table>"
         "<script>"
+        /* Before a print: the checks and what maintenance is overdue, asked once, then the form goes */
+        "function sdPrint(f){var b=f.querySelector('button');"
+        "function go(){b.disabled=true;b.textContent='" N_("Starting...") "';f.submit()}"
+        "fetch('/print/checks').then(function(r){return r.json()}).then(function(d){"
+        "var q=(d.warn?'\\u26a0 '+d.warn+'\\n\\n':'')+(d.n?'" N_("Maintenance is overdue:") " '+d.text+'\\n\\n"
+        N_("Print anyway? It is recorded in the maintenance log.") "':'" N_("Print anyway?") "');"
+        "if(!d.n&&!d.warn||confirm(q))go()})"
+        ".catch(go);return false}"
         "function fmt(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB'}"
         "function fmtDate(t){if(!t)return'-';var d=new Date(t*1000),m=d.getMonth()+1,dy=d.getDate(),y=d.getFullYear(),h=d.getHours(),mi=d.getMinutes();return y+'-'+(m<10?'0':'')+m+'-'+(dy<10?'0':'')+dy+' '+(h<10?'0':'')+h+':'+(mi<10?'0':'')+mi}"
         "function fmtTime(s){if(s<0)return'" N_("Unknown") "';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'" N_("h") " '+m+'" N_("min") "':m+'" N_("min") "'}"
@@ -100,7 +113,7 @@ static const char SD_PAGE[] =
         "var h='';f.forEach(function(x){"
         "h+='<tr><td>'+x.name+'<br><span style=\"color:#888;font-size:.75em\">'+fmt(x.size)+' &mdash; '+fmtDate(x.mtime)+'</span></td><td>'"
         "+'<button onclick=\"info(\\''+x.name.replace(/'/g,\"\\\\'\")+'\\')\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Info") "</button> '"
-        "+'<form method=POST action=/sd/print style=display:inline onsubmit=\"var b=this.querySelector(\\'button\\');b.disabled=true;b.textContent=\\'" N_("Starting...") "\\'\"><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Print") "</button></form> '"
+        "+'<form method=POST action=/sd/print style=display:inline onsubmit=\"return sdPrint(this)\"><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Print") "</button></form> '"
         "+'<form method=POST action=/sd/delete style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">" N_("Delete") "</button></form>'"
         "+'</td></tr>'});"
         "document.getElementById('files').innerHTML=h||'<tr><td colspan=2>" N_("No files") "</td></tr>';});}"
@@ -114,7 +127,18 @@ static const char SD_PAGE[] =
         "x.onload=function(){document.getElementById('upload-prog').style.display='none';"
         "document.getElementById('upload-status').textContent=x.status==200?'" N_("Done") "':'" N_("Error:") " '+x.responseText;load();};"
         "x.open('POST','/sd/upload');x.setRequestHeader('X-Filename',f.name);x.send(f);}"
-        "load();"
+        "function gb(k){return k<1048576?(k/1024).toFixed(0)+' " N_("MB") "':(k/1048576).toFixed(1)+' " N_("GB") "'}"
+        "var fmb='<button id=fmt onclick=\"fmtCard()\" style=\"margin-left:8px\">" N_("Format") "</button>',fdone=0;"
+        "function card(){fetch('/sd/status').then(function(r){return r.json()}).then(function(d){var c=document.getElementById('card');"
+        "if(d.card=='formatting'){c.textContent='" N_("Formatting the card...") "';setTimeout(card,2000);return}"
+        "c.innerHTML=d.card=='mounted'?'" N_("Card:") " '+gb(d.total_kb)+', " N_("free") " '+gb(d.free_kb)+fmb"
+        ":d.card=='unformatted'?'" N_("The card is not formatted, or the board cannot read its file system") "'+fmb:'" N_("No SD card") "';"
+        "if(fdone){fdone=0;load()}}).catch(function(){})}"
+        "function fmtCard(){if(!confirm('" N_("Format the SD card? Every file on it is erased.") "'))return;"
+        "var b=document.getElementById('fmt');b.disabled=true;"
+        "fetch('/sd/format',{method:'POST'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw t})})"
+        ".then(function(){fdone=1;card()},function(t){b.disabled=false;alert(typeof t=='string'&&t?t:'" N_("Not started, try again") "')})}"
+        "load();card();"
         "</script>";
 
 static esp_err_t sd_page_handler(httpd_req_t *req)
@@ -207,7 +231,7 @@ static void sd_writer_task(void *arg)
     if (!wbuf) {
         ESP_LOGE(TAG, "SD writer: no internal DMA memory");
         wctx->write_error = true;
-        vTaskDelete(NULL);
+        task_delete(NULL);
         return;
     }
     ESP_LOGI(TAG, "SD writer buffer: %d bytes (internal DMA)", wbuf_size);
@@ -217,7 +241,7 @@ static void sd_writer_task(void *arg)
         ESP_LOGE(TAG, "Failed to open file for writing");
         wctx->write_error = true;
         free(wbuf);
-        vTaskDelete(NULL);
+        task_delete(NULL);
         return;
     }
 
@@ -240,7 +264,7 @@ static void sd_writer_task(void *arg)
     fclose(wctx->file);
     wctx->file = NULL;  /* signal main task: we closed it */
     free(wbuf);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static void sd_upload_task(void *arg)
@@ -285,7 +309,7 @@ static void sd_upload_task(void *arg)
 
     /* Writer task on Core 1 — handles SD writes in parallel with recv */
     TaskHandle_t writer = NULL;
-    if (xTaskCreatePinnedToCore(sd_writer_task, "sd_wr", 4096, &wctx,
+    if (xTaskCreatePinnedToCore(sd_writer_task, "sd_wr", 6144, &wctx,
                                  5, &writer, 1) != pdPASS) {
         vStreamBufferDelete(stream);
         free(stream_store);
@@ -359,7 +383,8 @@ static void sd_upload_task(void *arg)
 done:
     httpd_req_async_handler_complete(req);
     free(ctx);
-    vTaskDelete(NULL);
+    s_uploads--;
+    task_delete(NULL);
 }
 
 static esp_err_t sd_upload_handler(httpd_req_t *req)
@@ -401,14 +426,56 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
     ctx->req = async_req;
     strlcpy(ctx->filename, filename, sizeof(ctx->filename));
 
-    if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 4096, ctx,
+    s_uploads++;
+    if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 6144, ctx,
                                  5, NULL, 0) != pdPASS) {
+        s_uploads--;
         httpd_req_async_handler_complete(async_req);
         free(ctx);
         return ESP_FAIL;
     }
 
     return ESP_OK;
+}
+
+/* ---- POST /sd/format ---- */
+
+static void sd_format_task(void *arg)
+{
+    sdcard_format();
+    s_format_running = false;
+    task_delete(NULL);
+}
+
+/* Refused while the card may be in use: a print (from it, or a Klipper print
+ * whose stops the board may scan it for again), a file being sent to Klipper,
+ * an upload. The page polls /sd/status for the result */
+static esp_err_t sd_format_handler(httpd_req_t *req)
+{
+    printer_state_t st;
+    printer_comm_get_state(&st);
+    const char *why = NULL;
+    sdcard_state_t card = sdcard_state();
+    if (s_format_running || card == SDCARD_FORMATTING) why = _("Already formatting");
+    else if (card == SDCARD_NONE) why = _("No SD card");
+    else if (st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
+             printer_comm_is_host_printing()) why = _("Not while printing");
+    else if (s_uploads > 0 ||
+             (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER && klipper_backend_sending())) {
+        why = _("A file is being sent, try again when it is done");
+    }
+    if (why) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, why);
+    }
+
+    s_format_running = true;
+    if (xTaskCreatePinnedToCore(sd_format_task, "sd_format", 6144, NULL, 5, NULL, 1) != pdPASS) {
+        s_format_running = false;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, _("Not started, try again"));
+    }
+    return httpd_resp_send(req, "OK", 2);
 }
 
 /* ---- POST /sd/delete ---- */
@@ -464,6 +531,7 @@ static void sd_print_task(void *arg)
     esp_err_t err;
     if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
         err = klipper_backend_print_file(ctx->filename);
+        if (err == ESP_OK) print_page_note_started(ctx->filename);
     } else {
         err = printer_comm_host_print_start(ctx->filename);
         if (err == ESP_OK) print_page_note_started(ctx->filename);
@@ -479,7 +547,7 @@ static void sd_print_task(void *arg)
 
     httpd_req_async_handler_complete(req);
     free(ctx);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static esp_err_t sd_print_handler(httpd_req_t *req)
@@ -502,6 +570,13 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     if (amp) *amp = '\0';
     url_decode_inplace(fn);
 
+    /* A file is still on its way to Moonraker: a second start would wait for
+     * it, then fail, or print the wrong one */
+    if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER && klipper_backend_sending()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, _("A file is still being sent to the printer"));
+    }
+
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
@@ -516,7 +591,7 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     ctx->req = async_req;
     strlcpy(ctx->filename, fn, sizeof(ctx->filename));
 
-    if (xTaskCreatePinnedToCore(sd_print_task, "sd_print", 4096, ctx,
+    if (xTaskCreatePinnedToCore(sd_print_task, "sd_print", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         free(ctx);
@@ -581,18 +656,24 @@ static esp_err_t sd_status_handler(httpd_req_t *req)
 
     bool paused = (st.opstate == PRINTER_PAUSED);
 
-    char json[256];
+    char card[96];
+    sdcard_state_t cs = s_format_running ? SDCARD_FORMATTING : sdcard_state();
+    static const char *const card_names[] = { "none", "unformatted", "mounted", "formatting" };
+    snprintf(card, sizeof(card), "\"card\":\"%s\",\"total_kb\":%ld,\"free_kb\":%ld,",
+             card_names[cs], (long)sdcard_get_total_kb(), (long)sdcard_get_free_kb());
+
+    char json[352];
     if (is_printing) {
         snprintf(json, sizeof(json),
-                 "{\"printing\":true,\"paused\":%s,\"filename\":\"%s\","
+                 "{%s\"printing\":true,\"paused\":%s,\"filename\":\"%s\","
                  "\"progress\":%.1f,\"layer\":%ld,\"elapsed\":%ld}",
-                 paused ? "true" : "false",
+                 card, paused ? "true" : "false",
                  st.filename,
                  st.progress_pct >= 0 ? st.progress_pct : 0.0f,
                  (long)st.current_layer,
                  (long)(st.print_time_s >= 0 ? st.print_time_s : 0));
     } else {
-        snprintf(json, sizeof(json), "{\"printing\":false}");
+        snprintf(json, sizeof(json), "{%s\"printing\":false}", card);
     }
 
     return httpd_resp_send(req, json, strlen(json));
@@ -650,7 +731,7 @@ static void sd_info_task(void *arg)
 done:
     httpd_req_async_handler_complete(req);
     free(ctx);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static esp_err_t sd_info_handler(httpd_req_t *req)
@@ -695,7 +776,7 @@ static esp_err_t sd_info_handler(httpd_req_t *req)
     ctx->req = async_req;
     strlcpy(ctx->filename, filename, sizeof(ctx->filename));
 
-    if (xTaskCreatePinnedToCore(sd_info_task, "sd_info", 6144, ctx,
+    if (task_create_psram(sd_info_task, "sd_info", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         free(ctx);
@@ -714,6 +795,7 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         { .uri = "/sd/files",  .method = HTTP_GET,  .handler = sd_files_handler },
         { .uri = "/sd/upload", .method = HTTP_POST, .handler = sd_upload_handler },
         { .uri = "/sd/delete", .method = HTTP_POST, .handler = sd_delete_handler },
+        { .uri = "/sd/format", .method = HTTP_POST, .handler = sd_format_handler },
         { .uri = "/sd/print",  .method = HTTP_POST, .handler = sd_print_handler },
         { .uri = "/sd/pause",  .method = HTTP_POST, .handler = sd_pause_handler },
         { .uri = "/sd/resume", .method = HTTP_POST, .handler = sd_resume_handler },

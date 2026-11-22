@@ -1,4 +1,10 @@
 #include "hub_client.h"
+#include "task_util.h"
+#include "maintenance.h"
+#include "esp_wifi.h"
+#include "ota.h"
+#include "settings_copy.h"
+#include "print_stats.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -37,7 +43,7 @@ static const char *TAG = "hub";
 typedef struct {
     hub_event_type_t type;
     char event_id[48];
-    char message[64];
+    char message[192];       /* A list of maintenance tasks fits */
     char filename[64];
 } hub_event_t;
 
@@ -51,6 +57,15 @@ static const char *event_type_name(hub_event_type_t type)
     switch (type) {
     case HUB_EVENT_HOLD:         return "hold";
     case HUB_EVENT_HOLD_TIMEOUT: return "hold_timeout";
+    case HUB_EVENT_UPDATED:      return "updated";
+    case HUB_EVENT_UPDATE_FAILED: return "update_failed";
+    case HUB_EVENT_MAINTENANCE:  return "maintenance";
+    case HUB_EVENT_MAINTENANCE_SKIPPED: return "maintenance_skipped";
+    case HUB_EVENT_STACK_LOW:    return "stack_low";
+    case HUB_EVENT_OBICO_PAUSE:  return "obico_pause";
+    case HUB_EVENT_NOZZLE_STANDBY: return "nozzle_standby";
+    case HUB_EVENT_PRINT_CHECK: return "print_check";
+    case HUB_EVENT_FILAMENT_RUNOUT: return "filament_runout";
     default:                     return "test";
     }
 }
@@ -214,8 +229,28 @@ static char *status_to_json(const printer_state_t *st)
     if (!root) return NULL;
     add_device(root);
     cJSON_AddStringToObject(root, "version", FW_VERSION);
+    cJSON_AddStringToObject(root, "build", FW_BUILD);
+    if (settings_copy_model()[0]) cJSON_AddStringToObject(root, "model", settings_copy_model());
     cJSON_AddNumberToObject(root, "interval_s", STATUS_INTERVAL_S);
     cJSON_AddStringToObject(root, "state", state_name(st));
+    print_stats_t ps;
+    print_stats_get(&ps);
+    cJSON_AddNumberToObject(root, "print_hours", (int)(ps.print_s / 360) / 10.0);
+    cJSON_AddNumberToObject(root, "prints", ps.started);
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        char name[26];
+        if (!wifi_ap_name(ap.bssid, name, sizeof(name))) {
+            snprintf(name, sizeof(name), "%02x:%02x:%02x", ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+        }
+        cJSON_AddStringToObject(root, "wifi_ap", name);
+        cJSON_AddNumberToObject(root, "wifi_rssi", ap.rssi);
+    }
+    int due = maintenance_due_count();
+    if (due) cJSON_AddNumberToObject(root, "maintenance_due", due);
+    char pending[32];
+    ota_get_pending(pending, sizeof(pending));
+    if (pending[0]) cJSON_AddStringToObject(root, "update_pending", pending);
 
     bool active = st->opstate == PRINTER_PRINTING || st->opstate == PRINTER_PAUSED;
     if (active) {
@@ -300,14 +335,15 @@ void hub_client_init(void)
 
     s_queue = xQueueCreate(QUEUE_DEPTH, sizeof(hub_event_t));
     if (!s_queue ||
-        xTaskCreatePinnedToCore(hub_task, "hub", 6144, NULL, 3, NULL, 0) != pdPASS) {
+        task_create_psram(hub_task, "hub", 12288, NULL, 3, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start hub client");
         if (s_queue) {
             vQueueDelete(s_queue);
             s_queue = NULL;
         }
     }
-    if (xTaskCreatePinnedToCore(status_task, "hub_status", 4096, NULL, 2, NULL, 0) != pdPASS) {
+    /* 6 KB: 4 KB had 480 bytes left */
+    if (task_create_psram(status_task, "hub_status", 12288, NULL, 2, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start hub status");
     }
 }
@@ -352,6 +388,27 @@ static esp_err_t send_form_error(httpd_req_t *req, const char *status, const cha
     return ESP_FAIL;
 }
 
+const char *hub_client_set_url(const char *in)
+{
+    char url[URL_MAX_LEN];
+    strlcpy(url, in, sizeof(url));
+    size_t len = strlen(url);
+    while (len > 0 && url[len - 1] == '/') url[--len] = '\0';
+
+    /* The value goes back into an HTML attribute on the settings page */
+    if (len > 0 && (strncmp(url, "http://", 7) != 0 || strpbrk(url, "'\"<>& "))) {
+        return NT_("URL must start with http://");
+    }
+    if (save_hub_url(url) != ESP_OK) return NT_("Could not save");
+    strlcpy(s_hub_url, url, sizeof(s_hub_url));
+    return NULL;
+}
+
+const char *hub_client_get_url(void)
+{
+    return s_hub_url;
+}
+
 static esp_err_t hub_config_handler(httpd_req_t *req)
 {
     char buf[256];
@@ -366,18 +423,8 @@ static esp_err_t hub_config_handler(httpd_req_t *req)
     const char *p = strstr(buf, "url=");
     if (p) url_decode_field(p + 4, url, sizeof(url));
 
-    size_t len = strlen(url);
-    while (len > 0 && url[len - 1] == '/') url[--len] = '\0';
-
-    /* The value goes back into an HTML attribute on the settings page */
-    if (len > 0 && (strncmp(url, "http://", 7) != 0 || strpbrk(url, "'\"<>& "))) {
-        return send_form_error(req, "400 Bad Request", _("URL must start with http://"));
-    }
-
-    if (save_hub_url(url) != ESP_OK) {
-        return send_form_error(req, "500 Internal Server Error", _("Could not save"));
-    }
-    strlcpy(s_hub_url, url, sizeof(s_hub_url));
+    const char *bad = hub_client_set_url(url);
+    if (bad) return send_form_error(req, "400 Bad Request", TR(bad));
 
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/settings");

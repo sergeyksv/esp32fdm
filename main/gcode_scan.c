@@ -9,80 +9,162 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdio.h>
+#include <unistd.h>
 
 static const char *TAG = "gcode_scan";
 
 /* ---- Quick scan (used by host print start) ---- */
 
+typedef struct {
+    gcode_scan_t *out;
+    int32_t max_layer;
+    int32_t layer_change_count;
+    float first_z;
+    bool seen_z;
+} scan_state_t;
+
+/* One line as fgets(buf, 256) gives it: at most 255 characters */
+static void scan_line(scan_state_t *st, const char *buf)
+{
+    gcode_scan_t *out = st->out;
+
+    /* Slicer metadata comments */
+    if (buf[0] == ';') {
+        /* PrusaSlicer/SuperSlicer/OrcaSlicer: ; layer_height = 0.2 */
+        const char *lh = strstr(buf, "layer_height");
+        if (lh) {
+            const char *eq = strchr(lh, '=');
+            if (eq) {
+                float v = strtof(eq + 1, NULL);
+                if (v > 0.01f && v < 1.0f) {
+                    /* "first_layer_height" vs "layer_height" */
+                    if (strstr(buf, "first_layer_height"))
+                        out->first_layer_height = v;
+                    else
+                        out->layer_height = v;
+                }
+            }
+        }
+        /* ;LAYER:N — track highest layer number */
+        if (strncmp(buf, ";LAYER:", 7) == 0) {
+            int32_t n = atoi(buf + 7);
+            if (n > st->max_layer) st->max_layer = n;
+        }
+        /* OrcaSlicer: ;LAYER_CHANGE */
+        if (strncmp(buf, ";LAYER_CHANGE", 13) == 0) {
+            st->layer_change_count++;
+        }
+        /* Cura: ;Layer height: 0.2 */
+        const char *clh = strstr(buf, ";Layer height:");
+        if (clh) {
+            float v = strtof(clh + 14, NULL);
+            if (v > 0.01f && v < 1.0f) out->layer_height = v;
+        }
+        return;
+    }
+
+    /* Track Z from G0/G1 moves */
+    if (buf[0] == 'G' && (buf[1] == '0' || buf[1] == '1') && buf[2] == ' ') {
+        const char *zp = strstr(buf, "Z");
+        if (zp && (zp == buf + 3 || *(zp - 1) == ' ')) {
+            float z = strtof(zp + 1, NULL);
+            if (z > 0.01f) {
+                if (!st->seen_z) {
+                    st->first_z = z;
+                    st->seen_z = true;
+                }
+                if (z > out->max_z) out->max_z = z;
+            }
+        }
+    }
+}
+
+#define SCAN_LINE_MAX 255   /* the host print sender reads with fgets(line, 256) */
+
+/* Counts a line as the sender does: one per fgets(256) chunk, so a line longer
+ * than 255 characters counts more than once and progress (lines sent / total)
+ * stays exact. len excludes the newline */
+static inline int32_t chunks_of(size_t len, bool newline)
+{
+    size_t n = len + (newline ? 1 : 0);
+    return (int32_t)((n + SCAN_LINE_MAX - 1) / SCAN_LINE_MAX);
+}
+
+/* A file on the SD card: read() on the descriptor into internal DMA memory,
+ * as the middle of gcode_scan_file_info() does. stdio goes through FATFS's
+ * sector cache in PSRAM, which DMA reaches only through a bounce buffer, and
+ * fgets() per line on top of it took 19 s for a 7 MB file. Returns false if
+ * there is no descriptor (fmemopen) or no buffer, and f is untouched */
+static bool scan_fd(FILE *f, scan_state_t *st)
+{
+    int fd = fileno(f);
+    if (fd < 0) return false;
+
+    int size = 16384;
+    char *rbuf = NULL;
+    while (size >= 4096 && !(rbuf = heap_caps_malloc(size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)))
+        size /= 2;
+    if (!rbuf) return false;
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        free(rbuf);
+        return false;
+    }
+
+    gcode_scan_t *out = st->out;
+    char line[SCAN_LINE_MAX + 1];
+    size_t line_len = 0;       /* characters of the current line kept in line[] */
+    size_t full_len = 0;       /* characters of the current line so far */
+    int got;
+    while ((got = read(fd, rbuf, size)) > 0) {
+        const char *p = rbuf, *end = rbuf + got;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', end - p);
+            size_t n = (nl ? nl : end) - p;
+            if (line_len < SCAN_LINE_MAX) {
+                size_t take = n < SCAN_LINE_MAX - line_len ? n : SCAN_LINE_MAX - line_len;
+                memcpy(line + line_len, p, take);
+                line_len += take;
+            }
+            full_len += n;
+            if (!nl) break;                      /* the line goes on in the next read */
+            line[line_len] = '\0';
+            scan_line(st, line);
+            out->total_lines += chunks_of(full_len, true);
+            line_len = full_len = 0;
+            p = nl + 1;
+            /* Runs next to a print: let the streaming and idle tasks in */
+            if ((out->total_lines & 0x3FF) == 0) vTaskDelay(1);
+        }
+    }
+    if (full_len > 0) {                          /* last line without a newline */
+        line[line_len] = '\0';
+        scan_line(st, line);
+        out->total_lines += chunks_of(full_len, false);
+    }
+    free(rbuf);
+    return true;
+}
+
 void gcode_scan_file(FILE *f, gcode_scan_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->total_layers = -1;
-
-    char buf[256];
-    int32_t max_layer = -1;
-    int32_t layer_change_count = 0;
-    float first_z = 0, prev_z = 0;
-    bool seen_z = false;
+    scan_state_t st = { .out = out, .max_layer = -1 };
 
     rewind(f);
-    while (fgets(buf, sizeof(buf), f)) {
-        out->total_lines++;
-
-        /* Runs next to a print: let the streaming and idle tasks in */
-        if ((out->total_lines & 0x3FF) == 0) vTaskDelay(1);
-
-        /* Slicer metadata comments */
-        if (buf[0] == ';') {
-            /* PrusaSlicer/SuperSlicer/OrcaSlicer: ; layer_height = 0.2 */
-            const char *lh = strstr(buf, "layer_height");
-            if (lh) {
-                const char *eq = strchr(lh, '=');
-                if (eq) {
-                    float v = strtof(eq + 1, NULL);
-                    if (v > 0.01f && v < 1.0f) {
-                        /* "first_layer_height" vs "layer_height" */
-                        if (strstr(buf, "first_layer_height"))
-                            out->first_layer_height = v;
-                        else
-                            out->layer_height = v;
-                    }
-                }
-            }
-            /* ;LAYER:N — track highest layer number */
-            if (strncmp(buf, ";LAYER:", 7) == 0) {
-                int32_t n = atoi(buf + 7);
-                if (n > max_layer) max_layer = n;
-            }
-            /* OrcaSlicer: ;LAYER_CHANGE */
-            if (strncmp(buf, ";LAYER_CHANGE", 13) == 0) {
-                layer_change_count++;
-            }
-            /* Cura: ;Layer height: 0.2 */
-            const char *clh = strstr(buf, ";Layer height:");
-            if (clh) {
-                float v = strtof(clh + 14, NULL);
-                if (v > 0.01f && v < 1.0f) out->layer_height = v;
-            }
-            continue;
-        }
-
-        /* Track Z from G0/G1 moves */
-        if (buf[0] == 'G' && (buf[1] == '0' || buf[1] == '1') && buf[2] == ' ') {
-            const char *zp = strstr(buf, "Z");
-            if (zp && (zp == buf + 3 || *(zp - 1) == ' ')) {
-                float z = strtof(zp + 1, NULL);
-                if (z > 0.01f) {
-                    if (!seen_z) {
-                        first_z = z;
-                        seen_z = true;
-                    }
-                    if (z > out->max_z) out->max_z = z;
-                    prev_z = z;
-                }
-            }
+    if (!scan_fd(f, &st)) {
+        /* A built-in script in memory (fmemopen), or no DMA buffer */
+        char buf[SCAN_LINE_MAX + 1];
+        while (fgets(buf, sizeof(buf), f)) {
+            out->total_lines++;
+            if ((out->total_lines & 0x3FF) == 0) vTaskDelay(1);
+            scan_line(&st, buf);
         }
     }
+    int32_t max_layer = st.max_layer;
+    int32_t layer_change_count = st.layer_change_count;
+    float first_z = st.first_z;
     rewind(f);
 
     /* Derive values if not found in comments */
@@ -106,7 +188,6 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
         out->total_layers = 1 + (int32_t)((out->max_z - flh) / out->layer_height + 0.5f);
     }
 
-    (void)prev_z;
     ESP_LOGI(TAG, "GCode scan: %ld lines, maxZ=%.2f, layers=%ld, lh=%.2f, flh=%.2f",
              (long)out->total_lines, out->max_z, (long)out->total_layers,
              out->layer_height, out->first_layer_height);
@@ -439,12 +520,21 @@ void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
      * Uses large fread() chunks instead of per-line fgets() for SD card speed. */
     long tail_start = (file_size > 32768) ? (file_size - 32768) : file_size;
     if (middle_start < tail_start) {
-        fseek(f, middle_start, SEEK_SET);
-        /* Use internal DMA-capable RAM — SDMMC DMA on ESP32-S3 can't access PSRAM,
-         * falls back to 512-byte bounce buffer per sector if buffer is in PSRAM */
-        #define SCAN_BUF_SIZE 4096
-        char *sbuf = heap_caps_malloc(SCAN_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (!sbuf) sbuf = malloc(SCAN_BUF_SIZE);  /* PSRAM fallback */
+        /* read() on the descriptor, not fread(): stdio goes through FATFS's
+         * sector cache in PSRAM, which DMA reaches only through a bounce buffer
+         * (1.4 MB/s); whole sectors straight into internal DMA memory go at
+         * 4.5 MB/s with 16 KB.  Nothing reads f through stdio after this. */
+        int fd = fileno(f);
+        lseek(fd, middle_start, SEEK_SET);
+        int SCAN_BUF_SIZE = 16384;
+        char *sbuf = NULL;
+        while (SCAN_BUF_SIZE >= 4096 &&
+               !(sbuf = heap_caps_malloc(SCAN_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)))
+            SCAN_BUF_SIZE /= 2;
+        if (!sbuf) {
+            SCAN_BUF_SIZE = 4096;
+            sbuf = malloc(SCAN_BUF_SIZE);  /* PSRAM fallback */
+        }
         if (sbuf) {
             long bytes_left = tail_start - middle_start;
             /* Carry-over: partial line from end of previous chunk */
@@ -453,7 +543,7 @@ void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
 
             while (bytes_left > 0) {
                 int to_read = bytes_left < SCAN_BUF_SIZE ? (int)bytes_left : SCAN_BUF_SIZE;
-                int got = fread(sbuf, 1, to_read, f);
+                int got = read(fd, sbuf, to_read);
                 if (got <= 0) break;
                 bytes_left -= got;
 
@@ -543,7 +633,6 @@ void gcode_scan_file_info(const char *path, gcode_file_info_t *out)
             }
             free(sbuf);
         }
-        #undef SCAN_BUF_SIZE
     }
 
     fclose(f);

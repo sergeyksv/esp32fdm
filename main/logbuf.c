@@ -1,4 +1,5 @@
 #include "logbuf.h"
+#include "task_util.h"
 #include "httpd.h"
 
 #include <string.h>
@@ -129,6 +130,137 @@ static int log_vprintf(const char *fmt, va_list args)
         putchar(tmp[i]);
 
     return len;
+}
+
+/* ---- Crash report ----
+ *
+ * ESP-IDF's panic handler prints the reason and the backtrace on the UART
+ * only, so /logs showed a bare "reboot: reason=PANIC" and nothing said why
+ * (a stack overflow looked like a power problem). The link wraps
+ * esp_panic_handler (-Wl,--wrap in main/CMakeLists.txt): this copies the
+ * report into the ring, then hands over to the real handler, which prints
+ * and restarts as before. Interrupt watchdog timeouts come through here too.
+ *
+ * It runs inside the panic handler, with the other core stopped: no locks,
+ * no heap, no printf. Lines are written without esp_cache_msync (it takes a
+ * lock), and the whole cache is written back once at the end. */
+
+#include "esp_private/panic_internal.h"
+#include "esp_debug_helpers.h"
+#include "esp_cpu_utils.h"
+#include "esp32s3/rom/cache.h"
+#include "xtensa_context.h"
+#include "version.h"
+#include "esp_timer.h"
+
+void __real_esp_panic_handler(panic_info_t *info);
+
+static DRAM_ATTR char s_pl[200];
+static DRAM_ATTR size_t s_pl_len;
+static DRAM_ATTR const char s_hex[] = "0123456789abcdef";
+
+static void IRAM_ATTR pl_str(const char *str)
+{
+    while (str && *str && s_pl_len < sizeof(s_pl) - 1) s_pl[s_pl_len++] = *str++;
+}
+
+static void IRAM_ATTR pl_hex(uint32_t v)
+{
+    pl_str("0x");
+    for (int sh = 28; sh >= 0 && s_pl_len < sizeof(s_pl) - 1; sh -= 4)
+        s_pl[s_pl_len++] = s_hex[(v >> sh) & 15];
+}
+
+static void IRAM_ATTR pl_dec(uint32_t v)
+{
+    char d[10];
+    int n = 0;
+    do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v && n < 10);
+    while (n && s_pl_len < sizeof(s_pl) - 1) s_pl[s_pl_len++] = d[--n];
+}
+
+/* Starts a line the way ESP_LOGE does, so /logs filters and colours it */
+static void IRAM_ATTR pl_begin(void)
+{
+    s_pl_len = 0;
+    pl_str("E (");
+    pl_dec((uint32_t)(esp_timer_get_time() / 1000));   /* lock-free, ISR-safe; the CPU cycle count of esp_log_early_timestamp() wraps every 18 s */
+    pl_str(") panic: ");
+}
+
+static void IRAM_ATTR pl_end(void)
+{
+    s_pl[s_pl_len++] = '\n';
+    size_t len = s_pl_len;
+    uint32_t head = s_hdr.head;
+    size_t first = LOGBUF_SIZE - head;
+    if (first > len) first = len;
+    memcpy(s_buf + head, s_pl, first);
+    memcpy(s_buf, s_pl + first, len - first);
+    s_hdr.head = (head + len) % LOGBUF_SIZE;
+    s_hdr.count = (s_hdr.count + len > LOGBUF_SIZE) ? LOGBUF_SIZE : s_hdr.count + len;
+    s_hdr.check = hdr_check();
+    s_pl_len = 0;
+}
+
+static void IRAM_ATTR panic_to_ring(const panic_info_t *info)
+{
+    static const char *const kind[] = { "debug exception", "interrupt watchdog",
+                                        "task watchdog", "abort", "fault" };
+
+    pl_begin();
+    pl_str("core ");
+    pl_dec((uint32_t)info->core);
+    pl_str(": ");
+    if (g_panic_abort && g_panic_abort_details) {
+        pl_str(g_panic_abort_details);   /* e.g. "A stack overflow in task led has been detected." */
+    } else {
+        if ((unsigned)info->exception < sizeof(kind) / sizeof(kind[0]))
+            pl_str(kind[info->exception]);
+        if (info->reason) { pl_str(", "); pl_str(info->reason); }
+        if (info->description) { pl_str(", "); pl_str(info->description); }
+    }
+    pl_end();
+
+    TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(info->core);
+    pl_begin();
+    pl_str("task ");
+    pl_str(t ? pcTaskGetName(t) : "?");
+    pl_str(", PC ");
+    pl_hex((uint32_t)info->addr);
+    pl_str(", build ");
+    pl_str(FW_BUILD);
+    pl_end();
+
+    /* The same walk as esp_backtrace_print_from_frame(); decode with
+     * xtensa-esp32s3-elf-addr2line -pfiaC -e build/esp32fdm.elf <PCs>
+     * on the ELF of that build */
+    const XtExcFrame *xf = (const XtExcFrame *)info->frame;
+    if (!xf) return;
+    esp_backtrace_frame_t fr = { .pc = xf->pc, .sp = xf->a1, .next_pc = xf->a0, .exc_frame = (void *)xf };
+    pl_begin();
+    pl_str("Backtrace:");
+    for (int i = 0; i < 24; i++) {
+        if (s_pl_len > sizeof(s_pl) - 24) { pl_end(); pl_begin(); pl_str("Backtrace (more):"); }
+        pl_str(" ");
+        pl_hex(esp_cpu_process_stack_pc(fr.pc));
+        pl_str(":");
+        pl_hex(fr.sp);
+        if (fr.next_pc == 0) break;
+        if (!esp_backtrace_get_next_frame(&fr)) { pl_str(" |<-CORRUPTED"); break; }
+    }
+    pl_end();
+}
+
+void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
+{
+    static DRAM_ATTR bool s_in_panic;
+    if (!s_in_panic && s_hdr.magic == LOGBUF_MAGIC && s_hdr.check == hdr_check()) {
+        s_in_panic = true;
+        panic_to_ring(info);
+        Cache_WriteBack_All();   /* PSRAM sits behind a write-back cache */
+    }
+    __real_esp_panic_handler(info);
 }
 
 /* ---- Init ---- */
@@ -367,7 +499,7 @@ static void logs_task(void *arg)
 
     httpd_req_async_handler_complete(req);
     free(ctx);
-    vTaskDelete(NULL);
+    task_delete(NULL);
 }
 
 static esp_err_t logs_handler(httpd_req_t *req)
@@ -400,7 +532,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
     ctx->lang = i18n_lang();
 
     /* 6KB stack: 1KB chunk buf + html_buf + PSRAM snapshot pointer */
-    if (xTaskCreatePinnedToCore(logs_task, "logs", 6144, ctx,
+    if (task_create_psram(logs_task, "logs", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         free(ctx);

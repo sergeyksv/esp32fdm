@@ -19,9 +19,19 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
 
 # LWIP — larger TCP window to avoid zero-window stalls during uploads
-CONFIG_LWIP_MAX_SOCKETS=16
+# Sockets: the web server alone takes 15 (13 connections, its listening and
+# control sockets), and the Klipper poll, hub, Obico and Janus need theirs.
+# With 16, browsers holding keep-alive connections used them all up: the
+# server could not accept (and so never reached its own limit, where it closes
+# the oldest idle connection), and the Klipper poll and hub events failed.
+CONFIG_LWIP_MAX_SOCKETS=32
+CONFIG_LWIP_MAX_ACTIVE_TCP=32
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# Send buffer: 4 MSS (the default) caps sending to ~140 KB/s over Wi-Fi with
+# a 40 ms round trip, and a file sent to Moonraker took 5 min for 40 MB.
+# lwIP allocates in PSRAM here (SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
@@ -65,3 +75,35 @@ CONFIG_HTTPD_MAX_URI_LEN=1024
 # FAT filesystem — long filename support for SD card
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=127
+
+# 802.11k/v: the network (DAWN on the routers) can steer the board between APs
+CONFIG_ESP_WIFI_11KV_SUPPORT=y
+
+# TLS in PSRAM: each connection (Obico's WebSocket and snapshot uploads) takes
+# ~25-30 KB with its 16 KB input buffer, which in internal RAM left a Marlin
+# board too fragmented for the 8 KB OTA task stack
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# Stacks, from the high water marks on a Marlin board (fdm06, /api/tasks):
+# system events had 488 bytes left of 2304, then 928 of 3072 across all boards
+# (its Wi-Fi handlers log, over 1 KB of stack a line); esp_timer used ~480 of 3584
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2560
+
+# mDNS task stack (4 KB) in PSRAM, like our own network tasks (main/task_util.h)
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+
+# Stack overflow: the canary is checked only at a task switch, after the
+# overflow may have corrupted the memory next to the stack; the watchpoint on
+# the last 32 bytes of the running task's stack stops on the write itself
+# (it takes one of the two CPU watchpoints, the other stays free for JTAG).
+# Both stay on: a large frame can jump past the watched 32 bytes
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# CPU at full speed: the G-code scan, the Klipper stop rewriting, JPEG and TLS are CPU bound
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Code and constants run from PSRAM (copied there at boot): Octal PSRAM serves
+# a cache miss several times faster than the flash in DIO, and flash writes
+# (OTA, NVS, LittleFS) no longer stop code that runs from PSRAM
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y

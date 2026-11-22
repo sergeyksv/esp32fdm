@@ -98,7 +98,7 @@ bool hp_is_paused(void);
 /** Command handlers (called from printer_comm_task queue dispatch) */
 void hp_cmd_start(const char *filename);
 void hp_cmd_start_script(const char *name);
-void hp_cmd_pause(void);
+void hp_cmd_pause(bool standby, bool runout);
 void hp_cmd_resume(void);
 void hp_cmd_cancel(void);
 void hp_cmd_continue(uint32_t hold_id);
@@ -116,7 +116,7 @@ void hp_fill_state(printer_state_t *out);
 
 /** Public API pass-throughs */
 esp_err_t hp_start(const char *filename);
-esp_err_t hp_start_script(const char *name, char *script);
+esp_err_t hp_start_script(const char *name, char *script, host_script_done_t done, int done_arg);
 esp_err_t hp_pause(void);
 esp_err_t hp_resume(void);
 esp_err_t hp_cancel(void);
